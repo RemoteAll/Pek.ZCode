@@ -8,7 +8,7 @@
 //! **明确返回 `error.Unsupported`**——不做静默降级，避免"看起来能用、实际生成错 SQL"。
 
 const std = @import("std");
-const Buf = @import("buf.zig").Buf;
+const Buf = @import("zzig").Buf;
 const DataType = @import("types.zig").DataType;
 const model = @import("model.zig");
 const TableMeta = model.TableMeta;

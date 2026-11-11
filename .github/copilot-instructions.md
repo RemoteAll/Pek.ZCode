@@ -21,6 +21,9 @@
 ## 工具链口径（本机实测）
 
 - `zig 0.17.0`（WinGet 安装，`zig.exe` 已在 PATH）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
+- **依赖公共库 `G:\Code\Zig\zzig`**（path 依赖）：`zzig.xml` + 通用件 `zzig.Decimal` / `zzig.DateTime` /
+  `zzig.db.Value` / `zzig.db.sqlite` / `zzig.Buf` / `zzig.File`。**这些能力只在 zzig 改，本仓不要再复制一份**；
+  改 zzig 后必须跑 `cd ..\zzig; zig build test`（并连带回归本仓）。
 - **验证一律走分档**：`zig build` / `zig build test` 只做编译与测试验证；`dist/` 打包只在用户明确说「打包 / 出包 / 部署」时才做。
 - **Zig 0.17 与旧版差异已踩过**（`std.DynLib` 不支持 Windows、`time.timestamp`/`crypto.random`/`fs.cwd`/`dupeZ` 移除等），
   详见 `docs/移植对照-NCode.md` 第 4 节——写新代码前先看，别按 0.15/0.16 的记忆写。

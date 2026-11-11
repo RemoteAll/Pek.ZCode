@@ -10,7 +10,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const TableMeta = model.TableMeta;
 const ColumnMeta = model.ColumnMeta;
-const Value = @import("value.zig").Value;
+const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const sqlbuild = @import("sqlbuild.zig");
 const session_mod = @import("session.zig");
@@ -19,7 +19,7 @@ const Row = session_mod.Row;
 const query = @import("query.zig");
 const Where = query.Where;
 const Query = query.Query;
-const DateTime = @import("datetime.zig").DateTime;
+const DateTime = @import("zzig").DateTime;
 
 pub const TableRef = struct {
     gpa: std.mem.Allocator,

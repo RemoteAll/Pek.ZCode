@@ -33,7 +33,7 @@
 const std = @import("std");
 const zzig = @import("zzig");
 pub const DataType = @import("types.zig").DataType;
-const Buf = @import("buf.zig").Buf;
+const Buf = @import("zzig").Buf;
 
 pub const default_namespace = "https://newlifex.com/Model202509.xsd";
 
@@ -237,9 +237,7 @@ pub const TableMeta = struct {
             if (i > 0) try names.appendSlice(gpa, ", ");
             try names.appendSlice(gpa, n);
         }
-        return try std.fmt.allocPrint(gpa,
-            "表 {s} 按 MySQL utf8mb4 估算行内占用 {d} 字节，超过上限 {d} 字节（varchar 按 4 字节/字符计）；请把最长文本列改用 DataType=\"Text\"（MySQL→LONGTEXT）：{s}",
-            .{ self.effectiveTableName(), bytes, mysql_max_row_bytes, names.items });
+        return try std.fmt.allocPrint(gpa, "表 {s} 按 MySQL utf8mb4 估算行内占用 {d} 字节，超过上限 {d} 字节（varchar 按 4 字节/字符计）；请把最长文本列改用 DataType=\"Text\"（MySQL→LONGTEXT）：{s}", .{ self.effectiveTableName(), bytes, mysql_max_row_bytes, names.items });
     }
 };
 
@@ -355,7 +353,8 @@ pub const EntityModel = struct {
             if (t.migration) |m| try writeAttr(&b, "Migration", m.name());
             if (t.insert_only) try writeAttr(&b, "InsertOnly", "True");
             if (t.is_view) try writeAttr(&b, "IsView", "True");
-            if (t.max_cache_count != 1000) try b.fmt(" MaxCacheCount=\"{d}\"", .{t.max_cache_count});            for (t.extra) |kv| try b.fmt(" {s}=\"{s}\"", .{ kv.key, kv.value });
+            if (t.max_cache_count != 1000) try b.fmt(" MaxCacheCount=\"{d}\"", .{t.max_cache_count});
+            for (t.extra) |kv| try b.fmt(" {s}=\"{s}\"", .{ kv.key, kv.value });
             try b.add(">\n");
 
             try b.add("      <Columns>\n");
@@ -525,15 +524,15 @@ fn parseIndex(a: std.mem.Allocator, e: *const zzig.xml.Dom.Element) !IndexMeta {
 }
 
 const table_known_attrs = [_][]const u8{
-    "Name",       "TableName", "Description", "ConnName", "BaseType",
-    "Migration",  "InsertOnly", "IsView",     "MaxCacheCount",
+    "Name",      "TableName",  "Description", "ConnName",      "BaseType",
+    "Migration", "InsertOnly", "IsView",      "MaxCacheCount",
 };
 
 const column_known_attrs = [_][]const u8{
-    "Name",       "ColumnName", "DataType",    "RawType",    "Length",
-    "Precision",  "Scale",      "Identity",    "PrimaryKey", "Master",
-    "Nullable",   "DefaultValue", "Type",      "DataScale",  "Map",
-    "ShowIn",     "Model",      "Category",    "ItemType",   "UsingCache",
+    "Name",        "ColumnName",   "DataType", "RawType",    "Length",
+    "Precision",   "Scale",        "Identity", "PrimaryKey", "Master",
+    "Nullable",    "DefaultValue", "Type",     "DataScale",  "Map",
+    "ShowIn",      "Model",        "Category", "ItemType",   "UsingCache",
     "Description",
 };
 

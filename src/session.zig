@@ -9,8 +9,8 @@
 //! 需要长期持有请 `dupe` 出去，或定期 `resetResults()` 回收。
 
 const std = @import("std");
-const sqlite = @import("sqlite.zig");
-const Value = @import("value.zig").Value;
+const sqlite = @import("zzig").sqlite;
+const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
 pub const Row = sqlite.Row;

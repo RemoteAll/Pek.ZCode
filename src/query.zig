@@ -6,8 +6,8 @@
 //! 「为空 / 非空」用 `isNull` / `notNull`；「为空或满足阈值」用 `raw`。
 
 const std = @import("std");
-const Buf = @import("buf.zig").Buf;
-const Value = @import("value.zig").Value;
+const Buf = @import("zzig").Buf;
+const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
 pub const Op = enum {

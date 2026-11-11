@@ -21,8 +21,8 @@ pub const DataType = enum {
 
     /// 全部类型（遍历/自检用）。
     pub const all = [_]DataType{
-        .boolean, .byte,  .int16, .int32,
-        .int64,   .single, .double, .decimal,
+        .boolean, .byte,     .int16,  .int32,
+        .int64,   .single,   .double, .decimal,
         .string,  .datetime, .binary, .json,
     };
 

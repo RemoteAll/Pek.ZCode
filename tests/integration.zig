@@ -38,7 +38,7 @@ fn openDal(a: std.mem.Allocator, db_path: []const u8) !zcode.Dal {
 
 /// 在临时目录下生成唯一库文件路径（调用方负责 free + 删文件）。
 fn tempDbPath(a: std.mem.Allocator, tag: []const u8) ![]u8 {
-    return zcode.tempfile.uniquePath(a, tag, ".db");
+    return zcode.File.UniqueTempName(a, tag, ".db");
 }
 
 test "端到端：建表 → CRUD → 分页 → 聚合" {
@@ -46,7 +46,7 @@ test "端到端：建表 → CRUD → 分页 → 聚合" {
 
     const db_path = try tempDbPath(a, "crud");
     defer a.free(db_path);
-    defer zcode.tempfile.deleteQuiet(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
 
     var dal = openDal(a, db_path) catch |e| {
         std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
@@ -137,7 +137,7 @@ test "二次 sync_schema 幂等，且新增列自动补齐" {
 
     const db_path = try tempDbPath(a, "evolve");
     defer a.free(db_path);
-    defer zcode.tempfile.deleteQuiet(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
 
     {
         var dal = try openDal(a, db_path);

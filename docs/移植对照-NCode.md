@@ -9,12 +9,12 @@
 |---|---|---|---|---|
 | `Model.xml` 解析 | `Entity/EntityBuilder` | `src/model.rs` | `src/model.zig` | ✅ 对齐（含未识别属性保留） |
 | 类型系统 | `DataType`（CLR 名） | `src/types.rs` | `src/types.zig` | ✅ 12 种类型 + 同义别名 |
-| 字段值 | `Object` + `DbType` | `src/value.rs` | `src/value.zig` | ✅ 子集（无 `Decimal` 运算，仅解析/格式化/比较） |
+| 字段值 | `Object` + `DbType` | `src/value.rs` | `zzig`：`db/value.zig` | ✅ 子集（无 `Decimal` 运算，仅解析/格式化/比较） |
 | 方言语义 | `DH.NCode.*` 各驱动 | `src/dialect.rs` | `src/dialect.zig` | ⚠️ **5 族已实现**：SQLite / MySQL / SQL Server / PostgreSQL 系 / Oracle；其余显式 `error.Unsupported` |
 | 条件表达式 | `WhereExpression` | `src/query.rs` | `src/query.zig` | ✅ 14 种运算符 |
 | SQL 组装 | `InsertBuilder` / `SelectBuilder` | `src/sqlbuild.rs` | `src/sqlbuild.zig` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT（批量写未做） |
 | 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接（无连接池/异步） |
-| SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `src/sqlite.zig`（动态加载 DLL） | ✅ |
+| SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `zzig`：`db/sqlite.zig`（动态加载 DLL） | ✅ |
 | 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count |
 | 连接与迁移 | `DAL` / `Migration` | `src/dal.rs` | `src/dal.zig` | ✅ 增量建表/补列/建索引，幂等 |
 | 对象实体 + 脏更新 | `Entity` | `src/entity.rs` / `dirty.rs` | — | ⛔ 未做 |
@@ -82,7 +82,28 @@
 | SQLite 通过 DLL 动态加载 | 不链 libc / UCRT（`-lc` 在 Win7 起不来）；也便于替换 SQLite 版本 |
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
 
-## 4. Zig 0.17 实测坑（已在代码里规避）
+## 4. 下沉到 `zzig` 的公共件（2026-11-11）
+
+与 ORM 无关、值得复用的能力已提到 `G:\Code\Zig\zzig` 公共库，ZCode 只保留 XCode 语义层。
+**同一个能力只允许一份实现**：ZCode 里不再保留副本，`src/buf.zig` / `decimal.zig` / `datetime.zig` /
+`value.zig` / `sqlite.zig` / `tempfile.zig` 已删除。
+
+| 能力 | zzig 位置 | 对外名字 | 复用场景 |
+|---|---|---|---|
+| 字符串缓冲 | `src/text/buf.zig` | `zzig.Buf` | 任何零碎字符串拼接（SQL/日志/报文） |
+| 十进制 | `src/number/decimal.zig` | `zzig.Decimal` | 财务文本、配置精度值、ORM 值模型 |
+| 日期时间 | `src/time/datetime.zig` | `zzig.DateTime` | 数据库时间文本、定时任务、日志时间 |
+| 字段值模型 | `src/db/value.zig` | `zzig.db.Value` | 任何“读库 → 统一值”的数据库访问层 |
+| SQLite 驱动 | `src/db/sqlite.zig` | `zzig.db.sqlite`（别名 `zzig.sqlite`） | 任何需要嵌入式 SQLite 的 Zig 项目 |
+| 临时文件名 / 静默删除 | `src/file/file.zig` | `zzig.File.UniqueTempName` / `DeleteQuiet` | 测试临时库、导出中间文件 |
+
+ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcode.DateTime` / `zcode.Value` /
+`zcode.buf` / `zcode.sqlite` / `zcode.File`。
+
+**不下沉**（带 XCode 语义，属于本库）：`types`（CLR 类型名）、`model`、`dialect`、`query`、`sqlbuild`、
+`session`、`dbtable`、`dal`。
+
+## 5. Zig 0.17 实测坑（已在代码里规避）
 
 1. **`std.DynLib` 不支持 Windows**（0.17 只有 linux/mac/BSD 分支）→ 手写 `LoadLibraryA` / `GetProcAddress`。
 2. **`std.time.timestamp` / `nanoTimestamp` / `crypto.random` 均已移除** → 用 `GetSystemTimeAsFileTime` / `GetTickCount64`。

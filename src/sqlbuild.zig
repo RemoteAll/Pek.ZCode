@@ -9,8 +9,8 @@
 //! - `SELECT COUNT(*) FROM "T" WHERE (...)`
 
 const std = @import("std");
-const Buf = @import("buf.zig").Buf;
-const Value = @import("value.zig").Value;
+const Buf = @import("zzig").Buf;
+const Value = @import("zzig").db.Value;
 const model = @import("model.zig");
 const TableMeta = model.TableMeta;
 const ColumnMeta = model.ColumnMeta;

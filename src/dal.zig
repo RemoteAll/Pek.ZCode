@@ -11,7 +11,7 @@ const EntityModel = model.EntityModel;
 const Migration = model.Migration;
 const dialect = @import("dialect.zig");
 const DatabaseKind = dialect.DatabaseKind;
-const sqlite = @import("sqlite.zig");
+const sqlite = @import("zzig").sqlite;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -84,7 +84,7 @@ fn parseBool(v: []const u8) bool {
 
 /// 测试用：在临时目录下生成一个唯一库文件路径（调用方负责 free + 删文件）。
 fn tempDbPath(a: std.mem.Allocator, tag: []const u8) ![]u8 {
-    return @import("tempfile.zig").uniquePath(a, tag, ".db");
+    return @import("zzig").File.UniqueTempName(a, tag, ".db");
 }
 
 pub const SchemaReport = struct {
@@ -96,9 +96,7 @@ pub const SchemaReport = struct {
     executed: bool = true,
 
     pub fn describeAlloc(self: SchemaReport, gpa: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(gpa,
-            "结构同步：建表 {d} / 补列 {d} / 建索引 {d} / 跳过 {d}{s}",
-            .{ self.tables_created, self.columns_added, self.indexes_created, self.tables_skipped, if (self.executed) "" else "（只读：未执行）" });
+        return std.fmt.allocPrint(gpa, "结构同步：建表 {d} / 补列 {d} / 建索引 {d} / 跳过 {d}{s}", .{ self.tables_created, self.columns_added, self.indexes_created, self.tables_skipped, if (self.executed) "" else "（只读：未执行）" });
     }
 };
 
@@ -326,7 +324,7 @@ test "sync_schema 幂等（临时文件库）" {
 
     const db_path = try tempDbPath(a, "sync");
     defer a.free(db_path);
-    defer @import("tempfile.zig").deleteQuiet(db_path);
+    defer @import("zzig").File.DeleteQuiet(db_path);
 
     const xml =
         \\<EntityModel><Tables><Table Name="JiLiYu" TableName="DH_JiLiYu">
@@ -371,7 +369,7 @@ test "Migration=Off 不做任何 DDL" {
 
     const db_path = try tempDbPath(a, "off");
     defer a.free(db_path);
-    defer @import("tempfile.zig").deleteQuiet(db_path);
+    defer @import("zzig").File.DeleteQuiet(db_path);
 
     const xml =
         \\<EntityModel><Tables><Table Name="T">

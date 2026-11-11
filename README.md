@@ -3,21 +3,24 @@
 > 语义与逻辑对齐 C# `DH.NCode`（`G:\Code\Pek.FrameWork\DH.NCode`）与 Rust `Pek.RCode`（`G:\Code\Rust\Pek.RCode`）：
 > **共用同一份 `Model.xml`、共用同一个数据库**，生成的 SQL 文本与结构迁移行为可逐一对照。
 > 详细对照见 [`docs/移植对照-NCode.md`](docs/移植对照-NCode.md)。
+>
+> 与 ORM 无关的通用件（Decimal / DateTime / 值模型 / SQLite 驱动 / 字符串缓冲 / 临时文件）
+> 已下沉到公共库 **`zzig`**（`G:\Code\Zig\zzig`），本包只保留 XCode 语义层。
 
 ## 当前范围（v0.1.0 第一轮）
 
 | 模块 | 对应 DH.NCode / Pek.RCode | 状态 |
 |---|---|---|
 | `types` | `DataType`（CLR 类型名） | ✅ 12 种类型 + 宽松别名解析 |
-| `decimal` | C# `Decimal` | ✅ 尾数×10^-scale 表示、解析/格式化（保留尾随零）/数值比较 |
-| `datetime` | XCode 时间口径 | ✅ 7 位小数秒解析与格式化、Unix 秒换算 |
-| `value` | 字段值 / `DbType` 转换 | ✅ 跨类型取值、SQL 字面量渲染 |
+| `zzig.Decimal` | C# `Decimal` | ✅ 尾数×10^-scale 表示、解析/格式化（保留尾随零）/数值比较 |
+| `zzig.DateTime` | XCode 时间口径 | ✅ 7 位小数秒解析与格式化、Unix 秒换算 |
+| `zzig.db.Value` | 字段值 / `DbType` 转换 | ✅ 跨类型取值、SQL 字面量渲染 |
 | `model` | `Model.xml` / `EntityModel` | ✅ 解析 + 写出（往返一致）、未识别属性原样保留 |
 | `dialect` | 各 `DbBase` 子类 | ✅ SQLite / MySQL / SQL Server / PostgreSQL（含金仓/瀚高/海量）/ Oracle：类型映射、DDL、索引、分页 |
 | `query` | `WhereExpression` / `PageParameter` | ✅ 14 种条件运算符、`IN` 空集恒假/恒真、多列 `OR` |
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT / UPDATE / DELETE / SELECT / COUNT |
 | `session` | `IDbSession` | ✅ 同步会话：execute / query / 标量 / 自增回写 |
-| `sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
+| `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
 | `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
 | `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等） |
 
