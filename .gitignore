@@ -1,7 +1,8 @@
 # ---- Zig 构建产物 ----
-.zig-cache/
-zig-cache/
-zig-out/
+# 用通配符：`--cache-dir .zig-cache-xxx` 这类临时缓存目录也要一并忽略
+.zig-cache*/
+zig-cache*/
+zig-out*/
 *.pdb
 *.obj
 *.o
@@ -20,6 +21,9 @@ artifacts/
 
 # ---- 发版产物 ----
 dist/
+
+# ---- 本地测试实例（tools/mysql-local.ps1 建的数据目录与日志，不入库）----
+.tools/
 
 # ---- 编辑器 / 系统 ----
 .vscode/.browse*

@@ -642,8 +642,8 @@ test "MySQL 真库：建表 → CRUD → 分页（需 -Dmysql-conn）" {
     }, &w);
     try std.testing.expectEqual(@as(usize, 1), n);
 
-    const rows = try table.queryRows(&s, null, null, 0, 0);
-    try std.testing.expect(rows.len >= 1);
+    const total = try table.count(&s, null);
+    try std.testing.expect(total >= 1);
 
     try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
     _ = s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{}) catch {};

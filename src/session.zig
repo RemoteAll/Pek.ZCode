@@ -1,9 +1,11 @@
 //! 会话：一次连接 + 结果集 arena。
 //!
-//! 与 DH.NCode `IDbSession` 的对应关系（第一轮只实现同步、单连接）：
+//! 与 DH.NCode `IDbSession` 的对应关系：
 //! - `execute` ≈ `Execute`（增删改）
 //! - `queryRows` ≈ `Query`（返回行集）
 //! - `lastInsertId` ≈ `Identity` 回写
+//! - `beginTransaction` / `commit` / `rollback` ≈ `BeginTransaction` / `Commit` / `Rollback`
+//!   （**可嵌套、按计数**：只有计数回到 0 才真正 COMMIT/ROLLBACK，与 C# `Transaction` 一致）
 //!
 //! 生命周期约定：查询返回的行/字符串都分配在会话自己的 arena 上，**下一次查询不会失效**；
 //! 需要长期持有请 `dupe` 出去，或定期 `resetResults()` 回收。
@@ -15,6 +17,29 @@ const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
 pub const Row = sqlite.Row; // == zzig.db.Row，两个驱动共用同一行结构
+
+/// 事务隔离级别（对应 `System.Data.IsolationLevel`）。
+/// `default` = 用数据库默认级别（SQLite 无从设置，MySQL 默认 REPEATABLE READ）。
+pub const IsolationLevel = enum {
+    default,
+    read_uncommitted,
+    read_committed,
+    repeatable_read,
+    serializable,
+    /// 快照隔离（SQL Server 系）；SQLite/MySQL 显式 `error.Unsupported`
+    snapshot,
+
+    pub fn sqlText(self: IsolationLevel) ?[]const u8 {
+        return switch (self) {
+            .default => null,
+            .read_uncommitted => "READ UNCOMMITTED",
+            .read_committed => "READ COMMITTED",
+            .repeatable_read => "REPEATABLE READ",
+            .serializable => "SERIALIZABLE",
+            .snapshot => null,
+        };
+    }
+};
 
 /// 会话底层驱动（当前只支持 SQLite / MySQL；其它方言在 Dal 层已报 `error.Unsupported`）。
 pub const Driver = union(enum) {
@@ -28,6 +53,8 @@ pub const Session = struct {
     driver: Driver,
     read_only: bool = false,
     arena: std.heap.ArenaAllocator,
+    /// 事务嵌套计数（0 = 不在事务中；1 = 最外层，真正持有 BEGIN）
+    tx_depth: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, db: sqlite.Db) Session {
         return initWithDriver(gpa, kind, .{ .sqlite = db });
@@ -147,6 +174,116 @@ pub const Session = struct {
             .mysql => error.Unsupported,
         };
     }
+
+    // ── 事务（对应 C# `DbSession.BeginTransaction/Commit/Rollback`）──────────
+
+    pub fn inTransaction(self: *const Session) bool {
+        return self.tx_depth > 0;
+    }
+
+    /// 开始（或嵌套进入）事务，返回剩余计数。
+    /// 与 C# 一致：**只有计数从 0 变为 1 时才真正 BEGIN**，嵌套只是计数。
+    pub fn beginTransaction(self: *Session, level: IsolationLevel) !u32 {
+        if (self.read_only) return error.ReadOnly;
+
+        const is_outer = self.tx_depth == 0;
+        self.tx_depth += 1;
+        errdefer self.tx_depth -= 1;
+
+        if (!is_outer) return self.tx_depth;
+
+        switch (self.kind) {
+            .sqlite => {
+                _ = try self.execute("BEGIN", &.{});
+            },
+            .mysql => {
+                if (level != .default) {
+                    const text = level.sqlText() orelse {
+                        std.debug.print("[zcode] 事务：MySQL 不支持隔离级别 {s}\n", .{@tagName(level)});
+                        return error.Unsupported;
+                    };
+                    const sql = try std.fmt.allocPrint(self.gpa, "SET TRANSACTION ISOLATION LEVEL {s}", .{text});
+                    defer self.gpa.free(sql);
+                    _ = try self.execute(sql, &.{});
+                }
+                _ = try self.execute("START TRANSACTION", &.{});
+            },
+            else => return error.Unsupported,
+        }
+        return self.tx_depth;
+    }
+
+    /// 提交（计数减一；减到 0 时才真正 COMMIT），返回剩余计数。
+    pub fn commit(self: *Session) !u32 {
+        if (self.tx_depth == 0) return error.NoTransaction;
+
+        self.tx_depth -= 1;
+        errdefer self.tx_depth += 1;
+
+        if (self.tx_depth == 0) {
+            switch (self.kind) {
+                .sqlite, .mysql => _ = try self.execute("COMMIT", &.{}),
+                else => return error.Unsupported,
+            }
+        }
+        return self.tx_depth;
+    }
+
+    /// 回滚（计数减一；减到 0 时才真正 ROLLBACK），返回剩余计数。
+    /// `ignore_exception` = true 时吞掉数据库错误（与 C# `Rollback(ignoreException = true)` 一致）。
+    pub fn rollback(self: *Session, ignore_exception: bool) !u32 {
+        if (self.tx_depth == 0) {
+            if (ignore_exception) return 0;
+            return error.NoTransaction;
+        }
+
+        self.tx_depth -= 1;
+        if (self.tx_depth > 0) return self.tx_depth;
+
+        switch (self.kind) {
+            .sqlite, .mysql => {
+                _ = self.execute("ROLLBACK", &.{}) catch |e| {
+                    if (ignore_exception) {
+                        std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
+                        return 0;
+                    }
+                    return e;
+                };
+            },
+            else => return error.Unsupported,
+        }
+        return 0;
+    }
+
+    /// 作用域事务（对应 C# `EntityTransaction<T>`）：`deinit` 时未提交即自动回滚。
+    pub const Scoped = struct {
+        session: *Session,
+        finished: bool = false,
+
+        pub fn begin(session: *Session) !Scoped {
+            return beginWith(session, .default);
+        }
+
+        pub fn beginWith(session: *Session, level: IsolationLevel) !Scoped {
+            _ = try session.beginTransaction(level);
+            return .{ .session = session };
+        }
+
+        pub fn commit(self: *Scoped) !void {
+            _ = try self.session.commit();
+            self.finished = true;
+        }
+
+        pub fn rollback(self: *Scoped) void {
+            _ = self.session.rollback(true) catch 0;
+            self.finished = true;
+        }
+
+        /// 未提交就离开作用域 → 回滚（吞掉异常，保证 defer ��不会炸）
+        pub fn deinit(self: *Scoped) void {
+            if (!self.finished) self.rollback();
+        }
+    };
 };
 
 test "会话基本 CRUD（内存库）" {
