@@ -648,3 +648,128 @@ test "MySQL 真库：建表 → CRUD → 分页（需 -Dmysql-conn）" {
     try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
     _ = s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{}) catch {};
 }
+
+// ── 事务 ───────────────────────────────────────────────────────────────────
+fn insertOne(dal: *zcode.Dal, s: *zcode.session.Session, code: []const u8) !i64 {
+    var e = JiLiYu{};
+    e.@"Code" = code;
+    e.@"Title" = "tx";
+    e.@"Amount" = try zcode.Decimal.parse("1");
+    e.@"Ok" = true;
+    e.@"CreateTime" = zcode.DateTime.nowLocal();
+    return try zcode.entity.insert(dal, &e, s);
+}
+
+test "事务：提交 / 回滚 / 嵌套计数（对齐 C# Transaction 语义）" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "tx");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    _ = try table.delete(&s, null);
+
+    // 1) 回滚：插入不落库
+    try std.testing.expectEqual(@as(u32, 1), try s.beginTransaction(.default));
+    _ = try insertOne(&dal, &s, "tx-rb");
+    try std.testing.expectEqual(@as(u32, 0), try s.rollback(false));
+    try std.testing.expect(!s.inTransaction());
+    try std.testing.expectEqual(@as(i64, 0), try table.count(&s, null));
+
+    // 2) 提交：落库
+    try std.testing.expectEqual(@as(u32, 1), try s.beginTransaction(.default));
+    _ = try insertOne(&dal, &s, "tx-ok");
+    try std.testing.expectEqual(@as(u32, 0), try s.commit());
+    try std.testing.expectEqual(@as(i64, 1), try table.count(&s, null));
+
+    // 3) 嵌套计数：内层 rollback 只减计数（不回滚），外层 commit 才真正提交
+    //    —— 与 C# `Transaction.Rollback()` 的计数语义一致
+    try std.testing.expectEqual(@as(u32, 1), try s.beginTransaction(.default));
+    try std.testing.expectEqual(@as(u32, 2), try s.beginTransaction(.default));
+    _ = try insertOne(&dal, &s, "tx-nested");
+    try std.testing.expectEqual(@as(u32, 1), try s.rollback(false));
+    try std.testing.expectEqual(@as(u32, 0), try s.commit());
+    try std.testing.expectEqual(@as(i64, 2), try table.count(&s, null));
+
+    // 4) 不在事务里提交 → 明确报错（不静默成功）
+    try std.testing.expectError(error.NoTransaction, s.commit());
+    try std.testing.expectError(error.NoTransaction, s.rollback(false));
+}
+
+test "事务：Scoped 未提交自动回滚（对应 EntityTransaction 的 Dispose 语义）" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "tx-scope");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    _ = try table.delete(&s, null);
+
+    {
+        var tx = try zcode.ScopedTransaction.begin(&s);
+        defer tx.deinit();
+        _ = try insertOne(&dal, &s, "scope-rb");
+        // 故意不 commit
+    }
+    try std.testing.expectEqual(@as(i64, 0), try table.count(&s, null));
+
+    {
+        var tx = try zcode.ScopedTransaction.begin(&s);
+        defer tx.deinit();
+        _ = try insertOne(&dal, &s, "scope-ok");
+        try tx.commit();
+    }
+    try std.testing.expectEqual(@as(i64, 1), try table.count(&s, null));
+}
+
+// MySQL 真库：BIT 列在文本协议下的字节序。
+// 口径分歧：C# 绿色版 `DH.MySql` 按小端还原，Rust `Pek.RCode` 按大端；
+// 这里用真实服务器一次定死（b16 存 0x0102：大端读到 258，小端读到 513）。
+test "MySQL 真库：BIT 列字节序（需 -Dmysql-conn）" {
+    const conn_str = build_options.mysql_conn;
+    if (conn_str.len == 0) {
+        std.debug.print("[SKIP] 未提供 -Dmysql-conn，跳过 BIT 字节序用例\n", .{});
+        return;
+    }
+
+    const a = std.testing.allocator;
+    var dal = try zcode.Dal.initWithModel(a, conn_str, try zcode.EntityModel.parse(a, model_xml));
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try s.execute("DROP TABLE IF EXISTS bit_probe", &.{});
+    _ = try s.execute("CREATE TABLE bit_probe (id INT PRIMARY KEY, b8 BIT(8), b16 BIT(16)) ENGINE=InnoDB", &.{});
+    _ = try s.execute("INSERT INTO bit_probe VALUES (1, b'10000001', b'0000000100000010')", &.{});
+
+    const rows = try s.queryRows("SELECT b8, b16 FROM bit_probe WHERE id = 1", &.{});
+    defer _ = s.execute("DROP TABLE IF EXISTS bit_probe", &.{}) catch {};
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const b8 = rows[0].get("b8").?.asI64().?;
+    const b16 = rows[0].get("b16").?.asI64().?;
+    std.debug.print("[BIT] 真库读回：b8={d}（期望 129） b16={d}（期望 258）\n", .{ b8, b16 });
+    try std.testing.expectEqual(@as(i64, 129), b8);
+    // 实测结论：MySQL 线上为大端（存 0x0102 → 字节 [0x01,0x02] → 258）
+    try std.testing.expectEqual(@as(i64, 258), b16);
+}

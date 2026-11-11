@@ -43,6 +43,12 @@ pub const buf = zzig.Buf;
 /// 文件工具（`zzig.File`：唯一临时名 / 静默删除）
 pub const File = zzig.File;
 pub const session = @import("session.zig");
+/// 会话（execute / query / 自增回写 / 事务）
+pub const Session = session.Session;
+/// 事务隔离级别（对应 `System.Data.IsolationLevel`）
+pub const IsolationLevel = session.IsolationLevel;
+/// 作用域事务：`deinit` 时未提交即自动回滚（对应 C# `EntityTransaction`）
+pub const ScopedTransaction = session.Session.Scoped;
 /// SQLite 驱动（`zzig.sqlite`：动态加载 DLL，不链 libc）
 pub const sqlite = zzig.sqlite;
 /// MySQL 驱动（`zzig.mysql`：纯 wire protocol，不依赖 libmysqlclient）
