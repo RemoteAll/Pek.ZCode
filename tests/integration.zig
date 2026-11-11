@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const zcode = @import("zcode");
+const build_options = @import("build_options");
 
 const model_xml =
     \\<?xml version="1.0" encoding="utf-8"?>
@@ -440,4 +441,210 @@ test "整表缓存：命中 / 写后自动失效 / TTL 过期重载" {
     // 手动失效
     c.invalidate();
     try std.testing.expectEqual(@as(usize, 4), try c.count(&s));
+}
+
+test "单对象缓存：命中 / TTL 过期回库 / 写后自动失效" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "singlecache");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = try openDal(a, db_path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    _ = try table.delete(&s, null);
+
+    var id: i32 = 0;
+    {
+        var e = JiLiYu{};
+        e.Code = "sc-1";
+        e.Title = "原始";
+        e.Amount = try zcode.Decimal.parse("0");
+        e.Ok = true;
+        e.CreateTime = zcode.DateTime.nowLocal();
+        id = @intCast(try zcode.entity.insert(&dal, &e, &s));
+    }
+
+    var c = zcode.cache.SingleCache(JiLiYu).init(&dal, 60);
+    defer c.deinit();
+
+    const v1 = (try c.get(&s, id)).?;
+    try std.testing.expectEqualStrings("原始", v1.Title);
+    try std.testing.expectEqual(@as(usize, 1), c.cachedCount());
+
+    // 绕过 TableRef 直接改库：缓存仍返回旧值（说明没有每次回库）
+    _ = try s.execute("UPDATE \"DH_JiLiYu\" SET \"Title\" = ? WHERE \"Id\" = ?", &.{
+        .{ .text = "直改" },
+        .{ .int = id },
+    });
+    const v2 = (try c.get(&s, id)).?;
+    try std.testing.expectEqualStrings("原始", v2.Title);
+
+    // TTL 过期 → 回库拿到新值
+    c.entries.getPtr(id).?.loaded_at -= 100;
+    const v3 = (try c.get(&s, id)).?;
+    try std.testing.expectEqualStrings("直改", v3.Title);
+
+    // 通过 TableRef 写入 → 自动失效（条目被清空）
+    var w = zcode.Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Id", .{ .int = id });
+    _ = try table.update(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "写后失效" } },
+    }, &w);
+    try std.testing.expectEqual(@as(usize, 0), c.cachedCount());
+
+    const v4 = (try c.get(&s, id)).?;
+    try std.testing.expectEqualStrings("写后失效", v4.Title);
+}
+
+// 生产模型回归：固件来自 C# 仓库 `DH.NCode/DH.NCode/Model.xml`（9 张表、200 列、7 种数据类型）。// 只做「解析 + 方言 DDL 生成 + 往返」——**不连库**，所以任何机器都能跑。
+test "生产模型回归：DH.NCode 内置 Model.xml 可解析并生成 SQLite 建表 SQL" {
+    const a = std.testing.allocator;
+
+    var m = try zcode.EntityModel.load(a, "tests/fixtures/dh-ncode-model.xml");
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 9), m.tables.len);
+    try std.testing.expect(m.options.connName() != null);
+
+    var total_columns: usize = 0;
+    var index_statements: usize = 0;
+
+    for (m.tables) |*t| {
+        try std.testing.expect(t.columns.len > 0);
+        total_columns += t.columns.len;
+
+        // XCode 模型约定：每张表至少一个主键
+        const pks = try t.primaryKeys(a);
+        defer a.free(pks);
+        try std.testing.expect(pks.len > 0);
+
+        const stmts = try zcode.dialect.DatabaseKind.sqlite.createTableAlloc(a, t);
+        defer {
+            for (stmts) |stmt| a.free(stmt);
+            a.free(stmts);
+        }
+        try std.testing.expect(stmts.len >= 1);
+        try std.testing.expect(std.mem.startsWith(u8, stmts[0], "CREATE TABLE "));
+        // 非自增主键应生成表级 PRIMARY KEY
+        if (t.identity() == null) {
+            try std.testing.expect(std.mem.indexOf(u8, stmts[0], "PRIMARY KEY (") != null);
+        }
+        for (stmts) |stmt| {
+            if (std.mem.startsWith(u8, stmt, "CREATE INDEX ") or std.mem.startsWith(u8, stmt, "CREATE UNIQUE INDEX ")) {
+                index_statements += 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 200), total_columns);
+    try std.testing.expect(index_statements > 0);
+
+    // 解析 → 写出 → 再解析：表/列/索引数量一致（未识别属性不丢）
+    const xml = try m.toXmlAlloc(a);
+    defer a.free(xml);
+    var m2 = try zcode.EntityModel.parse(a, xml);
+    defer m2.deinit();
+
+    try std.testing.expectEqual(m.tables.len, m2.tables.len);
+    for (m.tables, 0..) |t, i| {
+        const t2 = &m2.tables[i];
+        try std.testing.expectEqualStrings(t.name, t2.name);
+        try std.testing.expectEqualStrings(t.effectiveTableName(), t2.effectiveTableName());
+        try std.testing.expectEqual(t.columns.len, t2.columns.len);
+        try std.testing.expectEqual(t.indexes.len, t2.indexes.len);
+    }
+}
+
+// ── MySQL ───────────────────────────────────────────────────────────────────
+
+test "MySQL 连接串解析：Server/Port/Database/Uid/Pwd（不连库）" {
+    const a = std.testing.allocator;
+    var o = try zcode.parseConnectionString(a, "Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode;Uid=root;Pwd=secret;Migration=On");
+    defer o.deinit(a);
+
+    try std.testing.expectEqual(zcode.DatabaseKind.mysql, o.provider);
+    try std.testing.expectEqualStrings("127.0.0.1", o.server);
+    try std.testing.expectEqual(@as(u16, 3307), o.port);
+    try std.testing.expectEqualStrings("zcode", o.database);
+    try std.testing.expectEqualStrings("root", o.user);
+    try std.testing.expectEqualStrings("secret", o.password);
+    try std.testing.expectEqual(zcode.Migration.on, o.migration.?);
+
+    // 别名键（Host/User/Password）也要认
+    var o2 = try zcode.parseConnectionString(a, "Provider=MySQL;Host=db.local;User=u;Password=p;DataBase=mes");
+    defer o2.deinit(a);
+    try std.testing.expectEqualStrings("db.local", o2.server);
+    try std.testing.expectEqualStrings("u", o2.user);
+    try std.testing.expectEqualStrings("p", o2.password);
+    try std.testing.expectEqualStrings("mes", o2.database);
+    try std.testing.expectEqual(@as(u16, 3306), o2.port); // 未给 Port 用默认
+}
+
+// MySQL 真库端到端：需 `zig build integration -Dmysql-conn="Server=...;Database=...;Uid=...;Pwd=..."`。
+// 没给连接串时**显式 SKIP**（打印原因），绝不静默当成通过。
+test "MySQL 真库：建表 → CRUD → 分页（需 -Dmysql-conn）" {
+    const conn_str = build_options.mysql_conn;
+    if (conn_str.len == 0) {
+        std.debug.print("[SKIP] 未提供 -Dmysql-conn，跳过 MySQL 真库集成测试\n", .{});
+        return;
+    }
+
+    const a = std.testing.allocator;
+    const m = try zcode.EntityModel.parse(a, model_xml);
+    var dal = zcode.Dal.initWithModel(a, conn_str, m) catch |e| {
+        std.debug.print("[FAIL] 连接 MySQL 失败：{s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    // 幂等：先清掉旧表，保证从零建表也走一遍
+    _ = s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{}) catch |e| {
+        std.debug.print("[FAIL] 清理旧表失败：{s}（{s}）\n", .{ @errorName(e), s.lastError() });
+        return e;
+    };
+
+    const report = try dal.syncSchema(&s);
+    try std.testing.expectEqual(@as(usize, 1), report.tables_created);
+    try std.testing.expectEqual(@as(usize, 0), report.columns_added);
+
+    const table = try dal.table("JiLiYu");
+
+    var id: i32 = 0;
+    {
+        var e = JiLiYu{};
+        e.@"Code" = "my-1";
+        e.@"Title" = "MySQL 原始";
+        e.@"Amount" = try zcode.Decimal.parse("12.3400");
+        e.@"Ok" = true;
+        e.@"CreateTime" = zcode.DateTime.nowLocal();
+        id = @intCast(try zcode.entity.insert(&dal, &e, &s));
+        try std.testing.expect(id > 0);
+    }
+
+    const found = (try table.findByPk(&s, &.{.{ .int = id }})).?;
+    try std.testing.expectEqualStrings("MySQL 原始", found.get("Title").?.text);
+
+    var w = zcode.Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Id", .{ .int = id });
+    const n = try table.update(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "MySQL 改过" } },
+    }, &w);
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    const rows = try table.queryRows(&s, null, null, 0, 0);
+    try std.testing.expect(rows.len >= 1);
+
+    try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
+    _ = s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{}) catch {};
 }

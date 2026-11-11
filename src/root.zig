@@ -45,9 +45,17 @@ pub const File = zzig.File;
 pub const session = @import("session.zig");
 /// SQLite 驱动（`zzig.sqlite`：动态加载 DLL，不链 libc）
 pub const sqlite = zzig.sqlite;
+/// MySQL 驱动（`zzig.mysql`：纯 wire protocol，不依赖 libmysqlclient）
+pub const mysql = zzig.mysql;
 pub const dbtable = @import("dbtable.zig");
 pub const dal = @import("dal.zig");
+/// 数据访问层（连接 / 结构同步 / 缓存失效）
 pub const Dal = dal.Dal;
+/// 连接串解析（XCode 口径：`Data Source=...;Provider=...`，MySQL 用 `Server/Port/Uid/Pwd/Database`）
+pub const parseConnectionString = dal.parseConnectionString;
+pub const ConnectionOptions = dal.ConnectionOptions;
+/// 迁移档位（`Off` / `ReadOnly` / `On` / `Full`）
+pub const Migration = model.Migration;
 /// 对象实体（脏字段更新 / insert / save / update / delete / find / query）
 pub const entity = @import("entity.zig");
 /// 整表实体缓存（Blocking 一致性 + 写后自动失效）

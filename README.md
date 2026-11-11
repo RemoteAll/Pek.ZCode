@@ -21,15 +21,19 @@
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT / UPDATE / DELETE / SELECT / COUNT |
 | `session` | `IDbSession` | ✅ 同步会话：execute / query / 标量 / 自增回写 |
 | `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
+| `zzig.mysql` | `MySql.cs` | ✅ **绿色版纯协议驱动**：手握手 v10 + `mysql_native_password` / `caching_sha2` fast auth、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
 | `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
 | `entity` | `Entity`（对象实体） | ✅ 脏字段更新（只写变化列、无变化不发 SQL）、insert/save/update/delete/find/query/count、`insert_only`/视图保护 |
 | `batch` | `EntityExtension`（批量写） | ✅ `insertBatch`（多行 VALUES，按方言参数上限分批）/ `deleteByPkBatch` / `saveBatch`（新增合并批插、已有按脏列逐条更新） |
-| `cache` | `Meta.Cache`（整表实体缓存） | ✅ TTL 过期同步重载（Blocking 一致性）、主键 O(1) 命中、**写后自动失效**、`ttl=0` 不过期 |
+| `cache` | `Meta.Cache`（整表实体缓存） | ✅ TTL 过期同步重载（Blocking 一致性）、主键 O(1) 命中、**写后自动失效**、`ttl=0` 不过期；另有 `SingleCache`（单对象缓存，按主键缓存单行） |
 | `codegen` + `zcodegen` | `XCodeTool` / `rcodegen` | ✅ `Model.xml` → Zig 实体（meta/脏位图/访问器/取值与装载） |
 | `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等） |
 
-**本轮未做**（后续轮次）：对象实体与脏字段更新、整表/单对象缓存、批量写、分表、
-其它数据库驱动、反向工程、备份、代码生成器、读写分离。
+**本轮未做**（后续轮次）：分表、反向工程、备份、读写分离、SQL Server / PostgreSQL / Oracle 驱动。
+
+MySQL 驱动的能力边界（均**显式报错**、不静默降级）：不支持 TLS、不支持 `caching_sha2_password` 的
+完整鉴权（明文连接需 RSA 公钥交换）、不开启 `CLIENT_MULTI_STATEMENTS` / `CLIENT_FOUND_ROWS`。
+真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
 

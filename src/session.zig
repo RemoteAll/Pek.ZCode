@@ -10,25 +10,39 @@
 
 const std = @import("std");
 const sqlite = @import("zzig").sqlite;
+const mysql = @import("zzig").mysql;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
-pub const Row = sqlite.Row;
+pub const Row = sqlite.Row; // == zzig.db.Row，两个驱动共用同一行结构
+
+/// 会话底层驱动（当前只支持 SQLite / MySQL；其它方言在 Dal 层已报 `error.Unsupported`）。
+pub const Driver = union(enum) {
+    sqlite: sqlite.Db,
+    mysql: mysql.Conn,
+};
 
 pub const Session = struct {
     gpa: std.mem.Allocator,
     kind: DatabaseKind,
-    db: sqlite.Db,
+    driver: Driver,
     read_only: bool = false,
     arena: std.heap.ArenaAllocator,
 
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, db: sqlite.Db) Session {
-        return .{ .gpa = gpa, .kind = kind, .db = db, .arena = std.heap.ArenaAllocator.init(gpa) };
+        return initWithDriver(gpa, kind, .{ .sqlite = db });
+    }
+
+    pub fn initWithDriver(gpa: std.mem.Allocator, kind: DatabaseKind, driver: Driver) Session {
+        return .{ .gpa = gpa, .kind = kind, .driver = driver, .arena = std.heap.ArenaAllocator.init(gpa) };
     }
 
     pub fn deinit(self: *Session) void {
         self.arena.deinit();
-        self.db.close();
+        switch (self.driver) {
+            .sqlite => |*db| db.close(),
+            .mysql => |*conn| conn.deinit(),
+        }
     }
 
     /// 结果集 allocator（行/字符串都从这里分配）。
@@ -44,38 +58,63 @@ pub const Session = struct {
     /// 执行增删改（写会话才允许；只读副本在调用点即失败）。
     pub fn execute(self: *Session, sql: []const u8, params: []const Value) !usize {
         if (self.read_only) return error.ReadOnly;
-        const stmt = try self.db.prepare(self.gpa, sql);
-        defer stmt.finalize();
-        stmt.bindAll(params) catch |e| {
-            std.debug.print("[zcode] 参数绑定失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, self.db.lastError() });
-            return e;
-        };
-        stmt.run() catch |e| {
-            std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, self.db.lastError() });
-            return e;
-        };
-        return self.db.changes();
+        switch (self.driver) {
+            .sqlite => |*db| {
+                const stmt = try db.prepare(self.gpa, sql);
+                defer stmt.finalize();
+                stmt.bindAll(params) catch |e| {
+                    std.debug.print("[zcode] 参数绑定失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                    return e;
+                };
+                stmt.run() catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                    return e;
+                };
+                return db.changes();
+            },
+            .mysql => |*conn| {
+                const n = conn.exec(sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
+        }
     }
 
     /// 查询（返回行集，含列名）。
-    pub fn queryRows(self: *Session, sql: []const u8, params: []const Value) ![]Row {
-        const stmt = try self.db.prepare(self.gpa, sql);
-        defer stmt.finalize();
-        try stmt.bindAll(params);
+    pub fn queryRows(self: *Session, sql: []const u8, params: []const Value) ![]const Row {
+        switch (self.driver) {
+            .sqlite => |*db| {
+                const stmt = try db.prepare(self.gpa, sql);
+                defer stmt.finalize();
+                try stmt.bindAll(params);
 
-        const arena = self.arena.allocator();
-        var rows: std.ArrayList(Row) = .empty;
-        while (true) {
-            const rc = self.db.lib.step(stmt.handle);
-            if (rc == sqlite.sqlite_row) {
-                try rows.append(arena, try stmt.readRow(arena));
-                continue;
-            }
-            if (rc == sqlite.sqlite_done) break;
-            self.setErrorFromDb();
-            return error.Sqlite;
+                const arena = self.arena.allocator();
+                var rows: std.ArrayList(Row) = .empty;
+                while (true) {
+                    const rc = db.lib.step(stmt.handle);
+                    if (rc == sqlite.sqlite_row) {
+                        try rows.append(arena, try stmt.readRow(arena));
+                        continue;
+                    }
+                    if (rc == sqlite.sqlite_done) break;
+                    return error.Sqlite;
+                }
+                return rows.toOwnedSlice(arena);
+            },
+            .mysql => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows.rows,
+                    // DDL 等无结果集语句：返回空行集（与 SQLite 侧行为一致）
+                    .ok => &.{},
+                };
+            },
         }
-        return rows.toOwnedSlice(arena);
     }
 
     /// 查询单值（第一列第一行）；无行返回 null。
@@ -87,21 +126,26 @@ pub const Session = struct {
     }
 
     pub fn lastInsertId(self: *Session) i64 {
-        return self.db.lastInsertId();
+        return switch (self.driver) {
+            .sqlite => |*db| db.lastInsertId(),
+            .mysql => |*conn| conn.lastInsertId(),
+        };
     }
 
     pub fn lastError(self: *Session) []const u8 {
-        return self.db.lastError();
-    }
-
-    fn setErrorFromDb(self: *Session) void {
-        // sqlite 已在 Db 内记录 errmsg；这里保留接口对称性
-        _ = self;
+        return switch (self.driver) {
+            .sqlite => |*db| db.lastError(),
+            .mysql => |*conn| conn.lastError(),
+        };
     }
 
     /// 预编译语句，供批量写/游标读取复用（调用方负责 finalize）。
+    /// MySQL 侧走预处理协议但不由上层复用（每次 prepare/execute/close），故不支持。
     pub fn prepare(self: *Session, sql: []const u8) !sqlite.Stmt {
-        return self.db.prepare(self.gpa, sql);
+        return switch (self.driver) {
+            .sqlite => |*db| db.prepare(self.gpa, sql),
+            .mysql => error.Unsupported,
+        };
     }
 };
 

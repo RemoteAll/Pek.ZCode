@@ -109,6 +109,19 @@ if (-not (Test-Path $buildZig)) {
         }
     } else {
         Add-Log '[SKIP] 没有 codegen 步骤或 examples\entities 目录——跳过生成漂移检查'
+    }
+
+    # 公共库 zzig（源码依赖）：改了它必须一起回归，否则本仓可能被下游改动打破而不自知
+    $zzigDir = Join-Path (Split-Path $root -Parent) 'zzig'
+    if (Test-Path (Join-Path $zzigDir 'build.zig')) {
+        Push-Location $zzigDir
+        try {
+            Invoke-External 'zzig: zig build test（公共库）' $zigCmd.Source @('build', 'test')
+        } finally {
+            Pop-Location
+        }
+    } else {
+        Add-Log "[SKIP] 未找到公共库 $zzigDir——跳过 zzig 回归"
     }}
 
 Add-Log ''

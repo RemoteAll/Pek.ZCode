@@ -37,6 +37,13 @@ pub fn build(b: *std.Build) void {
     });
     itest_mod.addImport("zcode", zcode);
 
+    // MySQL 真库集成用例：只有传了 `-Dmysql-conn="Server=...;Database=...;Uid=...;Pwd=..."`
+    // 才会真正连库；未传时用例显式打印 SKIP 原因（不静默通过）。
+    const mysql_conn = b.option([]const u8, "mysql-conn", "MySQL 连接串（提供时跑真库集成测试）") orelse "";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "mysql_conn", mysql_conn);
+    itest_mod.addOptions("build_options", build_options);
+
     const itests = b.addTest(.{
         .name = "zcode-integration",
         .root_module = itest_mod,

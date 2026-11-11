@@ -12,6 +12,7 @@ const Migration = model.Migration;
 const dialect = @import("dialect.zig");
 const DatabaseKind = dialect.DatabaseKind;
 const sqlite = @import("zzig").sqlite;
+const mysql = @import("zzig").mysql;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -24,14 +25,28 @@ pub const ConnectionOptions = struct {
     show_sql: bool = false,
     read_only: bool = false,
     pooling: ?bool = null,
+    /// MySQL 专属（`Provider=MySQL` 时才用）：服务器 / 端口 / 账号 / 库名
+    server: []const u8 = "",
+    port: u16 = 3306,
+    user: []const u8 = "",
+    password: []const u8 = "",
+    database: []const u8 = "",
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
     extra: []model.KeyValue = &.{},
 
-    /// 释放自持内存（`data_source` 与 `extra`）。
+    /// 释放自持内存（`data_source` / MySQL 字段 / `extra`）。
     pub fn deinit(self: *ConnectionOptions, gpa: std.mem.Allocator) void {
         if (self.data_source.len > 0) gpa.free(self.data_source);
+        if (self.server.len > 0) gpa.free(self.server);
+        if (self.user.len > 0) gpa.free(self.user);
+        if (self.password.len > 0) gpa.free(self.password);
+        if (self.database.len > 0) gpa.free(self.database);
         if (self.extra.len > 0) gpa.free(self.extra);
         self.data_source = "";
+        self.server = "";
+        self.user = "";
+        self.password = "";
+        self.database = "";
         self.extra = &.{};
     }
 };
@@ -62,6 +77,19 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
         {
             // **必须复制**：连接串通常来自临时缓冲，Dal 生命周期远长于它
             opts.data_source = try gpa.dupe(u8, value);
+            if (std.ascii.eqlIgnoreCase(key, "DataBase")) {
+                opts.database = try gpa.dupe(u8, value);
+            }
+        } else if (std.ascii.eqlIgnoreCase(key, "Server") or std.ascii.eqlIgnoreCase(key, "Host")) {
+            opts.server = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Port")) {
+            opts.port = std.fmt.parseInt(u16, value, 10) catch 3306;
+        } else if (std.ascii.eqlIgnoreCase(key, "Uid") or std.ascii.eqlIgnoreCase(key, "User") or
+            std.ascii.eqlIgnoreCase(key, "User Id") or std.ascii.eqlIgnoreCase(key, "Username"))
+        {
+            opts.user = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Pwd") or std.ascii.eqlIgnoreCase(key, "Password")) {
+            opts.password = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Migration")) {
             opts.migration = Migration.parse(value);
         } else if (std.ascii.eqlIgnoreCase(key, "ShowSql")) {
@@ -104,7 +132,8 @@ pub const Dal = struct {
     gpa: std.mem.Allocator,
     model: EntityModel,
     opts: ConnectionOptions,
-    lib: sqlite.Lib,
+    /// SQLite 动态库句柄（`Provider=MySQL` 时为 null，MySQL 走纯协议不需外部库）
+    lib: ?sqlite.Lib = null,
     /// 整表实体缓存注册表（写操作后按表名使缓存失效）
     cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
 
@@ -127,21 +156,28 @@ pub const Dal = struct {
         var opts_owned = try parseConnectionString(gpa, conn_str);
         errdefer freeOptions(gpa, &opts_owned);
 
-        if (opts_owned.data_source.len == 0) return error.NoConnection;
-        if (opts_owned.provider != .sqlite) return error.Unsupported;
-
-        const lib = try sqlite.Lib.load(gpa);
-        return Dal{
-            .gpa = gpa,
-            .model = m,
-            .opts = opts_owned,
-            .lib = lib,
-        };
+        switch (opts_owned.provider) {
+            .sqlite => {
+                if (opts_owned.data_source.len == 0) return error.NoConnection;
+                const lib = try sqlite.Lib.load(gpa);
+                return Dal{ .gpa = gpa, .model = m, .opts = opts_owned, .lib = lib };
+            },
+            .mysql => {
+                // MySQL 连接串的 "host" 可能写在 Server / Data Source 任一键里
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                if (opts_owned.database.len == 0) return error.NoDatabase;
+                return Dal{ .gpa = gpa, .model = m, .opts = opts_owned };
+            },
+            else => return error.Unsupported,
+        }
     }
 
     pub fn deinit(self: *Dal) void {
         self.cache_hooks.deinit(self.gpa);
-        self.lib.deinit();
+        if (self.lib) |*lib| lib.deinit();
         self.opts.deinit(self.gpa);
         self.model.deinit();
     }
@@ -176,11 +212,29 @@ pub const Dal = struct {
 
     /// 打开一个写会话；`Readonly=true` 时打开只读会话（写入在调用点报错）。
     pub fn openSession(self: *Dal) !Session {
-        var db = try sqlite.Db.open(&self.lib, self.opts.data_source);
-        errdefer db.close();
-        var s = Session.init(self.gpa, self.opts.provider, db);
-        s.read_only = self.opts.read_only;
-        return s;
+        switch (self.opts.provider) {
+            .sqlite => {
+                const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
+                var db = try sqlite.Db.open(lib_ptr, self.opts.data_source);
+                errdefer db.close();
+                var s = Session.init(self.gpa, .sqlite, db);
+                s.read_only = self.opts.read_only;
+                return s;
+            },
+            .mysql => {
+                const conn = try mysql.Conn.open(self.gpa, .{
+                    .host = self.opts.server,
+                    .port = self.opts.port,
+                    .user = self.opts.user,
+                    .password = self.opts.password,
+                    .database = self.opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
+                s.read_only = self.opts.read_only;
+                return s;
+            },
+            else => return error.Unsupported,
+        }
     }
 
     /// 取表句柄（按实体名或物理表名）。
@@ -224,7 +278,7 @@ pub const Dal = struct {
                 report.tables_skipped += 1;
                 continue;
             }
-            const exists = try tableExists(s, t.effectiveTableName());
+            const exists = try tableExists(s, self.opts.provider, t.effectiveTableName());
             if (!exists) {
                 const stmts = try self.opts.provider.createTableAlloc(self.gpa, t);
                 defer {
@@ -251,7 +305,7 @@ pub const Dal = struct {
             }
 
             // 已存在：补列
-            const existing = try existingColumns(s, self.gpa, t.effectiveTableName());
+            const existing = try existingColumns(s, self.gpa, self.opts.provider, t.effectiveTableName());
             defer freeColumnNames(self.gpa, existing);
 
             for (t.columns) |col| {
@@ -276,7 +330,7 @@ pub const Dal = struct {
 
                 const idx_name = try self.opts.provider.indexNameAlloc(self.gpa, t, idx);
                 defer self.gpa.free(idx_name);
-                if (try indexExists(s, idx_name)) continue;
+                if (try indexExists(s, self.opts.provider, idx_name)) continue;
 
                 if (execute_ddl) {
                     _ = s.execute(idx_sql, &.{}) catch |e| {
@@ -291,36 +345,67 @@ pub const Dal = struct {
     }
 };
 
-fn tableExists(s: *Session, name: []const u8) !bool {
-    const rows = try s.queryRows(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
-        &.{.{ .text = name }},
-    );
+fn tableExists(s: *Session, kind: DatabaseKind, name: []const u8) !bool {
+    const rows = switch (kind) {
+        .sqlite => try s.queryRows(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            &.{.{ .text = name }},
+        ),
+        .mysql => try s.queryRows(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1",
+            &.{.{ .text = name }},
+        ),
+        else => return error.Unsupported,
+    };
     return rows.len > 0;
 }
 
-fn indexExists(s: *Session, name: []const u8) !bool {
-    const rows = try s.queryRows(
-        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
-        &.{.{ .text = name }},
-    );
+fn indexExists(s: *Session, kind: DatabaseKind, name: []const u8) !bool {
+    const rows = switch (kind) {
+        .sqlite => try s.queryRows(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
+            &.{.{ .text = name }},
+        ),
+        .mysql => try s.queryRows(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name = ? LIMIT 1",
+            &.{.{ .text = name }},
+        ),
+        else => return error.Unsupported,
+    };
     return rows.len > 0;
 }
 
-/// 读取现有列名（`PRAGMA table_info` 的第 2 列 `name`）。
-fn existingColumns(s: *Session, gpa: std.mem.Allocator, table_name: []const u8) ![]const []const u8 {
-    const quoted = try @import("dialect.zig").DatabaseKind.sqlite.quoteAlloc(gpa, table_name);
-    defer gpa.free(quoted);
-    const sql = try std.fmt.allocPrint(gpa, "PRAGMA table_info({s})", .{quoted});
-    defer gpa.free(sql);
-
-    const rows = try s.queryRows(sql, &.{});
+/// 读取现有列名（SQLite：`PRAGMA table_info` 第 2 列；MySQL：`information_schema.columns` 第 1 列）。
+fn existingColumns(s: *Session, gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(gpa);
-    for (rows) |row| {
-        if (row.get("name")) |v| {
-            if (v.asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
-        }
+
+    switch (kind) {
+        .sqlite => {
+            const quoted = try @import("dialect.zig").DatabaseKind.sqlite.quoteAlloc(gpa, table_name);
+            defer gpa.free(quoted);
+            const sql = try std.fmt.allocPrint(gpa, "PRAGMA table_info({s})", .{quoted});
+            defer gpa.free(sql);
+
+            const rows = try s.queryRows(sql, &.{});
+            for (rows) |row| {
+                if (row.get("name")) |v| {
+                    if (v.asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+                }
+            }
+        },
+        .mysql => {
+            // 注意：MySQL 8 的 information_schema 列名返回大写，因此按列序号取，不依赖列名
+            const rows = try s.queryRows(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+            }
+        },
+        else => return error.Unsupported,
     }
     return list.toOwnedSlice(gpa);
 }

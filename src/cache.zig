@@ -132,3 +132,122 @@ pub fn Cache(comptime T: type) type {
         }
     };
 }
+
+/// 单对象缓存（对应 C# `Meta.SingleCache` / Rust `SingleCache`）：
+/// 按主键缓存单行，TTL 到期或该表被写入时失效，下次读取回库。
+///
+/// 与整表缓存的分工：整表缓存适合**小表全量**（≤1000 行）；单对象缓存适合**大表按主键取**，
+/// 只缓存访问过的行。内存都是每个条目一个 arena，`invalidate` 后旧值切片失效。
+pub fn SingleCache(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Entry = struct {
+            value: T,
+            loaded_at: i64,
+            arena: std.heap.ArenaAllocator,
+        };
+
+        dal: *Dal,
+        gpa: std.mem.Allocator,
+        ttl_seconds: i64 = 60,
+        entries: std.AutoHashMapUnmanaged(i64, Entry) = .empty,
+        registered: bool = false,
+
+        pub fn init(dal: *Dal, ttl_seconds: i64) Self {
+            return .{ .dal = dal, .gpa = dal.gpa, .ttl_seconds = ttl_seconds };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.registered) self.dal.unregisterCache(@ptrCast(self));
+            var it = self.entries.iterator();
+            while (it.next()) |kv| kv.value_ptr.arena.deinit();
+            self.entries.deinit(self.gpa);
+        }
+
+        /// 使单个主键失效。
+        pub fn invalidate(self: *Self, pk: i64) void {
+            if (self.entries.fetchRemove(pk)) |kv| {
+                var entry = kv.value;
+                entry.arena.deinit();
+            }
+        }
+
+        /// 使全部条目失效。
+        pub fn invalidateAll(self: *Self) void {
+            var it = self.entries.iterator();
+            while (it.next()) |kv| kv.value_ptr.arena.deinit();
+            self.entries.clearRetainingCapacity();
+        }
+
+        fn invalidateHook(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.invalidateAll();
+        }
+
+        fn ensureRegistered(self: *Self) !void {
+            if (self.registered) return;
+            try self.dal.registerCache(.{
+                .table_name = T.meta.table_name,
+                .ctx = @ptrCast(self),
+                .invalidate = invalidateHook,
+            });
+            self.registered = true;
+        }
+
+        fn isExpired(self: *const Self, entry: *const Entry) bool {
+            if (entry.loaded_at == 0) return true;
+            if (self.ttl_seconds <= 0) return false;
+            return DateTime.nowUnix() - entry.loaded_at >= self.ttl_seconds;
+        }
+
+        /// 按主键取（未命中/过期回库并缓存；不存在返回 null）。
+        pub fn get(self: *Self, s: *Session, pk: i64) !?T {
+            try self.ensureRegistered();
+
+            if (self.entries.getPtr(pk)) |entry| {
+                if (!self.isExpired(entry)) return entry.value;
+                self.invalidate(pk);
+            }
+
+            const row = (try entity.findByPk(self.dal, T, s, &.{.{ .int = pk }})) orelse return null;
+
+            // 深拷贝到条目自己的 arena，脱离会话结果集生命周期
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            errdefer arena.deinit();
+            const owned = try cloneInto(arena.allocator(), row);
+
+            try self.entries.put(self.gpa, pk, .{
+                .value = owned,
+                .loaded_at = DateTime.nowUnix(),
+                .arena = arena,
+            });
+            return self.entries.get(pk).?.value;
+        }
+
+        /// 已缓存条目数（含已过期未清理的）。
+        pub fn cachedCount(self: *const Self) usize {
+            return self.entries.count();
+        }
+
+        /// 把实体里借用的字符串/二进制复制到持久 arena（其余值类型直接拷贝）。
+        fn cloneInto(arena: std.mem.Allocator, e: T) !T {
+            var out = e;
+            out.dirty = 0;
+            for (T.meta.fields, 0..) |_, i| {
+                switch (e.columnValue(i)) {
+                    .text => |t| {
+                        const owned = try arena.dupe(u8, t);
+                        try out.setColumnValue(i, .{ .text = owned });
+                    },
+                    .blob => |b| {
+                        const owned = try arena.dupe(u8, b);
+                        try out.setColumnValue(i, .{ .blob = owned });
+                    },
+                    else => {},
+                }
+            }
+            return out;
+        }
+    };
+}
