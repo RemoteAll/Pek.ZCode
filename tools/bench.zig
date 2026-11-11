@@ -199,6 +199,67 @@ pub fn main(init: std.process.Init) !void {
         try results.append(gpa, .{ .name = "条件分页查询 10 行", .total_ns = nowNs() - start, .iterations = n });
     }
 
+    // 6) 分表路由（纯计算：时间 → 分片表名）
+    {
+        const policy = zcode.shards.TimePolicy{
+            .gpa = gpa,
+            .field = "CreateTime",
+            .base_conn = "DH",
+            .base_table = "Bench_Article",
+            .table_policy = "{0}_{1:yyyyMMdd}",
+            .step_ms = zcode.shards.day_ms,
+            .level = .day,
+        };
+
+        const n = 20000;
+        const base_ms = zcode.shards.msFromCivil(2024, 5, 6, 7, 8, 9);
+        var i: usize = 0;
+        var sink: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            const sm = (try policy.shardAt(base_ms + @as(i64, @intCast(i)) * zcode.shards.day_ms)).?;
+            sink +%= sm.table_name.len;
+            sm.deinit(gpa);
+        }
+        const total = nowNs() - start;
+        std.mem.doNotOptimizeAway(sink);
+        try results.append(gpa, .{ .name = "分表路由（单点 → 表名）", .total_ns = total, .iterations = n });
+    }
+
+    // 7) 写入拦截器开销（insert 带 TimeInterceptor 补审计列）
+    {
+        var ti = zcode.interceptor.TimeInterceptor{};
+        var chain = zcode.interceptor.Chain.init(gpa);
+        defer chain.deinit();
+        try chain.add(ti.interceptor());
+        dal.setInterceptorChain(&chain);
+        defer dal.setInterceptorChain(null);
+
+        const n = 500;
+        var i: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            var e = Article{};
+            e.Title = try std.fmt.allocPrint(aa, "ic-{d}", .{i});
+            e.Author = "bench";
+            e.Score = @intCast(i);
+            _ = try zcode.entity.insert(&dal, &e, &s);
+        }
+        try results.append(gpa, .{ .name = "insert + 时间拦截器", .total_ns = nowNs() - start, .iterations = n });
+    }
+
+    // 8) 导航属性：批量填充（一次 IN 查回 + 分组，替代 N+1 逐条查）
+    {
+        const n = 200;
+        var i: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            var g = try zcode.navigation.fillMany(&dal, Article, &s, "Score", &.{ 1, 2, 3, 4, 5 });
+            g.deinit();
+        }
+        try results.append(gpa, .{ .name = "导航批量填充（5 主键）", .total_ns = nowNs() - start, .iterations = n });
+    }
+
     // ── 输出 ────────────────────────────────────────────────────────────────
     std.debug.print("\n=== Pek.ZCode 基准（SQLite 内存库，ReleaseFast）===\n", .{});
     std.debug.print("{s: <32} {s: >8} {s: >12} {s: >12}\n", .{ "用例", "次数", "总耗时(ms)", "单次(µs)" });

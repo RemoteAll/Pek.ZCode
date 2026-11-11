@@ -7,7 +7,7 @@
 > 与 ORM 无关的通用件（Decimal / DateTime / 值模型 / SQLite 驱动 / 字符串缓冲 / 临时文件）
 > 已下沉到公共库 **`zzig`**（`G:\Code\Zig\zzig`），本包只保留 XCode 语义层。
 
-## 当前范围（v0.1.0 第一轮）
+## 当前范围（v0.1.0）
 
 | 模块 | 对应 DH.NCode / Pek.RCode | 状态 |
 |---|---|---|
@@ -28,13 +28,23 @@
 | `cache` | `Meta.Cache`（整表实体缓存） | ✅ TTL 过期同步重载（Blocking 一致性）、主键 O(1) 命中、**写后自动失效**、`ttl=0` 不过期；另有 `SingleCache`（单对象缓存，按主键缓存单行） |
 | `codegen` + `zcodegen` | `XCodeTool` / `rcodegen` | ✅ `Model.xml` → Zig 实体（meta/脏位图/访问器/取值与装载） |
 | `reverse` + `zcodegen --reverse` | `DbMetaData.GetSchema` + XCodeTool 反查 | ✅ 现有库 → `Model.xml`（SQLite：`sqlite_master`+`PRAGMA`；MySQL：`information_schema`；含列型/主键/自增/索引/注释） |
-| `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等） |
+| `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等）；`Full` 档删列删索引；表级档位只能收紧 |
+| `readwrite` + `Dal.readSessionFor` | `ReadWriteStrategy` / `DAL.Reads` | ✅ 忽略表（大小写不敏感）、全局切主库、轮询从库；**从库会话强制只读**，无从库自动回落主库 |
+| `pool` + `Dal.makePool` | ADO.NET 连接池 / Rust `pool.rs` | ✅ 上限（超限直接 `PoolExhausted`，不排队）、空闲超时回收、预热、统计；`:memory:` 不建议池化 |
+| `shards` + `Dal.tableShard` | `TimeShardPolicy` / `EntitySplit` | ✅ 时间分表（`{0}_{1:yyyyMM}` 等）、连接模板、区间扫描（支持倒序）、条件推导、雪花 Id；**跨库分片未做**（显式报错） |
+| `interceptor` | `TimeModule` / `UserModule` / `TraceModule` | ✅ 插入补审计列、更新刷新；单条与批量都生效；`allow_empty=false` 时无用户直接报错 |
+| `entity_queue` | `EntityDeferredQueue` | ✅ 按条数/时间触发 `saveBatch`；**flush 失败保留队列**便于重试；deinit 不自动 flush |
+| `navigation` | `NavigationLoader` | ✅ 单条 / 列表 / **`fillMany` 批量填充（消除 N+1）** |
+| `tree` | `Tree/EntityTree` | ✅ 子节点 / 后代（BFS，一层一次 `IN`）/ 向上路径 / 根节点；深度与节点数护栏（成环明确报错） |
+| `backup` | `DAL_Backup` | ✅ SQLite 原生快照（`VACUUM INTO`，校验非 0 字节）+ SQL 脚本（结构同源 DDL + 字面量安全，SQLite/MySQL） |
 
-**本轮未做**（后续轮次）：分表、反向工程、备份、读写分离、SQL Server / PostgreSQL / Oracle 驱动。
+**本轮未做**（已写进 `docs/移植对照-NCode.md`，不是遗忘）：远程服务（`DbServer`/`DbService`）、
+SQL Server / PostgreSQL / Oracle **执行驱动**（方言与 DDL 已就绪）、MySQL TLS / 压缩 / LOCAL INFILE、跨连接分片。
 
 MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH.MySql`** 为准 ——
 开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
-`caching_sha2` 完整鉴权（RSA-OAEP）；BIT 按小端还原。**不支持**：TLS（`CLIENT_SSL` 不发）、压缩协议、LOCAL INFILE。
+`caching_sha2` 完整鉴权（**RSAES-PKCS1-v1_5**，真库实测：OAEP 服务端回 1045）；BIT 按**大端**还原（真库实测）。
+**不支持**：TLS（`CLIENT_SSL` 不发）、压缩协议、LOCAL INFILE。
 真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
@@ -116,11 +126,18 @@ zig build codegen -Dmodel=Entity/Model.xml -Dout=src/entities
 
 | 用例 | 次数 | 总耗时 | 单次 |
 |---|---|---|---|
-| 实体 insert（含自增回写） | 500 | 3.77 ms | **7.53 µs** |
-| 批量 saveBatch（新增 2000 条） | 2000 | 4.40 ms | **2.20 µs/条** |
-| findByPk（直连库，命中） | 2000 | 9.04 ms | **4.52 µs** |
-| 整表缓存 get（命中） | 20000 | 0.22 ms | **0.01 µs** |
-| 条件分页查询（10 行） | 300 | 4.49 ms | **14.96 µs** |
+| 实体 insert（含自增回写） | 500 | 2.60 ms | **5.21 µs** |
+| 批量 saveBatch（新增 2000 条） | 2000 | 4.91 ms | **2.46 µs/条** |
+| findByPk（直连库，命中） | 2000 | 3.59 ms | **1.80 µs** |
+| 整表缓存 get（命中） | 20000 | 0.24 ms | **0.01 µs** |
+| 条件分页查询（10 行） | 300 | 3.45 ms | **11.49 µs** |
+| 分表路由（单点 → 表名） | 20000 | 2.27 ms | **0.11 µs** |
+| insert + 时间拦截器 | 500 | 3.00 ms | **6.00 µs** |
+| 导航批量填充（5 主键） | 200 | 34.09 ms | **170 µs** |
+
+> 会话内置 **SQLite 预处理语句缓存**（同一 SQL 复用，省 prepare/finalize）；
+> 换掉它以后主键查 **4.52 → 1.80 µs（−60%）**、insert **7.53 → 5.21 µs**、分页 **14.96 → 11.49 µs**。
+> 绝对数字随机器负载浮动，**跨轮次不能相减**，只用于同机同轮对比。
 
 回归口径：基准**不进门禁**（机器抖动会误报），只作信息项；改 SQL 生成 / 缓存路径后手动跑一次对比。
 

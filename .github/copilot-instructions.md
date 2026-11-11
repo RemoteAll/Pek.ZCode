@@ -14,13 +14,17 @@
 
 - 定位：**DH.NCode / Pek.RCode 的 Zig 实现**（共用 `Model.xml` 与数据库），逐项对照见 `docs/移植对照-NCode.md`。
 - 已实现：`model` / `types` / `value` / `decimal` / `datetime` / `dialect`（SQLite、MySQL、SQL Server、
-  PostgreSQL 系、Oracle）/ `query` / `sqlbuild` / `session`（含事务）/ **SQLite + MySQL 执行驱动** /
-  `dbtable` / `dal`（增量建表）/ 对象实体与脏更新 / 批量写 / 整表缓存 + 单对象缓存 / **反向工程** / 代码生成。
-- 未实现：分表、读写分离、SQL Server/PostgreSQL/Oracle 执行驱动、备份、MySQL TLS/压缩/LOCAL INFILE。
-- 测试：`zig build test`（单元 48 + 集成 14，**62 项全通过**）；真库另跑
-  `zig build integration -Dmysql-conn="…"`（14/14）；zzig 侧 84 项；`tools/regression.ps1` 已接入构建与测试。
-- 性能：`zig build bench`（ReleaseFast）出数字，实测 insert 7.53 µs / 批量 2.20 µs 条 / 主键查 4.52 µs /
-  缓存命中 0.01 µs / 分页 14.96 µs。**基准不进门禁**（机器抖动会误报），改热路径后手动对比。
+  PostgreSQL 系、Oracle）/ `query` / `sqlbuild` / `session`（含事务 + **SQLite 语句缓存**）/ **SQLite + MySQL 执行驱动** /
+  `dbtable` / `dal`（增量建表 + `Full` 删列删索引 + 表级档位收紧）/ 对象实体与脏更新 / 批量写 / 整表缓存 + 单对象缓存 /
+  **分表分库** / **读写分离** / **连接池** / **写入拦截器** / **延迟写队列** / **导航属性** / **树形实体** /
+  **备份** / **反向工程** / 代码生成。
+- 未实现：远程服务（`DbServer`）、SQL Server/PostgreSQL/Oracle 执行驱动、MySQL TLS/压缩/LOCAL INFILE、
+  跨连接分片（`ConnPolicy` 指向别的库）、分表自动建表。
+- 测试：`zig build test`（单元 74 + 集成 25，**99 项全通过**）；真库另跑
+  `zig build integration -Dmysql-conn="…"`（25/25）；zzig 侧 84 项；`tools/regression.ps1` 已接入构建与测试。
+- 性能：`zig build bench`（ReleaseFast）出数字，实测 insert 5.21 µs / 批量 2.46 µs 条 / 主键查 1.80 µs /
+  缓存命中 0.01 µs / 分页 11.49 µs / 分表路由 0.11 µs / 拦截器开销 +0.8 µs / 导航批量填充 170 µs。
+  **基准不进门禁**（机器抖动会误报），改热路径后手动对比。
 
 ## 工具链口径（本机实测）
 

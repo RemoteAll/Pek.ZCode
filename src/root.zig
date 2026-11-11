@@ -70,6 +70,24 @@ pub const cache = @import("cache.zig");
 pub const codegen = @import("codegen.zig");
 /// 反向工程：现有数据库结构 → Model.xml
 pub const reverse = @import("reverse.zig");
+/// 单调时钟（连接池/队列/拦截器共用的时间源）
+pub const clock = @import("clock.zig");
+/// 读写分离策略（忽略表 / 全局切主库）
+pub const readwrite = @import("readwrite.zig");
+/// 会话连接池（复用连接 / 空闲回收 / 上限保护）
+pub const pool = @import("pool.zig");
+/// 写入拦截器（审计列自动补全：时间 / 用户 / 追踪号）
+pub const interceptor = @import("interceptor.zig");
+/// 实体延迟写队列
+pub const entity_queue = @import("entity_queue.zig");
+/// 分表 / 分库（时间分表策略、区间扫描、雪花 Id 解析）
+pub const shards = @import("shards.zig");
+/// 备份（SQLite 原生快照 / SQL 脚本文本）
+pub const backup = @import("backup.zig");
+/// 导航属性（单条/列表/批量填充，消除 N+1）
+pub const navigation = @import("navigation.zig");
+/// 树形实体（子节点 / 后代 / 向上路径 / 根节点）
+pub const tree = @import("tree.zig");
 
 pub const Error = error{
     Model,
@@ -98,4 +116,13 @@ test {
     _ = @import("cache.zig");
     _ = @import("codegen.zig");
     _ = @import("reverse.zig");
+    _ = @import("clock.zig");
+    _ = @import("readwrite.zig");
+    _ = @import("pool.zig");
+    _ = @import("interceptor.zig");
+    _ = @import("entity_queue.zig");
+    _ = @import("shards.zig");
+    _ = @import("backup.zig");
+    _ = @import("navigation.zig");
+    _ = @import("tree.zig");
 }

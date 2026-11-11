@@ -56,6 +56,18 @@ pub const Session = struct {
     /// 事务嵌套计数（0 = 不在事务中；1 = 最外层，真正持有 BEGIN）
     tx_depth: u32 = 0,
 
+    /// SQLite 预处理语句缓存（同一 SQL 文本复用，省去每次 prepare/finalize）
+    stmt_cache: std.ArrayListUnmanaged(CachedStmt) = .empty,
+    /// 缓存上限（超过后新 SQL 不再入缓存，直接即时 prepare）
+    stmt_cache_limit: usize = 64,
+    stmt_cache_hits: usize = 0,
+    stmt_cache_misses: usize = 0,
+
+    const CachedStmt = struct {
+        sql: []const u8,
+        stmt: sqlite.Stmt,
+    };
+
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, db: sqlite.Db) Session {
         return initWithDriver(gpa, kind, .{ .sqlite = db });
     }
@@ -65,11 +77,50 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        for (self.stmt_cache.items) |*e| {
+            e.stmt.finalize();
+            self.gpa.free(e.sql);
+        }
+        self.stmt_cache.deinit(self.gpa);
         self.arena.deinit();
         switch (self.driver) {
             .sqlite => |*db| db.close(),
             .mysql => |*conn| conn.deinit(),
         }
+    }
+
+    /// 取一个已重置的缓存语句（SQLite）。返回 null 表示该会话不走缓存
+    /// （MySQL，或缓存已满）。
+    ///
+    /// 注意：返回的指针只在**本次调用内**有效（中间不要插入新的缓存写入）。
+    fn cachedStmt(self: *Session, sql: []const u8) !?*sqlite.Stmt {
+        switch (self.driver) {
+            .sqlite => {},
+            else => return null,
+        }
+        for (self.stmt_cache.items) |*e| {
+            if (std.mem.eql(u8, e.sql, sql)) {
+                self.stmt_cache_hits += 1;
+                e.stmt.reset();
+                return &e.stmt;
+            }
+        }
+        self.stmt_cache_misses += 1;
+        if (self.stmt_cache.items.len >= self.stmt_cache_limit) return null;
+
+        const stmt = try self.driver.sqlite.prepare(self.gpa, sql);
+        const owned_sql = self.gpa.dupe(u8, sql) catch |e| {
+            stmt.finalize();
+            return e;
+        };
+        try self.stmt_cache.append(self.gpa, .{ .sql = owned_sql, .stmt = stmt });
+        const entry = &self.stmt_cache.items[self.stmt_cache.items.len - 1];
+        return &entry.stmt;
+    }
+
+    /// 语句缓存统计（命中/未命中），用于观察热点 SQL 是否真的被复用。
+    pub fn stmtCacheStats(self: *const Session) struct { hits: usize, misses: usize, size: usize } {
+        return .{ .hits = self.stmt_cache_hits, .misses = self.stmt_cache_misses, .size = self.stmt_cache.items.len };
     }
 
     /// 结果集 allocator（行/字符串都从这里分配）。
@@ -87,6 +138,22 @@ pub const Session = struct {
         if (self.read_only) return error.ReadOnly;
         switch (self.driver) {
             .sqlite => |*db| {
+                // 快路径：命中缓存则直接重置复用（省去每次 prepare/finalize）
+                if (try self.cachedStmt(sql)) |stmt| {
+                    stmt.bindAll(params) catch |e| {
+                        std.debug.print("[zcode] 参数绑定失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                        stmt.reset();
+                        return e;
+                    };
+                    stmt.run() catch |e| {
+                        std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                        stmt.reset();
+                        return e;
+                    };
+                    stmt.reset();
+                    return db.changes();
+                }
+
                 const stmt = try db.prepare(self.gpa, sql);
                 defer stmt.finalize();
                 stmt.bindAll(params) catch |e| {
@@ -113,12 +180,32 @@ pub const Session = struct {
     pub fn queryRows(self: *Session, sql: []const u8, params: []const Value) ![]const Row {
         switch (self.driver) {
             .sqlite => |*db| {
+                const arena = self.arena.allocator();
+                var rows: std.ArrayList(Row) = .empty;
+
+                if (try self.cachedStmt(sql)) |stmt| {
+                    stmt.bindAll(params) catch |e| {
+                        std.debug.print("[zcode] 参数绑定失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                        stmt.reset();
+                        return e;
+                    };
+                    defer stmt.reset();
+                    while (true) {
+                        const rc = db.lib.step(stmt.handle);
+                        if (rc == sqlite.sqlite_row) {
+                            try rows.append(arena, try stmt.readRow(arena));
+                            continue;
+                        }
+                        if (rc == sqlite.sqlite_done) break;
+                        return error.Sqlite;
+                    }
+                    return rows.toOwnedSlice(arena);
+                }
+
                 const stmt = try db.prepare(self.gpa, sql);
                 defer stmt.finalize();
                 try stmt.bindAll(params);
 
-                const arena = self.arena.allocator();
-                var rows: std.ArrayList(Row) = .empty;
                 while (true) {
                     const rc = db.lib.step(stmt.handle);
                     if (rc == sqlite.sqlite_row) {

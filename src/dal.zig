@@ -17,6 +17,10 @@ const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
 const TableRef = dbtable.TableRef;
+const readwrite = @import("readwrite.zig");
+const shards = @import("shards.zig");
+const interceptor = @import("interceptor.zig");
+const pool = @import("pool.zig");
 
 pub const ConnectionOptions = struct {
     provider: DatabaseKind = .sqlite,
@@ -121,11 +125,23 @@ pub const SchemaReport = struct {
     columns_added: usize = 0,
     indexes_created: usize = 0,
     tables_skipped: usize = 0,
+    /// 仅 `Migration=Full`：删除模型里已不存在的列
+    columns_dropped: usize = 0,
+    /// 仅 `Migration=Full`：删除模型里已不存在的索引
+    indexes_dropped: usize = 0,
     /// 生成但未执行（`Migration=ReadOnly`）
     executed: bool = true,
 
     pub fn describeAlloc(self: SchemaReport, gpa: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(gpa, "结构同步：建表 {d} / 补列 {d} / 建索引 {d} / 跳过 {d}{s}", .{ self.tables_created, self.columns_added, self.indexes_created, self.tables_skipped, if (self.executed) "" else "（只读：未执行）" });
+        return std.fmt.allocPrint(
+            gpa,
+            "结构同步：建表 {d} / 补列 {d} / 建索引 {d} / 删列 {d} / 删索引 {d} / 跳过 {d}{s}",
+            .{
+                self.tables_created,  self.columns_added,   self.indexes_created,
+                self.columns_dropped, self.indexes_dropped, self.tables_skipped,
+                if (self.executed) "" else "（只读：未执行）",
+            },
+        );
     }
 };
 
@@ -137,6 +153,22 @@ pub const Dal = struct {
     lib: ?sqlite.Lib = null,
     /// 整表实体缓存注册表（写操作后按表名使缓存失效）
     cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
+    /// 读写分离策略（忽略表 / 全局切主库）
+    strategy: readwrite.Strategy,
+    /// 只读副本（从库）连接参数；为空时读操作走主库
+    replicas: std.ArrayListUnmanaged(ConnectionOptions) = .empty,
+    /// 副本轮询下标
+    rr_index: usize = 0,
+    /// 分表策略注册表（按模型表名）
+    shard_routes: std.ArrayListUnmanaged(ShardRoute) = .empty,
+    /// 写入拦截器链（不拥有，由调用方创建与销毁）
+    chain: ?*interceptor.Chain = null,
+
+    /// 一条分表路由：表名 + 策略（表名/模板字符串由 Dal 持有）
+    pub const ShardRoute = struct {
+        table_name: []const u8,
+        policy: shards.TimePolicy,
+    };
 
     /// 缓存注册项：类型擦除的回调（表名 + 失效函数）
     pub const CacheHook = struct {
@@ -161,7 +193,13 @@ pub const Dal = struct {
             .sqlite => {
                 if (opts_owned.data_source.len == 0) return error.NoConnection;
                 const lib = try sqlite.Lib.load(gpa);
-                return Dal{ .gpa = gpa, .model = m, .opts = opts_owned, .lib = lib };
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .lib = lib,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
             },
             .mysql => {
                 // MySQL 连接串的 "host" 可能写在 Server / Data Source 任一键里
@@ -170,7 +208,12 @@ pub const Dal = struct {
                 }
                 if (opts_owned.server.len == 0) return error.NoConnection;
                 if (opts_owned.database.len == 0) return error.NoDatabase;
-                return Dal{ .gpa = gpa, .model = m, .opts = opts_owned };
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
             },
             else => return error.Unsupported,
         }
@@ -178,6 +221,18 @@ pub const Dal = struct {
 
     pub fn deinit(self: *Dal) void {
         self.cache_hooks.deinit(self.gpa);
+        self.strategy.deinit();
+        for (self.replicas.items) |*o| o.deinit(self.gpa);
+        self.replicas.deinit(self.gpa);
+        for (self.shard_routes.items) |*route| {
+            self.gpa.free(route.table_name);
+            if (route.policy.field.len > 0) self.gpa.free(route.policy.field);
+            if (route.policy.base_conn.len > 0) self.gpa.free(route.policy.base_conn);
+            if (route.policy.base_table.len > 0) self.gpa.free(route.policy.base_table);
+            if (route.policy.conn_policy) |tpl| self.gpa.free(tpl);
+            if (route.policy.table_policy) |tpl| self.gpa.free(tpl);
+        }
+        self.shard_routes.deinit(self.gpa);
         if (self.lib) |*lib| lib.deinit();
         self.opts.deinit(self.gpa);
         self.model.deinit();
@@ -205,6 +260,206 @@ pub const Dal = struct {
         for (self.cache_hooks.items) |hook| {
             if (std.ascii.eqlIgnoreCase(hook.table_name, table_name)) hook.invalidate(hook.ctx);
         }
+    }
+
+    // ── 读写分离 ────────────────────────────────────────────────
+
+    /// 读写分离策略（可直接改忽略表 / 全局切主库）。
+    pub fn readStrategy(self: *Dal) *readwrite.Strategy {
+        return &self.strategy;
+    }
+
+    /// 挂载只读副本（从库）连接串；解析失败或方言不一致时整体失败，不半途生效。
+    pub fn attachReplicas(self: *Dal, conn_strs: []const []const u8) !void {
+        var staged: std.ArrayListUnmanaged(ConnectionOptions) = .empty;
+        errdefer {
+            for (staged.items) |*o| o.deinit(self.gpa);
+            staged.deinit(self.gpa);
+        }
+
+        for (conn_strs) |cs| {
+            var o = try parseConnectionString(self.gpa, cs);
+            if (o.provider != self.opts.provider) {
+                std.debug.print(
+                    "[zcode] 读写分离：从库方言 {s} 与主库 {s} 不一致，拒绝挂载（{s}）\n",
+                    .{ @tagName(o.provider), @tagName(self.opts.provider), cs },
+                );
+                o.deinit(self.gpa);
+                return error.Unsupported;
+            }
+            try staged.append(self.gpa, o);
+        }
+
+        for (self.replicas.items) |*o| o.deinit(self.gpa);
+        self.replicas.deinit(self.gpa);
+        self.replicas = staged;
+        self.rr_index = 0;
+    }
+
+    pub fn replicaCount(self: *const Dal) usize {
+        return self.replicas.items.len;
+    }
+
+    /// 临时全量切主库（对应 C# `SuspendReadOnly` / `ResumeReadOnly` 的场景）。
+    pub fn setPrimaryOnly(self: *Dal, value: bool) void {
+        self.strategy.setPrimaryOnly(value);
+    }
+
+    pub fn isPrimaryOnly(self: *const Dal) bool {
+        return self.strategy.isPrimaryOnly();
+    }
+
+    /// 取只读会话：有从库且策略允许时轮询从库，否则回落到主库。
+    pub fn readSession(self: *Dal) !Session {
+        return self.readSessionFor("");
+    }
+
+    /// 按表取只读会话（忽略表 / 全局切主库走主库）。
+    ///
+    /// 语义：**从库会话强制只读**（连接串没写 `Readonly=true` 也一样）；
+    /// 回落到主库时返回**普通会话**（可写）——与 C# `DAL.Reads` “没有从库就降级主库” 一致。
+    pub fn readSessionFor(self: *Dal, table_name: []const u8) !Session {
+        const use_replica = self.replicas.items.len > 0 and
+            (table_name.len == 0 or self.strategy.allowsReplica(table_name));
+        if (!use_replica) return self.openSession();
+
+        const idx = self.rr_index % self.replicas.items.len;
+        self.rr_index = (self.rr_index + 1) % self.replicas.items.len;
+        var s = try self.openSessionWith(&self.replicas.items[idx]);
+        // 从库会话一律只读：连接串没写 `Readonly=true` 也不能往从库写
+        s.read_only = true;
+        return s;
+    }
+
+    /// 用指定连接参数打开会话（内部使用；对外请用 `openSession` / `readSessionFor`）。
+    pub fn openSessionWith(self: *Dal, opts: *const ConnectionOptions) !Session {
+        switch (opts.provider) {
+            .sqlite => {
+                const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
+                const db = try sqlite.Db.open(lib_ptr, opts.data_source);
+                var s = Session.init(self.gpa, .sqlite, db);
+                s.read_only = opts.read_only;
+                return s;
+            },
+            .mysql => {
+                const conn = try mysql.Conn.open(self.gpa, .{
+                    .host = opts.server,
+                    .port = opts.port,
+                    .user = opts.user,
+                    .password = opts.password,
+                    .database = opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
+                s.read_only = opts.read_only;
+                return s;
+            },
+            else => return error.Unsupported,
+        }
+    }
+
+    // ── 连接池 ──────────────────────────────────────────────────
+
+    /// 建一个绑定本 Dal 的连接池（连接参数与 `openSession` 一致）。
+    ///
+    /// 注意：`:memory:`（SQLite 内存库）**不要用池**——每个连接是独立数据库，
+    /// 复用会让不同调用方看到不同的库。用 `supportsPooling()` 判断。
+    pub fn makePool(self: *Dal, opts: pool.Options) pool.SessionPool {
+        return pool.SessionPool.init(self.gpa, .{ .ctx = @ptrCast(self), .open = poolFactoryOpen }, opts);
+    }
+
+    fn poolFactoryOpen(ctx: *anyopaque) anyerror!Session {
+        const self: *Dal = @ptrCast(@alignCast(ctx));
+        return self.openSession();
+    }
+
+    /// 是否适合池化：SQLite 内存库不适合（每个连接一个独立库）。
+    pub fn supportsPooling(self: *const Dal) bool {
+        return switch (self.opts.provider) {
+            .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
+            .mysql => true,
+            else => false,
+        };
+    }
+
+    // ── 分表 / 分库 ─────────────────────────────────────────────
+
+    /// 注册分表策略（按模型表名；同名覆盖）。`policy` 里的字符串会**复制**一份。
+    pub fn addShardPolicy(self: *Dal, table_name: []const u8, policy: shards.TimePolicy) !void {
+        const owned = shards.TimePolicy{
+            .gpa = self.gpa,
+            .field = try self.gpa.dupe(u8, policy.field),
+            .base_conn = try self.gpa.dupe(u8, policy.base_conn),
+            .base_table = try self.gpa.dupe(u8, policy.base_table),
+            .conn_policy = if (policy.conn_policy) |tpl| try self.gpa.dupe(u8, tpl) else null,
+            .table_policy = if (policy.table_policy) |tpl| try self.gpa.dupe(u8, tpl) else null,
+            .step_ms = policy.step_ms,
+            .level = policy.level,
+        };
+
+        for (self.shard_routes.items) |*route| {
+            if (std.ascii.eqlIgnoreCase(route.table_name, table_name)) {
+                // 覆盖：先释放旧的
+                self.gpa.free(route.table_name);
+                self.gpa.free(route.policy.field);
+                self.gpa.free(route.policy.base_conn);
+                self.gpa.free(route.policy.base_table);
+                if (route.policy.conn_policy) |tpl| self.gpa.free(tpl);
+                if (route.policy.table_policy) |tpl| self.gpa.free(tpl);
+                route.* = .{ .table_name = try self.gpa.dupe(u8, table_name), .policy = owned };
+                return;
+            }
+        }
+        try self.shard_routes.append(self.gpa, .{
+            .table_name = try self.gpa.dupe(u8, table_name),
+            .policy = owned,
+        });
+    }
+
+    pub fn shardPolicyFor(self: *Dal, table_name: []const u8) ?*shards.TimePolicy {
+        for (self.shard_routes.items) |*route| {
+            if (std.ascii.eqlIgnoreCase(route.table_name, table_name)) return &route.policy;
+        }
+        return null;
+    }
+
+    /// 按字段值定位分片表句柄。返回的 `ShardModel` 由调用方释放。
+    ///
+    /// 跨库分片（`ConnPolicy` 指向别的连接）需要额外挂载连接，本轮**显式不支持**：
+    /// 返回 `error.Unsupported` 并打印实际期望的连接名，避免静默写到错误库。
+    pub fn tableShard(self: *Dal, table_name: []const u8, value: @import("zzig").db.Value) !struct { table: TableRef, model: shards.ShardModel } {
+        const policy = self.shardPolicyFor(table_name) orelse return error.NoShardPolicy;
+        const shard_model = (try policy.shardOf(value)) orelse return error.NoShardPolicy;
+
+        if (!std.ascii.eqlIgnoreCase(shard_model.conn_name, self.connName())) {
+            std.debug.print(
+                "[zcode] 分表：分片连接 {s} 与当前连接 {s} 不同，尚未支持跨库分片（表 {s}）\n",
+                .{ shard_model.conn_name, self.connName(), shard_model.table_name },
+            );
+            shard_model.deinit(self.gpa);
+            return error.Unsupported;
+        }
+
+        const t = self.model.table(table_name) orelse {
+            shard_model.deinit(self.gpa);
+            return error.TableNotFound;
+        };
+        var ref = TableRef.init(self.gpa, self.opts.provider, t);
+        ref.table_name = shard_model.table_name;
+        ref.setWriteNotifier(@ptrCast(self), onTableWrite);
+        ref.setInterceptorChain(self.chain);
+        return .{ .table = ref, .model = shard_model };
+    }
+
+    /// 当前连接名（模型 `<Option><ConnName>`，缺省空串）。
+    pub fn connName(self: *const Dal) []const u8 {
+        return self.model.options.connName() orelse "";
+    }
+
+    // ── 写入拦截器 ──────────────────────────────────────────────
+
+    /// 挂上写入拦截器链（不接管所有权）。此后 `table()` 取到的表句柄都会应用它。
+    pub fn setInterceptorChain(self: *Dal, chain: ?*interceptor.Chain) void {
+        self.chain = chain;
     }
 
     fn freeOptions(gpa: std.mem.Allocator, opts: *ConnectionOptions) void {
@@ -243,6 +498,7 @@ pub const Dal = struct {
         const t = self.model.table(name) orelse return error.TableNotFound;
         var ref = TableRef.init(self.gpa, self.opts.provider, t);
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
+        ref.setInterceptorChain(self.chain);
         return ref;
     }
 
@@ -265,20 +521,26 @@ pub const Dal = struct {
     pub fn syncSchema(self: *Dal, s: *Session) !SchemaReport {
         var report = SchemaReport{};
 
-        const migration = self.effectiveMigration();
-        if (migration == .off) {
+        const global = self.effectiveMigration();
+        if (global == .off) {
             report.tables_skipped = self.model.tables.len;
             report.executed = false;
             return report;
         }
-        const execute_ddl = migration == .on or migration == .full;
-        report.executed = execute_ddl;
+        report.executed = global.canExecute();
 
         for (self.model.tables) |*t| {
+            // 表级档位只能更保守（C# `ResolveMigration` 的 min 语义）
+            const migration = global.tighten(t.migration);
+            if (migration == .off) {
+                report.tables_skipped += 1;
+                continue;
+            }
             if (t.is_view) {
                 report.tables_skipped += 1;
                 continue;
             }
+            const execute_ddl = migration.canExecute();
             const exists = try tableExists(s, self.opts.provider, t.effectiveTableName());
             if (!exists) {
                 const stmts = try self.opts.provider.createTableAlloc(self.gpa, t);
@@ -341,10 +603,149 @@ pub const Dal = struct {
                 }
                 report.indexes_created += 1;
             }
+
+            // Full：删除模型里已不存在的列与索引（**只有 Full 档允许删除**）
+            // 顺序：**先删索引再删列**——否则引用该列的索引会让 DROP COLUMN 报
+            //「error in index ... after drop column: no such column」
+            if (!migration.onlyCreate()) {
+                try self.dropExtraIndexes(s, t, execute_ddl, &report);
+                try self.dropExtraColumns(s, t, existing, execute_ddl, &report);
+            }
         }
         return report;
     }
+
+    /// 删除「库里有、模型里没有」的列（`Migration=Full`）。
+    fn dropExtraColumns(
+        self: *Dal,
+        s: *Session,
+        t: *const model.TableMeta,
+        existing: []const []const u8,
+        execute_ddl: bool,
+        report: *SchemaReport,
+    ) !void {
+        const quoted_table = try self.opts.provider.quoteAlloc(self.gpa, t.effectiveTableName());
+        defer self.gpa.free(quoted_table);
+
+        for (existing) |col_name| {
+            if (modelHasColumn(t, col_name)) continue;
+
+            const quoted_col = try self.opts.provider.quoteAlloc(self.gpa, col_name);
+            defer self.gpa.free(quoted_col);
+            const sql = try std.fmt.allocPrint(self.gpa, "ALTER TABLE {s} DROP COLUMN {s}", .{ quoted_table, quoted_col });
+            defer self.gpa.free(sql);
+
+            if (execute_ddl) {
+                _ = s.execute(sql, &.{}) catch |e| {
+                    std.debug.print(
+                        "[sync_schema] 删列失败：{s}.{s}\n  SQL: {s}\n  错误: {s}\n  （SQLite 需 3.35+，且不能删主键/被索引列）\n",
+                        .{ t.name, col_name, sql, s.lastError() },
+                    );
+                    return e;
+                };
+            }
+            report.columns_dropped += 1;
+        }
+    }
+
+    /// 删除「库里有、模型里没有」的索引（`Migration=Full`）。
+    fn dropExtraIndexes(
+        self: *Dal,
+        s: *Session,
+        t: *const model.TableMeta,
+        execute_ddl: bool,
+        report: *SchemaReport,
+    ) !void {
+        const existing = try existingIndexes(s, self.gpa, self.opts.provider, t.effectiveTableName());
+        defer freeColumnNames(self.gpa, existing);
+
+        for (existing) |idx_name| {
+            // SQLite 的隐式索引（sqlite_autoindex_*）不能删
+            if (std.ascii.startsWithIgnoreCase(idx_name, "sqlite_autoindex")) continue;
+            if (try self.modelHasIndex(t, idx_name)) continue;
+
+            const sql = switch (self.opts.provider) {
+                .sqlite => blk: {
+                    const quoted = try self.opts.provider.quoteAlloc(self.gpa, idx_name);
+                    defer self.gpa.free(quoted);
+                    break :blk try std.fmt.allocPrint(self.gpa, "DROP INDEX {s}", .{quoted});
+                },
+                .mysql => blk: {
+                    const quoted_table = try self.opts.provider.quoteAlloc(self.gpa, t.effectiveTableName());
+                    defer self.gpa.free(quoted_table);
+                    const quoted_idx = try self.opts.provider.quoteAlloc(self.gpa, idx_name);
+                    defer self.gpa.free(quoted_idx);
+                    break :blk try std.fmt.allocPrint(self.gpa, "ALTER TABLE {s} DROP INDEX {s}", .{ quoted_table, quoted_idx });
+                },
+                else => return error.Unsupported,
+            };
+            defer self.gpa.free(sql);
+
+            if (execute_ddl) {
+                _ = s.execute(sql, &.{}) catch |e| {
+                    std.debug.print("[sync_schema] 删索引失败：{s}.{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, idx_name, sql, s.lastError() });
+                    return e;
+                };
+            }
+            report.indexes_dropped += 1;
+        }
+    }
+
+    /// 该表在模型里是否声明了同名索引（按生成后的索引名比对）。
+    fn modelHasIndex(self: *Dal, t: *const model.TableMeta, idx_name: []const u8) !bool {
+        for (t.indexes) |idx| {
+            const name = try self.opts.provider.indexNameAlloc(self.gpa, t, idx);
+            defer self.gpa.free(name);
+            if (std.ascii.eqlIgnoreCase(name, idx_name)) return true;
+        }
+        return false;
+    }
 };
+
+/// 模型里是否存在该列（按物理列名忽略大小写）。
+fn modelHasColumn(t: *const model.TableMeta, name: []const u8) bool {
+    for (t.columns) |*c| {
+        if (std.ascii.eqlIgnoreCase(t.effectiveColumnName(c), name)) return true;
+    }
+    return false;
+}
+
+/// 读取现有索引名（SQLite：`PRAGMA index_list`；MySQL：`information_schema.statistics`）。
+fn existingIndexes(s: *Session, gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(gpa);
+
+    switch (kind) {
+        .sqlite => {
+            const quoted = try DatabaseKind.sqlite.quoteAlloc(gpa, table_name);
+            defer gpa.free(quoted);
+            const sql = try std.fmt.allocPrint(gpa, "PRAGMA index_list({s})", .{quoted});
+            defer gpa.free(sql);
+
+            const rows = try s.queryRows(sql, &.{});
+            for (rows) |row| {
+                if (row.get("name")) |v| {
+                    if (v.asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+                }
+            }
+        },
+        .mysql => {
+            const rows = try s.queryRows(
+                "SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ?",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| {
+                    if (std.ascii.eqlIgnoreCase(text, "PRIMARY")) continue;
+                    try list.append(gpa, try gpa.dupe(u8, text));
+                }
+            }
+        },
+        else => return error.Unsupported,
+    }
+    return list.toOwnedSlice(gpa);
+}
 
 fn tableExists(s: *Session, kind: DatabaseKind, name: []const u8) !bool {
     const rows = switch (kind) {

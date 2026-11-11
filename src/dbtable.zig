@@ -30,6 +30,8 @@ pub const TableRef = struct {
     /// 写后失效通知（由 `Dal.table()` 注入；不引入对 dal 的循环依赖）
     write_ctx: ?*anyopaque = null,
     write_notify: ?*const fn (ctx: *anyopaque, table_name: []const u8) void = null,
+    /// 写入拦截器链（审计列自动补全；由 `Dal` 注入，可为空）
+    chain: ?*@import("interceptor.zig").Chain = null,
 
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, table: *const TableMeta) TableRef {
         return .{ .gpa = gpa, .kind = kind, .table = table, .table_name = table.effectiveTableName() };
@@ -47,8 +49,51 @@ pub const TableRef = struct {
         }
     }
 
+    /// 注入写入拦截器链。
+    pub fn setInterceptorChain(self: *TableRef, chain: ?*@import("interceptor.zig").Chain) void {
+        self.chain = chain;
+    }
+
+    /// 把拦截器应用到一次写入的字段列表（无链时直接返回原切片，不分配）。
+    fn applyInterceptors(
+        self: *const TableRef,
+        s: *Session,
+        method: @import("interceptor.zig").Method,
+        fields: []const sqlbuild.Field,
+    ) ![]const sqlbuild.Field {
+        const chain = self.chain orelse return fields;
+        if (chain.count() == 0) return fields;
+
+        const gpa = s.gpa;
+        var list: std.ArrayList(sqlbuild.Field) = .empty;
+        try list.appendSlice(gpa, fields);
+        errdefer list.deinit(gpa);
+
+        chain.applyTo(method, self.table, .{ .gpa = gpa, .items = &list }) catch |e| {
+            list.deinit(gpa);
+            return e;
+        };
+
+        // 结果直接传回调用方，由调用方（本函数的所有调用点）负责释放
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// 插入一行（带拦截器）：拦截器可能追加审计列。
+    fn insertWithInterceptors(self: *const TableRef, s: *Session, fields: []const sqlbuild.Field) !i64 {
+        const chain = self.chain orelse return self.insertRaw(s, fields);
+        if (chain.count() == 0) return self.insertRaw(s, fields);
+
+        const effective = try self.applyInterceptors(s, .insert, fields);
+        defer s.gpa.free(effective);
+        return self.insertRaw(s, effective);
+    }
+
     /// 插入一行，返回自增 ID（无自增列返回 0）。
     pub fn insert(self: *const TableRef, s: *Session, fields: []const sqlbuild.Field) !i64 {
+        return self.insertWithInterceptors(s, fields);
+    }
+
+    fn insertRaw(self: *const TableRef, s: *Session, fields: []const sqlbuild.Field) !i64 {
         try self.ensureWritable();
         const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
         defer sql.deinit(self.gpa);
@@ -60,8 +105,18 @@ pub const TableRef = struct {
 
     /// 更新（`filter` 为空即全表——调用方必须自己保证带上主键条件）。
     pub fn update(self: *const TableRef, s: *Session, sets: []const sqlbuild.Field, filter: ?*const Where) !usize {
+        var effective = sets;
+        var owned: ?[]sqlbuild.Field = null;
+        if (self.chain) |chain| {
+            if (chain.count() > 0) {
+                effective = try self.applyInterceptors(s, .update, sets);
+                owned = @constCast(effective);
+            }
+        }
+        defer if (owned) |o| s.gpa.free(o);
+
         try self.ensureWritable();
-        const sql = try sqlbuild.update(self.gpa, self.kind, self.table, self.table_name, sets, filter);
+        const sql = try sqlbuild.update(self.gpa, self.kind, self.table, self.table_name, effective, filter);
         defer sql.deinit(self.gpa);
         const affected = try s.execute(sql.text, sql.params);
         if (affected > 0) self.notifyWrite();
@@ -101,7 +156,25 @@ pub const TableRef = struct {
     pub fn insertBatch(self: *const TableRef, s: *Session, rows: []const []const sqlbuild.Field) !usize {
         try self.ensureWritable();
         if (rows.len == 0) return 0;
-        const cols = rows[0].len;
+
+        // 拦截器：逐行补齐审计列（每行独立内存，避免复用同一缓冲）
+        var patched: std.ArrayList([]const sqlbuild.Field) = .empty;
+        defer {
+            for (patched.items) |r| self.gpa.free(r);
+            patched.deinit(self.gpa);
+        }
+        if (self.chain) |chain| {
+            if (chain.count() > 0) {
+                try patched.ensureTotalCapacity(self.gpa, rows.len);
+                for (rows) |row| {
+                    const effective = try self.applyInterceptors(s, .insert, row);
+                    patched.appendAssumeCapacity(effective);
+                }
+            }
+        }
+        const effective_rows: []const []const sqlbuild.Field = if (patched.items.len > 0) patched.items else rows;
+
+        const cols = effective_rows[0].len;
         if (cols == 0) return error.Model;
 
         var per_batch: usize = 5000;
@@ -111,9 +184,9 @@ pub const TableRef = struct {
 
         var affected: usize = 0;
         var start: usize = 0;
-        while (start < rows.len) {
-            const end = @min(start + per_batch, rows.len);
-            const sql = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, rows[start..end]);
+        while (start < effective_rows.len) {
+            const end = @min(start + per_batch, effective_rows.len);
+            const sql = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end]);
             defer sql.deinit(self.gpa);
             affected += try s.execute(sql.text, sql.params);
             start = end;

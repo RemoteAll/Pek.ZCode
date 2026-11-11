@@ -44,6 +44,9 @@ pub const mysql_max_row_bytes: usize = 65_535;
 pub const mysql_safe_varchar_chars: i32 = 2_000;
 
 /// 迁移档位（对应 DH.NCode 的 `Migration`）。
+///
+/// 档位只能**按 rank 收紧**（`Off < ReadOnly < On < Full`）：表级配置可把全局档位调得更保守，
+/// 但不能更激进（对齐 C# `ResolveMigration` 的 `min(table, global)`）。
 pub const Migration = enum {
     off,
     read_only,
@@ -66,6 +69,37 @@ pub const Migration = enum {
             .on => "On",
             .full => "Full",
         };
+    }
+
+    /// 严格程度序号（越大越激进）。
+    pub fn rank(self: Migration) u8 {
+        return switch (self) {
+            .off => 0,
+            .read_only => 1,
+            .on => 2,
+            .full => 3,
+        };
+    }
+
+    /// 是否只读档（不执行 DDL）。
+    pub fn isReadOnly(self: Migration) bool {
+        return self.rank() <= Migration.read_only.rank();
+    }
+
+    /// 是否允许执行 DDL。
+    pub fn canExecute(self: Migration) bool {
+        return !self.isReadOnly();
+    }
+
+    /// 是否只做「创建类」动作（`On` 及以下；删除/修改仅 `Full` 允许）。
+    pub fn onlyCreate(self: Migration) bool {
+        return self.rank() < Migration.full.rank();
+    }
+
+    /// 用表级档位收紧（表级只能更保守）。
+    pub fn tighten(self: Migration, table_level: ?Migration) Migration {
+        const t = table_level orelse return self;
+        return if (t.rank() < self.rank()) t else self;
     }
 };
 

@@ -860,3 +860,8 @@ test "MySQL 真库：反向工程 → Model.xml（需 -Dmysql-conn）" {
         if (idx.columns.len == 1) try std.testing.expect(!std.mem.eql(u8, idx.columns[0], "Id"));
     }
 }
+
+// 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
+test {
+    _ = @import("integration_features.zig");
+}
