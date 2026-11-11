@@ -1,0 +1,22 @@
+# ---- Zig 构建产物 ----
+.zig-cache/
+zig-cache/
+zig-out/
+*.pdb
+*.obj
+*.o
+*.lib
+*.ilk
+*.exp
+
+# ---- 运行产物 / 回归报告 ----
+*.log
+artifacts/
+
+# ---- 发版产物 ----
+dist/
+
+# ---- 编辑器 / 系统 ----
+.vscode/.browse*
+Thumbs.db
+desktop.ini
