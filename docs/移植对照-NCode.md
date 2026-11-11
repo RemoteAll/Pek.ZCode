@@ -15,6 +15,7 @@
 | SQL 组装 | `InsertBuilder` / `SelectBuilder` | `src/sqlbuild.rs` | `src/sqlbuild.zig` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT（批量写未做） |
 | 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接（无连接池/异步） |
 | SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `zzig`：`db/sqlite.zig`（动态加载 DLL） | ✅ |
+| MySQL 驱动 | `DH.NCode.MySql` | `src/mysql.rs`（`mysql` crate，纯协议） | `zzig`：`db/mysql.zig`（**纯协议**，不加载 libmysqlclient） | ✅ 握手/鉴权/COM_QUERY/预处理二进制协议；TLS 与 caching_sha2 完整鉴权显式不支持 |
 | 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count |
 | 连接与迁移 | `DAL` / `Migration` | `src/dal.rs` | `src/dal.zig` | ✅ 增量建表/补列/建索引，幂等 |
 | 对象实体 + 脏更新 | `Entity` | `src/entity.rs` / `dirty.rs` | — | ⛔ 未做 |
@@ -94,11 +95,13 @@
 | 十进制 | `src/number/decimal.zig` | `zzig.Decimal` | 财务文本、配置精度值、ORM 值模型 |
 | 日期时间 | `src/time/datetime.zig` | `zzig.DateTime` | 数据库时间文本、定时任务、日志时间 |
 | 字段值模型 | `src/db/value.zig` | `zzig.db.Value` | 任何“读库 → 统一值”的数据库访问层 |
+| 结果集行 | `src/db/row.zig` | `zzig.db.Row` | 各驱动共用的行结构（按列名/序号取值） |
 | SQLite 驱动 | `src/db/sqlite.zig` | `zzig.db.sqlite`（别名 `zzig.sqlite`） | 任何需要嵌入式 SQLite 的 Zig 项目 |
+| MySQL 驱动（绿色） | `src/db/mysql.zig` | `zzig.db.mysql`（别名 `zzig.mysql`） | 纯协议访问 MySQL，不加载 libmysqlclient |
 | 临时文件名 / 静默删除 | `src/file/file.zig` | `zzig.File.UniqueTempName` / `DeleteQuiet` | 测试临时库、导出中间文件 |
 
 ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcode.DateTime` / `zcode.Value` /
-`zcode.buf` / `zcode.sqlite` / `zcode.File`。
+`zcode.buf` / `zcode.sqlite` / `zcode.mysql` / `zcode.File`。
 
 **不下沉**（带 XCode 语义，属于本库）：`types`（CLR 类型名）、`model`、`dialect`、`query`、`sqlbuild`、
 `session`、`dbtable`、`dal`。
