@@ -865,3 +865,13 @@ test "MySQL 真库：反向工程 → Model.xml（需 -Dmysql-conn）" {
 test {
     _ = @import("integration_features.zig");
 }
+
+// PostgreSQL 接线用例（协议层由 zzig 回环假服务端覆盖）
+test {
+    _ = @import("integration_pg.zig");
+}
+
+// 跨库分片 + 分片表自动建表
+test {
+    _ = @import("integration_shard.zig");
+}

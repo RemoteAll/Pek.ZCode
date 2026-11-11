@@ -42,6 +42,9 @@ pub fn build(b: *std.Build) void {
     const mysql_conn = b.option([]const u8, "mysql-conn", "MySQL 连接串（提供时跑真库集成测试）") orelse "";
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "mysql_conn", mysql_conn);
+    // PostgreSQL 真库集成用例：`-Dpg-conn="Provider=PostgreSQL;Server=...;Port=5432;Database=...;UserID=...;Password=..."`
+    const pg_conn = b.option([]const u8, "pg-conn", "PostgreSQL 连接串（提供时跑真库集成测试）") orelse "";
+    build_options.addOption([]const u8, "pg_conn", pg_conn);
     itest_mod.addOptions("build_options", build_options);
 
     const itests = b.addTest(.{

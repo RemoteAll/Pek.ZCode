@@ -13,6 +13,7 @@
 const std = @import("std");
 const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
+const postgres = @import("zzig").postgres;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
@@ -41,10 +42,11 @@ pub const IsolationLevel = enum {
     }
 };
 
-/// 会话底层驱动（当前只支持 SQLite / MySQL；其它方言在 Dal 层已报 `error.Unsupported`）。
+/// 会话底层驱动（SQLite / MySQL / PostgreSQL；其它方言在 Dal 层已报 `error.Unsupported`）。
 pub const Driver = union(enum) {
     sqlite: sqlite.Db,
     mysql: mysql.Conn,
+    postgres: postgres.Conn,
 };
 
 pub const Session = struct {
@@ -86,6 +88,7 @@ pub const Session = struct {
         switch (self.driver) {
             .sqlite => |*db| db.close(),
             .mysql => |*conn| conn.deinit(),
+            .postgres => |*conn| conn.deinit(),
         }
     }
 
@@ -173,6 +176,13 @@ pub const Session = struct {
                 };
                 return @intCast(n);
             },
+            .postgres => |*conn| {
+                const n = conn.exec(sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -228,6 +238,16 @@ pub const Session = struct {
                     .ok => &.{},
                 };
             },
+            .postgres => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows.rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -243,6 +263,8 @@ pub const Session = struct {
         return switch (self.driver) {
             .sqlite => |*db| db.lastInsertId(),
             .mysql => |*conn| conn.lastInsertId(),
+            // PostgreSQL 无自增回写（需 `RETURNING`），恒为 0
+            .postgres => |*conn| conn.lastInsertId(),
         };
     }
 
@@ -250,6 +272,7 @@ pub const Session = struct {
         return switch (self.driver) {
             .sqlite => |*db| db.lastError(),
             .mysql => |*conn| conn.lastError(),
+            .postgres => |*conn| conn.lastError(),
         };
     }
 
@@ -259,6 +282,7 @@ pub const Session = struct {
         return switch (self.driver) {
             .sqlite => |*db| db.prepare(self.gpa, sql),
             .mysql => error.Unsupported,
+            .postgres => error.Unsupported,
         };
     }
 
@@ -295,6 +319,19 @@ pub const Session = struct {
                 }
                 _ = try self.execute("START TRANSACTION", &.{});
             },
+            .postgresql => {
+                if (level != .default) {
+                    const text = level.sqlText() orelse {
+                        std.debug.print("[zcode] 事务：PostgreSQL 不支持隔离级别 {s}\n", .{@tagName(level)});
+                        return error.Unsupported;
+                    };
+                    const sql = try std.fmt.allocPrint(self.gpa, "BEGIN ISOLATION LEVEL {s}", .{text});
+                    defer self.gpa.free(sql);
+                    _ = try self.execute(sql, &.{});
+                } else {
+                    _ = try self.execute("BEGIN", &.{});
+                }
+            },
             else => return error.Unsupported,
         }
         return self.tx_depth;
@@ -309,7 +346,7 @@ pub const Session = struct {
 
         if (self.tx_depth == 0) {
             switch (self.kind) {
-                .sqlite, .mysql => _ = try self.execute("COMMIT", &.{}),
+                .sqlite, .mysql, .postgresql => _ = try self.execute("COMMIT", &.{}),
                 else => return error.Unsupported,
             }
         }
@@ -328,7 +365,7 @@ pub const Session = struct {
         if (self.tx_depth > 0) return self.tx_depth;
 
         switch (self.kind) {
-            .sqlite, .mysql => {
+            .sqlite, .mysql, .postgresql => {
                 _ = self.execute("ROLLBACK", &.{}) catch |e| {
                     if (ignore_exception) {
                         std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });

@@ -21,7 +21,7 @@
 | 对象实体 + 脏更新 | `Entity` | `src/entity.rs` / `dirty.rs` | `src/entity.zig` | ✅ insert/update(脏列)/save/saveBatch/delete/find/query |
 | 整表/单对象缓存 | `Meta.Cache` | `src/cache.rs` | `src/cache.zig` | ✅ 整表 `Cache(T)` + `SingleCache(T)`，写后自动失效 |
 | 批量写 / 队列 | `EntityExtension` / `EntityDeferredQueue` | `src/batch.rs` / `entity_queue.rs` | `src/entity_queue.zig` | ✅ 多行 INSERT 分批 + 延迟写队列（按条数/时间触发，失败保留队列） |
-| 分表 / 分库 | `EntitySplit` / `Shards` / `TimeShardPolicy` | `src/shards.rs` | `src/shards.zig` | ✅ 时间分表（`{0}_{1:yyyyMM}`）/ 连接模板 / 区间扫描 / 条件推导 / 雪花 Id；**跨库分片未做**（显式报错） |
+| 分表 / 分库 | `EntitySplit` / `Shards` / `TimeShardPolicy` | `src/shards.rs` | `src/shards.zig` | ✅ 时间分表（`{0}_{1:yyyyMM}`）/ 连接模板 / 区间扫描 / 条件推导 / 雪花 Id；✅ **跨库分片**（`attachConnection` + `sessionForConn`）与**分片表自动建表**（`ensureShardTable`） |
 | 读写分离 | `ReadWriteStrategy` / `DAL.Reads` | `src/readwrite.rs` | `src/readwrite.zig` + `Dal.readSessionFor` | ✅ 忽略表 / 全局切主库 / 轮询从库（从库会话强制只读） |
 | 连接池 | ADO.NET 连接池 | `src/pool.rs` | `src/pool.zig` + `Dal.makePool` | ✅ 上限 / 空闲回收 / 预热 / 统计；`:memory:` 自动不建议池化 |
 | 写入拦截器 | `EntityInterceptor` / `TimeModule` / `UserModule` / `TraceModule` | `src/interceptor.rs` | `src/interceptor.zig` | ✅ 审计列自动补全（插入补、更新刷），单条与批量都生效 |
@@ -31,7 +31,7 @@
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
 | 远程服务 | `DbServer` / `DbService` | `db_service.rs` | — | ⛔ 未做（需要协议栈与服务端形态，单独一轮） |
-| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | — | ⛔ 未做：方言与 DDL 已就绪，**执行驱动**缺（PG SCRAM / TDS / OCI 各需独立实现 + 回环假服务端测试） |
+| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；SQL Server（TDS）与 Oracle（OCI/TNS）**未做**（另有 MySQL TLS/压缩/LOCAL INFILE 未做） |
 
 ## 2. 逐项语义对齐（已实现部分）
 

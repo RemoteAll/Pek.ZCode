@@ -233,6 +233,7 @@ fn isUsable(s: *const Session) bool {
     return switch (s.driver) {
         .sqlite => |db| db.handle != null,
         .mysql => |conn| !conn.closed,
+        .postgres => |conn| !conn.closed,
     };
 }
 

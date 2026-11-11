@@ -249,22 +249,29 @@ pub const TableRef = struct {
     }
 
     /// 按模型列类型规整值：读到的时间/小数/布尔都转成规范表示。
+    /// 按模型列类型规整值：读到的时间/小数/布尔都转成规范表示。
+    ///
+    /// 分配口径（性能相关）：直接 `arena.alloc` 一次拿到结果数组、每行一次 `alloc` 拿到值数组，
+    /// **不再用 ArrayList + toOwnedSlice**——后者会多复制一遍（arena 上的 toOwnedSlice 是拷贝），
+    /// 分页 10 行 × 5 列就是 20 次多余分配。
     fn normalizeRows(self: *const TableRef, s: *Session, raw: []const Row) ![]Row {
         const arena = s.resultAllocator();
-        var out: std.ArrayList(Row) = .empty;
-        try out.ensureTotalCapacity(arena, raw.len);
+        if (raw.len == 0) return &.{};
 
-        for (raw) |row| {
-            var values: std.ArrayList(Value) = .empty;
-            try values.ensureTotalCapacity(arena, row.values.len);
+        const out = try arena.alloc(Row, raw.len);
+        for (raw, 0..) |row, r| {
+            const values = try arena.alloc(Value, row.values.len);
             for (row.names, 0..) |name, i| {
                 const raw_value = row.values[i];
                 const col = self.table.column(name);
-                values.appendAssumeCapacity(if (col) |c| try normalizeValue(arena, c.data_type, raw_value, self.table.effectiveColumnName(c)) else raw_value);
+                values[i] = if (col) |c|
+                    try normalizeValue(arena, c.data_type, raw_value, self.table.effectiveColumnName(c))
+                else
+                    raw_value;
             }
-            out.appendAssumeCapacity(.{ .names = row.names, .values = try values.toOwnedSlice(arena) });
+            out[r] = .{ .names = row.names, .values = values };
         }
-        return out.toOwnedSlice(arena);
+        return out;
     }
 
     fn ensureWritable(self: *const TableRef) !void {

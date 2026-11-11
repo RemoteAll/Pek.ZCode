@@ -13,6 +13,7 @@ const dialect = @import("dialect.zig");
 const DatabaseKind = dialect.DatabaseKind;
 const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
+const postgres = @import("zzig").postgres;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -161,6 +162,8 @@ pub const Dal = struct {
     rr_index: usize = 0,
     /// 分表策略注册表（按模型表名）
     shard_routes: std.ArrayListUnmanaged(ShardRoute) = .empty,
+    /// 额外挂载的命名连接（跨库分片 / 多库共存用）
+    connections: std.ArrayListUnmanaged(NamedConn) = .empty,
     /// 写入拦截器链（不拥有，由调用方创建与销毁）
     chain: ?*interceptor.Chain = null,
 
@@ -168,6 +171,12 @@ pub const Dal = struct {
     pub const ShardRoute = struct {
         table_name: []const u8,
         policy: shards.TimePolicy,
+    };
+
+    /// 额外挂载的命名连接（对应 `ConnPolicy` 指向的另一个库）
+    pub const NamedConn = struct {
+        name: []const u8,
+        opts: ConnectionOptions,
     };
 
     /// 缓存注册项：类型擦除的回调（表名 + 失效函数）
@@ -184,10 +193,17 @@ pub const Dal = struct {
         return initWithModel(gpa, conn_str, m);
     }
 
-    /// 用已解析的模型打开（模型所有权转移给 Dal）。
-    pub fn initWithModel(gpa: std.mem.Allocator, conn_str: []const u8, m: EntityModel) !Dal {
+    /// 用已解析的模型打开（模型所有权转移给 Dal；**失败时由本函数释放**）。
+    pub fn initWithModel(gpa: std.mem.Allocator, conn_str: []const u8, m_in: EntityModel) !Dal {
         var opts_owned = try parseConnectionString(gpa, conn_str);
         errdefer freeOptions(gpa, &opts_owned);
+
+        // 校验失败时模型必须释放：调用方已把所有权交出来，不能再指望它 deinit
+        const m = m_in;
+        errdefer {
+            var owned = m;
+            owned.deinit();
+        }
 
         switch (opts_owned.provider) {
             .sqlite => {
@@ -215,6 +231,21 @@ pub const Dal = struct {
                     .strategy = readwrite.Strategy.init(gpa),
                 };
             },
+            .postgresql => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                if (opts_owned.database.len == 0) return error.NoDatabase;
+                // 端口缺省以方言为准（PG 5432），不能沿用 MySQL 的 3306
+                if (opts_owned.port == 3306) opts_owned.port = postgres.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
             else => return error.Unsupported,
         }
     }
@@ -233,6 +264,11 @@ pub const Dal = struct {
             if (route.policy.table_policy) |tpl| self.gpa.free(tpl);
         }
         self.shard_routes.deinit(self.gpa);
+        for (self.connections.items) |*c| {
+            self.gpa.free(c.name);
+            c.opts.deinit(self.gpa);
+        }
+        self.connections.deinit(self.gpa);
         if (self.lib) |*lib| lib.deinit();
         self.opts.deinit(self.gpa);
         self.model.deinit();
@@ -353,6 +389,18 @@ pub const Dal = struct {
                 s.read_only = opts.read_only;
                 return s;
             },
+            .postgresql => {
+                const conn = try postgres.Conn.open(self.gpa, .{
+                    .host = opts.server,
+                    .port = opts.port,
+                    .user = opts.user,
+                    .password = opts.password,
+                    .database = opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
+                s.read_only = opts.read_only;
+                return s;
+            },
             else => return error.Unsupported,
         }
     }
@@ -376,7 +424,7 @@ pub const Dal = struct {
     pub fn supportsPooling(self: *const Dal) bool {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
-            .mysql => true,
+            .mysql, .postgresql => true,
             else => false,
         };
     }
@@ -424,30 +472,117 @@ pub const Dal = struct {
 
     /// 按字段值定位分片表句柄。返回的 `ShardModel` 由调用方释放。
     ///
-    /// 跨库分片（`ConnPolicy` 指向别的连接）需要额外挂载连接，本轮**显式不支持**：
-    /// 返回 `error.Unsupported` 并打印实际期望的连接名，避免静默写到错误库。
+    /// 跨库分片（`ConnPolicy` 指向别的连接）需先用 `attachConnection` 挂上该连接，
+    /// 并用 `sessionForConn(model.conn_name)` 取会话；**没挂就报错**，不会静默写到主库。
     pub fn tableShard(self: *Dal, table_name: []const u8, value: @import("zzig").db.Value) !struct { table: TableRef, model: shards.ShardModel } {
+        const sm = try self.shardOfTable(table_name, value);
+        return .{ .table = try self.tableShardOn(table_name, sm), .model = sm };
+    }
+
+    /// 只算分片（不开会话、不建表）：返回的 `ShardModel` 由调用方释放。
+    pub fn shardOfTable(self: *Dal, table_name: []const u8, value: @import("zzig").db.Value) !shards.ShardModel {
         const policy = self.shardPolicyFor(table_name) orelse return error.NoShardPolicy;
-        const shard_model = (try policy.shardOf(value)) orelse return error.NoShardPolicy;
+        return (try policy.shardOf(value)) orelse error.NoShardPolicy;
+    }
 
-        if (!std.ascii.eqlIgnoreCase(shard_model.conn_name, self.connName())) {
+    /// 按分片模型取表句柄（表名已替换；连接由调用方用 `sessionForConn` 选择）。
+    pub fn tableShardOn(self: *Dal, base_table: []const u8, shard_model: shards.ShardModel) !TableRef {
+        const is_main = std.ascii.eqlIgnoreCase(shard_model.conn_name, self.connName());
+        if (!is_main and self.connectionIndex(shard_model.conn_name) == null) {
             std.debug.print(
-                "[zcode] 分表：分片连接 {s} 与当前连接 {s} 不同，尚未支持跨库分片（表 {s}）\n",
-                .{ shard_model.conn_name, self.connName(), shard_model.table_name },
+                "[zcode] 分表：连接 {s} 未挂载（表 {s}）。跨库分片需先 attachConnection(名称, 连接串)\n",
+                .{ shard_model.conn_name, shard_model.table_name },
             );
-            shard_model.deinit(self.gpa);
-            return error.Unsupported;
+            return error.UnknownConnection;
         }
-
-        const t = self.model.table(table_name) orelse {
-            shard_model.deinit(self.gpa);
-            return error.TableNotFound;
-        };
+        const t = self.model.table(base_table) orelse return error.TableNotFound;
         var ref = TableRef.init(self.gpa, self.opts.provider, t);
         ref.table_name = shard_model.table_name;
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
         ref.setInterceptorChain(self.chain);
-        return .{ .table = ref, .model = shard_model };
+        return ref;
+    }
+
+    /// 挂载一个命名连接（用于跨库分片 / 多库共存）。同名覆盖，幂等。
+    pub fn attachConnection(self: *Dal, name: []const u8, conn_str: []const u8) !void {
+        var opts = try parseConnectionString(self.gpa, conn_str);
+        errdefer opts.deinit(self.gpa);
+
+        if (opts.provider != self.opts.provider) {
+            std.debug.print(
+                "[zcode] 附加连接 {s} 的方言 {s} 与主库 {s} 不一致，拒绝挂载\n",
+                .{ name, @tagName(opts.provider), @tagName(self.opts.provider) },
+            );
+            opts.deinit(self.gpa);
+            return error.Unsupported;
+        }
+
+        for (self.connections.items) |*c| {
+            if (std.ascii.eqlIgnoreCase(c.name, name)) {
+                c.opts.deinit(self.gpa);
+                c.opts = opts;
+                return;
+            }
+        }
+        try self.connections.append(self.gpa, .{ .name = try self.gpa.dupe(u8, name), .opts = opts });
+    }
+
+    pub fn connectionCount(self: *const Dal) usize {
+        return self.connections.items.len;
+    }
+
+    fn connectionIndex(self: *const Dal, name: []const u8) ?usize {
+        if (name.len == 0 or std.ascii.eqlIgnoreCase(name, self.connName())) return null;
+        for (self.connections.items, 0..) |c, i| {
+            if (std.ascii.eqlIgnoreCase(c.name, name)) return i;
+        }
+        return null;
+    }
+
+    /// 取指定连接名对应的会话：主连接（名称为空或等于模型 `ConnName`）走 `openSession`，
+    /// 其余必须已 `attachConnection`。
+    pub fn sessionForConn(self: *Dal, name: []const u8) !Session {
+        if (name.len == 0 or std.ascii.eqlIgnoreCase(name, self.connName())) return self.openSession();
+        const idx = self.connectionIndex(name) orelse {
+            std.debug.print("[zcode] 连接 {s} 未挂载，无法开会话\n", .{name});
+            return error.UnknownConnection;
+        };
+        return self.openSessionWith(&self.connections.items[idx].opts);
+    }
+
+    /// 分片表自动建表：表不存在时按基础表结构建表（含索引）。
+    /// 返回 1 = 已新建，0 = 已存在。
+    pub fn ensureShardTable(self: *Dal, base_table: []const u8, shard_model: shards.ShardModel) !usize {
+        const base = self.model.table(base_table) orelse return error.TableNotFound;
+        const exists = blk: {
+            var s = try self.sessionForConn(shard_model.conn_name);
+            defer s.deinit();
+            break :blk try tableExists(&s, self.opts.provider, shard_model.table_name);
+        };
+        if (exists) return 0;
+
+        var s = try self.sessionForConn(shard_model.conn_name);
+        defer s.deinit();
+
+        // 用基础表结构 + 分片表名建表（索引名会随表名变化，避免与基础表撞名）
+        var meta = base.*;
+        const owned_name = shard_model.table_name;
+        meta.table_name = owned_name;
+        const stmts = try self.opts.provider.createTableAlloc(self.gpa, &meta);
+        defer {
+            for (stmts) |stmt| self.gpa.free(stmt);
+            self.gpa.free(stmts);
+        }
+        for (stmts) |stmt| {
+            _ = s.execute(stmt, &.{}) catch |e| {
+                std.debug.print(
+                    "[zcode] 分片建表失败：{s}#{s}\n  SQL: {s}\n  错误: {s}\n",
+                    .{ shard_model.conn_name, shard_model.table_name, stmt, s.lastError() },
+                );
+                return e;
+            };
+        }
+        return 1;
     }
 
     /// 当前连接名（模型 `<Option><ConnName>`，缺省空串）。
@@ -486,6 +621,18 @@ pub const Dal = struct {
                     .database = self.opts.database,
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
+                s.read_only = self.opts.read_only;
+                return s;
+            },
+            .postgresql => {
+                const conn = try postgres.Conn.open(self.gpa, .{
+                    .host = self.opts.server,
+                    .port = self.opts.port,
+                    .user = self.opts.user,
+                    .password = self.opts.password,
+                    .database = self.opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
                 s.read_only = self.opts.read_only;
                 return s;
             },

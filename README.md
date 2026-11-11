@@ -21,7 +21,8 @@
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT / UPDATE / DELETE / SELECT / COUNT |
 | `session` | `IDbSession` | ✅ 同步会话：execute / query / 标量 / 自增回写 |
 | `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
-| `zzig.mysql` | `MySql.cs` / `DH.MySql` | ✅ **绿色版纯协议驱动**：握手 v10 + `mysql_native_password` / `caching_sha2`（fast auth **与完整鉴权 RSA-OAEP**）、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
+| `zzig.mysql` | `MySql.cs` / `DH.MySql` | ✅ **绿色版纯协议驱动**：握手 v10 + `mysql_native_password` / `caching_sha2`（fast auth **与完整鉴权 RSAES-PKCS1-v1_5**）、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
+| `zzig.postgres` | `PostgreSQL.cs` | ✅ **纯协议驱动（协议 3.0）**：Trust / Cleartext / **MD5** / **SCRAM-SHA-256** 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；不依赖 libpq |
 | `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
 | `entity` | `Entity`（对象实体） | ✅ 脏字段更新（只写变化列、无变化不发 SQL）、insert/save/update/delete/find/query/count、`insert_only`/视图保护 |
 | `batch` | `EntityExtension`（批量写） | ✅ `insertBatch`（多行 VALUES，按方言参数上限分批）/ `deleteByPkBatch` / `saveBatch`（新增合并批插、已有按脏列逐条更新） |
@@ -31,7 +32,7 @@
 | `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等）；`Full` 档删列删索引；表级档位只能收紧 |
 | `readwrite` + `Dal.readSessionFor` | `ReadWriteStrategy` / `DAL.Reads` | ✅ 忽略表（大小写不敏感）、全局切主库、轮询从库；**从库会话强制只读**，无从库自动回落主库 |
 | `pool` + `Dal.makePool` | ADO.NET 连接池 / Rust `pool.rs` | ✅ 上限（超限直接 `PoolExhausted`，不排队）、空闲超时回收、预热、统计；`:memory:` 不建议池化 |
-| `shards` + `Dal.tableShard` | `TimeShardPolicy` / `EntitySplit` | ✅ 时间分表（`{0}_{1:yyyyMM}` 等）、连接模板、区间扫描（支持倒序）、条件推导、雪花 Id；**跨库分片未做**（显式报错） |
+| `shards` + `Dal.tableShard` | `TimeShardPolicy` / `EntitySplit` | ✅ 时间分表（`{0}_{1:yyyyMM}` 等）、连接模板、区间扫描（支持倒序）、条件推导、雪花 Id；✅ **跨库分片**（`attachConnection` + `sessionForConn`）与**分片表自动建表**（`ensureShardTable`，幂等） |
 | `interceptor` | `TimeModule` / `UserModule` / `TraceModule` | ✅ 插入补审计列、更新刷新；单条与批量都生效；`allow_empty=false` 时无用户直接报错 |
 | `entity_queue` | `EntityDeferredQueue` | ✅ 按条数/时间触发 `saveBatch`；**flush 失败保留队列**便于重试；deinit 不自动 flush |
 | `navigation` | `NavigationLoader` | ✅ 单条 / 列表 / **`fillMany` 批量填充（消除 N+1）** |
@@ -39,7 +40,7 @@
 | `backup` | `DAL_Backup` | ✅ SQLite 原生快照（`VACUUM INTO`，校验非 0 字节）+ SQL 脚本（结构同源 DDL + 字面量安全，SQLite/MySQL） |
 
 **本轮未做**（已写进 `docs/移植对照-NCode.md`，不是遗忘）：远程服务（`DbServer`/`DbService`）、
-SQL Server / PostgreSQL / Oracle **执行驱动**（方言与 DDL 已就绪）、MySQL TLS / 压缩 / LOCAL INFILE、跨连接分片。
+SQL Server（TDS）与 Oracle（OCI/TNS）**执行驱动**、MySQL TLS / 压缩 / LOCAL INFILE。
 
 MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH.MySql`** 为准 ——
 开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
@@ -98,6 +99,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/regression.ps1   # 一
 powershell -File tools/mysql-local.ps1 -Action setup   # 一次性：建 3307 端口便携实例
 zig build integration -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
 ```
+
+PostgreSQL 同理：`zig build integration -Dpg-conn="Provider=PostgreSQL;Server=127.0.0.1;Port=5432;Database=demo;UserID=pg;Password=…"`
+（**没给 `-Dpg-conn` 时，PG 只跑回环假服务端用例**——协议层在 `zzig` 里已完整覆盖，不依赖真库。）
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
 要在 Win7 上运行，把一份自带运行时的 `sqlite3.dll` 放到 exe 同目录即可（无需重新编译）。
