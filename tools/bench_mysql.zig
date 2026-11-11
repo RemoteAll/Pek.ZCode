@@ -118,7 +118,67 @@ pub fn main(init: std.process.Init) !void {
         printLine("loadDataBatch（LOCAL INFILE）", elapsed, loaded);
     }
 
+    // 3) 预处理语句复用 A/B：同一进程内先关缓存测一遍，再开缓存测一遍
+    {
+        const rounds: usize = 3000;
+        _ = try s.execute("DELETE FROM `DH_BenchBulk`", &.{});
+        _ = try s.execute("INSERT INTO `DH_BenchBulk` (`Id`, `Code`, `Title`, `Amount`, `Ok`, `CreateTime`) VALUES (1, 'hit-1', 'x', 1.0, 1, '2026-11-11 00:00:00')", &.{});
+
+        const sel_sql = "SELECT `Id`, `Code`, `Title` FROM `DH_BenchBulk` WHERE `Id` = ?";
+        const ins_sql = "INSERT INTO `DH_BenchBulk` (`Code`, `Title`, `Amount`, `Ok`, `CreateTime`) VALUES (?, 'y', 2.0, 0, '2026-11-11 00:00:00')";
+
+        // 关缓存
+        s.driver.mysql.setStmtCacheLimit(0);
+        const off_sel = try timePointSelect(&s, sel_sql, rounds);
+        const off_ins = try timeSingleInsert(&s, ins_sql, rounds);
+        printLine("点查（预处理**未**复用）", off_sel, rounds);
+        printLine("单行插入（预处理**未**复用）", off_ins, rounds);
+
+        // 开缓存（32 条够用）
+        s.driver.mysql.setStmtCacheLimit(32);
+        const on_sel = try timePointSelect(&s, sel_sql, rounds);
+        const on_ins = try timeSingleInsert(&s, ins_sql, rounds);
+        printLine("点查（预处理复用）", on_sel, rounds);
+        printLine("单行插入（预处理复用）", on_ins, rounds);
+
+        const stats = s.driver.mysql.stmtCacheStats();
+        std.debug.print("语句缓存：命中 {d} / 未命中 {d} / 当前 {d} 条\n", .{ stats.hits, stats.misses, stats.size });
+        const speedup_sel = @as(f64, @floatFromInt(off_sel)) / @as(f64, @floatFromInt(on_sel));
+        const speedup_ins = @as(f64, @floatFromInt(off_ins)) / @as(f64, @floatFromInt(on_ins));
+        std.debug.print("提速：点查 {d:.2}× / 单行插入 {d:.2}×\n", .{ speedup_sel, speedup_ins });
+    }
+
     _ = s.execute("DROP TABLE IF EXISTS `DH_BenchBulk`", &.{}) catch {};
+}
+
+/// 单个参数化点查循环（不计数、只测协议往返），返回总纳秒。
+fn timePointSelect(s: *zcode.Session, sql: []const u8, rounds: usize) !i128 {
+    // 热身 1 次：把首次 prepare/缓存写入排除在计时之外
+    const warm = try s.queryRows(sql, &.{.{ .int = 1 }});
+    try std.testing.expect(warm.len == 1);
+    s.resetResults();
+
+    const start = nowNs();
+    for (0..rounds) |_| {
+        const rows = try s.queryRows(sql, &.{.{ .int = 1 }});
+        if (rows.len != 1) return error.Unexpected;
+        s.resetResults();
+    }
+    return nowNs() - start;
+}
+
+/// 单个参数化插入循环（包在一个事务里，避免把「每次提交」的磁盘开销算进来）。
+fn timeSingleInsert(s: *zcode.Session, sql: []const u8, rounds: usize) !i128 {
+    _ = try s.beginTransaction(.default);
+    const start = nowNs();
+    for (0..rounds) |i| {
+        const code = try std.fmt.allocPrint(s.resultAllocator(), "s-{d}", .{i});
+        _ = try s.execute(sql, &.{.{ .text = code }});
+        s.resetResults();
+    }
+    const elapsed = nowNs() - start;
+    _ = try s.rollback(false);
+    return elapsed;
 }
 
 fn printLine(name: []const u8, elapsed_ns: i128, n: usize) void {

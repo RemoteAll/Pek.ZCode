@@ -47,6 +47,8 @@ MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH
 `caching_sha2` 完整鉴权（**RSAES-PKCS1-v1_5**，真库实测：OAEP 服务端回 1045）；BIT 按**大端**还原（真库实测）。
 **TLS 已支持**（`SslMode=Disabled|Preferred|Required|VerifyCA|VerifyFull`，缺省 `Preferred`，与 MySqlConnector 同口径）；
 **压缩协议已支持**（`Compression=True`，缺省关，认证完成后套 zlib 压缩帧，与 TLS 可叠加）。
+**预处理语句复用**：带参语句按 SQL 文本缓存句柄（默认 32 条，FIFO 淘汰）；同进程 A/B 实测
+点查 **1.64×**、单行插入（同事务）**1.62×**（`zig build bench-mysql` 可复现）。
 真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
