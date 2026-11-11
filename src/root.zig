@@ -50,6 +50,8 @@ pub const dal = @import("dal.zig");
 pub const Dal = dal.Dal;
 /// 对象实体（脏字段更新 / insert / save / update / delete / find / query）
 pub const entity = @import("entity.zig");
+/// 整表实体缓存（Blocking 一致性 + 写后自动失效）
+pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
 pub const codegen = @import("codegen.zig");
 
@@ -77,5 +79,6 @@ test {
     _ = @import("dbtable.zig");
     _ = @import("dal.zig");
     _ = @import("entity.zig");
+    _ = @import("cache.zig");
     _ = @import("codegen.zig");
 }

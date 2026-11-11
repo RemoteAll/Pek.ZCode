@@ -105,6 +105,15 @@ pub const Dal = struct {
     model: EntityModel,
     opts: ConnectionOptions,
     lib: sqlite.Lib,
+    /// 整表实体缓存注册表（写操作后按表名使缓存失效）
+    cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
+
+    /// 缓存注册项：类型擦除的回调（表名 + 失效函数）
+    pub const CacheHook = struct {
+        table_name: []const u8,
+        ctx: *anyopaque,
+        invalidate: *const fn (ctx: *anyopaque) void,
+    };
 
     /// 从 `Model.xml` 文件打开。
     pub fn open(gpa: std.mem.Allocator, conn_str: []const u8, model_path: []const u8) !Dal {
@@ -131,9 +140,34 @@ pub const Dal = struct {
     }
 
     pub fn deinit(self: *Dal) void {
+        self.cache_hooks.deinit(self.gpa);
         self.lib.deinit();
         self.opts.deinit(self.gpa);
         self.model.deinit();
+    }
+
+    /// 注册整表缓存（由 `cache.Cache(T).init` 调用）。
+    pub fn registerCache(self: *Dal, hook: CacheHook) !void {
+        try self.cache_hooks.append(self.gpa, hook);
+    }
+
+    /// 注销整表缓存（按 ctx 指针匹配）。
+    pub fn unregisterCache(self: *Dal, ctx: *anyopaque) void {
+        var i: usize = 0;
+        while (i < self.cache_hooks.items.len) {
+            if (self.cache_hooks.items[i].ctx == ctx) {
+                _ = self.cache_hooks.swapRemove(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// 写后失效：只通知与该表匹配的缓存。
+    pub fn invalidateCaches(self: *Dal, table_name: []const u8) void {
+        for (self.cache_hooks.items) |hook| {
+            if (std.ascii.eqlIgnoreCase(hook.table_name, table_name)) hook.invalidate(hook.ctx);
+        }
     }
 
     fn freeOptions(gpa: std.mem.Allocator, opts: *ConnectionOptions) void {
@@ -152,7 +186,14 @@ pub const Dal = struct {
     /// 取表句柄（按实体名或物理表名）。
     pub fn table(self: *Dal, name: []const u8) !TableRef {
         const t = self.model.table(name) orelse return error.TableNotFound;
-        return TableRef.init(self.gpa, self.opts.provider, t);
+        var ref = TableRef.init(self.gpa, self.opts.provider, t);
+        ref.setWriteNotifier(@ptrCast(self), onTableWrite);
+        return ref;
+    }
+
+    fn onTableWrite(ctx: *anyopaque, table_name: []const u8) void {
+        const self: *Dal = @ptrCast(@alignCast(ctx));
+        self.invalidateCaches(table_name);
     }
 
     /// 实际生效的迁移档位（连接串优先，其次模型 `<Option><Migration>`，缺省 `On`）。

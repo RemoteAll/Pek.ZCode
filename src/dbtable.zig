@@ -27,9 +27,24 @@ pub const TableRef = struct {
     table: *const TableMeta,
     /// 物理表名（分表场景由调用方传入具体表名）
     table_name: []const u8,
+    /// 写后失效通知（由 `Dal.table()` 注入；不引入对 dal 的循环依赖）
+    write_ctx: ?*anyopaque = null,
+    write_notify: ?*const fn (ctx: *anyopaque, table_name: []const u8) void = null,
 
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, table: *const TableMeta) TableRef {
         return .{ .gpa = gpa, .kind = kind, .table = table, .table_name = table.effectiveTableName() };
+    }
+
+    /// 注入写后通知（Dal 用它使整表缓存失效）。
+    pub fn setWriteNotifier(self: *TableRef, ctx: *anyopaque, notify: *const fn (ctx: *anyopaque, table_name: []const u8) void) void {
+        self.write_ctx = ctx;
+        self.write_notify = notify;
+    }
+
+    fn notifyWrite(self: *const TableRef) void {
+        if (self.write_ctx) |ctx| {
+            if (self.write_notify) |notify| notify(ctx, self.table_name);
+        }
     }
 
     /// 插入一行，返回自增 ID（无自增列返回 0）。
@@ -38,6 +53,7 @@ pub const TableRef = struct {
         const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
         defer sql.deinit(self.gpa);
         _ = try s.execute(sql.text, sql.params);
+        self.notifyWrite();
         if (self.table.identity() != null) return s.lastInsertId();
         return 0;
     }
@@ -47,7 +63,9 @@ pub const TableRef = struct {
         try self.ensureWritable();
         const sql = try sqlbuild.update(self.gpa, self.kind, self.table, self.table_name, sets, filter);
         defer sql.deinit(self.gpa);
-        return try s.execute(sql.text, sql.params);
+        const affected = try s.execute(sql.text, sql.params);
+        if (affected > 0) self.notifyWrite();
+        return affected;
     }
 
     /// 删除（同样：`filter` 为空即清空全表，慎用）。
@@ -55,7 +73,9 @@ pub const TableRef = struct {
         try self.ensureWritable();
         const sql = try sqlbuild.delete(self.gpa, self.kind, self.table_name, filter);
         defer sql.deinit(self.gpa);
-        return try s.execute(sql.text, sql.params);
+        const affected = try s.execute(sql.text, sql.params);
+        if (affected > 0) self.notifyWrite();
+        return affected;
     }
 
     /// 计数。
@@ -98,6 +118,7 @@ pub const TableRef = struct {
             affected += try s.execute(sql.text, sql.params);
             start = end;
         }
+        if (affected > 0) self.notifyWrite();
         return affected;
     }
 
@@ -127,6 +148,7 @@ pub const TableRef = struct {
             affected += try s.execute(sql.text, sql.params);
             start = end;
         }
+        if (affected > 0) self.notifyWrite();
         return affected;
     }
 

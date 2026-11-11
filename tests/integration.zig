@@ -348,20 +348,20 @@ test "批量写：多行插入 / 主键批量删除 / 实体批量保存" {
 
     // 3) 实体批量保存：2 个新增合并插入 + 1 个已有按脏列更新
     var existing = JiLiYu{};
-    existing.@"Code" = "e-existing";
-    existing.@"Title" = "旧";
-    existing.@"Amount" = try zcode.Decimal.parse("0");
+    existing.Code = "e-existing";
+    existing.Title = "旧";
+    existing.Amount = try zcode.Decimal.parse("0");
     const existing_id = try zcode.entity.insert(&dal, &existing, &s);
 
     var e1 = JiLiYu{};
-    e1.@"Code" = "n-1";
-    e1.@"Title" = "新1";
-    e1.@"Amount" = try zcode.Decimal.parse("0");
+    e1.Code = "n-1";
+    e1.Title = "新1";
+    e1.Amount = try zcode.Decimal.parse("0");
 
     var e2 = JiLiYu{};
-    e2.@"Code" = "n-2";
-    e2.@"Title" = "新2";
-    e2.@"Amount" = try zcode.Decimal.parse("0");
+    e2.Code = "n-2";
+    e2.Title = "新2";
+    e2.Amount = try zcode.Decimal.parse("0");
 
     var e3 = (try zcode.entity.findByPk(&dal, JiLiYu, &s, &.{.{ .int = existing_id }})).?;
     e3.setTitle("改过");
@@ -375,4 +375,69 @@ test "批量写：多行插入 / 主键批量删除 / 实体批量保存" {
     const report2 = try zcode.entity.saveBatch(&dal, JiLiYu, &[_]*JiLiYu{&e3}, &s);
     try std.testing.expectEqual(@as(usize, 1), report2.unchanged);
     try std.testing.expectEqual(@as(usize, 0), report2.updated);
+}
+
+test "整表缓存：命中 / 写后自动失效 / TTL 过期重载" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "cache");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = try openDal(a, db_path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    _ = try table.delete(&s, null);
+
+    // 2 行（走实体：内部经 Dal.table，同样会触发写后失效）
+    var ids: [2]i32 = undefined;
+    for (0..2) |k| {
+        var e = JiLiYu{};
+        e.Code = try std.fmt.allocPrint(s.resultAllocator(), "c-{d}", .{k});
+        e.Title = "缓存";
+        e.Amount = try zcode.Decimal.parse("0");
+        e.Ok = true;
+        e.CreateTime = zcode.DateTime.nowLocal();
+        ids[k] = @intCast(try zcode.entity.insert(&dal, &e, &s));
+    }
+
+    var c = zcode.cache.Cache(JiLiYu).init(&dal, 60);
+    defer c.deinit();
+
+    // 首次访问整表装载；按主键命中
+    try std.testing.expectEqual(@as(usize, 2), try c.count(&s));
+    const hit = (try c.get(&s, ids[1])).?;
+    try std.testing.expectEqualStrings("c-1", hit.Code);
+
+    // 绕过 TableRef 直接写库 → 缓存立即可见？不，仍是旧快照（Blocking 语义靠写后失效，这里没有通知）
+    _ = try s.execute("INSERT INTO \"DH_JiLiYu\" (\"Code\", \"Title\", \"Amount\", \"Ok\", \"CreateTime\") VALUES (?, ?, ?, ?, ?)", &.{
+        .{ .text = "raw" },
+        .{ .text = "raw" },
+        .{ .decimal = try zcode.Decimal.parse("0") },
+        .{ .boolean = true },
+        .{ .datetime = zcode.DateTime.nowLocal() },
+    });
+    try std.testing.expectEqual(@as(usize, 2), try c.count(&s));
+
+    // TTL 过期 → 同步重载，看到第 3 行
+    c.loaded_at -= 100;
+    try std.testing.expectEqual(@as(usize, 3), try c.count(&s));
+
+    // 通过 TableRef 写入 → 自动失效 → 下次访问就是新快照
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Code", .value = .{ .text = "via-ref" } },
+        .{ .name = "Title", .value = .{ .text = "写后失效" } },
+        .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("0") } },
+        .{ .name = "Ok", .value = .{ .boolean = true } },
+        .{ .name = "CreateTime", .value = .{ .datetime = zcode.DateTime.nowLocal() } },
+    });
+    try std.testing.expectEqual(@as(usize, 4), try c.count(&s));
+
+    // 手动失效
+    c.invalidate();
+    try std.testing.expectEqual(@as(usize, 4), try c.count(&s));
 }
