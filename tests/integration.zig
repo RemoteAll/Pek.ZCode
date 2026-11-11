@@ -880,3 +880,8 @@ test {
 test {
     _ = @import("integration_mysql_bulk.zig");
 }
+
+// MySQL TLS（SslMode=Required/None/VerifyCA/VerifyFull，需 -Dmysql-conn，可选 -Dmysql-ca）
+test {
+    _ = @import("integration_mysql_tls.zig");
+}

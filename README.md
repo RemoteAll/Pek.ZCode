@@ -45,7 +45,8 @@ SQL Server（TDS）与 Oracle（OCI/TNS）**执行驱动**、MySQL TLS / 压缩 
 MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH.MySql`** 为准 ——
 开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
 `caching_sha2` 完整鉴权（**RSAES-PKCS1-v1_5**，真库实测：OAEP 服务端回 1045）；BIT 按**大端**还原（真库实测）。
-**不支持**：TLS（`CLIENT_SSL` 不发）、压缩协议、LOCAL INFILE。
+**TLS 已支持**（`SslMode=Disabled|Preferred|Required|VerifyCA|VerifyFull`，缺省 `Preferred`，与 MySqlConnector 同口径）；
+**不支持**：压缩协议。
 真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
@@ -100,10 +101,26 @@ powershell -File tools/mysql-local.ps1 -Action setup   # 一次性：建 3307 �
 zig build integration -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
 # MySQL 批量写基准：insertBatch vs LOAD DATA LOCAL INFILE（20000 行）
 zig build bench-mysql -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
+# 额外传根证书时，跑 SslMode=VerifyCA / VerifyFull 的正向用例（自签 CA 场景）
+zig build integration -Dmysql-ca="...\data-3307\ca.pem" -Dmysql-conn="..."
 ```
 
 PostgreSQL 同理：`zig build integration -Dpg-conn="Provider=PostgreSQL;Server=127.0.0.1;Port=5432;Database=demo;UserID=pg;Password=…"`
 （**没给 `-Dpg-conn` 时，PG 只跑回环假服务端用例**——协议层在 `zzig` 里已完整覆盖，不依赖真库。）
+
+### MySQL TLS（`SslMode`）
+
+| 取值 | 行为 |
+|---|---|
+| `Disabled` / `None` | 明文（不声明 `CLIENT_SSL`） |
+| `Preferred`（**缺省**） | 服务端支持就加密；TLS 失败时**回退明文重连一次**并在 stderr 说明原因 |
+| `Required` | 只加密，不校验证书（内网自签常态） |
+| `VerifyCA` | 校验证书链（`SslCa=ca.pem` 或系统根证书），不校验主机名 |
+| `VerifyFull` | 证书链 + 主机名全校验（公网域名常态） |
+
+`SslMode=VerifyCA;SslCa=D:\certs\ca.pem` 直接写在连接串里；认不出的取值会在解析期报 `error.InvalidSslMode`（**不会静默按缺省走**）。
+TLS 实现复用 Zig std 的客户端，但**多处理了一条 `CertificateRequest`**（MySQL 8 只要配了 `ssl_ca`——自动生成证书的默认形态——握手必发该消息，std 不处理会直接连不上），
+差异只在这一处，见 `zzig/src/db/tls_client.zig` 头部。
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
 要在 Win7 上运行，把一份自带运行时的 `sqlite3.dll` 放到 exe 同目录即可（无需重新编译）。

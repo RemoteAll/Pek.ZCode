@@ -36,6 +36,10 @@ pub const ConnectionOptions = struct {
     user: []const u8 = "",
     password: []const u8 = "",
     database: []const u8 = "",
+    /// MySQL TLS 档位（`SslMode`）：缺省 `preferred`（服务端支持就加密）
+    ssl_mode: mysql.SslMode = .preferred,
+    /// 根证书文件（`SslCa`/`CertificateFile`），`verify_ca`/`verify_full` 用；空 = 系统根证书
+    ssl_ca: []const u8 = "",
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
     extra: []model.KeyValue = &.{},
 
@@ -46,12 +50,14 @@ pub const ConnectionOptions = struct {
         if (self.user.len > 0) gpa.free(self.user);
         if (self.password.len > 0) gpa.free(self.password);
         if (self.database.len > 0) gpa.free(self.database);
+        if (self.ssl_ca.len > 0) gpa.free(self.ssl_ca);
         if (self.extra.len > 0) gpa.free(self.extra);
         self.data_source = "";
         self.server = "";
         self.user = "";
         self.password = "";
         self.database = "";
+        self.ssl_ca = "";
         self.extra = &.{};
     }
 };
@@ -96,6 +102,21 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
             opts.user = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Pwd") or std.ascii.eqlIgnoreCase(key, "Password")) {
             opts.password = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "SslMode") or std.ascii.eqlIgnoreCase(key, "Ssl Mode") or
+            std.ascii.eqlIgnoreCase(key, "SSLMode"))
+        {
+            // 认不出的取值不能静默当成缺省：那是「以为加密实际明文」的根源
+            opts.ssl_mode = mysql.SslMode.parse(value) orelse {
+                std.debug.print(
+                    "[zcode] 连接串 SslMode={s} 无法识别（可用：None/Disabled/Preferred/Required/VerifyCA/VerifyFull）\n",
+                    .{value},
+                );
+                return error.InvalidSslMode;
+            };
+        } else if (std.ascii.eqlIgnoreCase(key, "SslCa") or std.ascii.eqlIgnoreCase(key, "Ssl CA") or
+            std.ascii.eqlIgnoreCase(key, "CertificateFile") or std.ascii.eqlIgnoreCase(key, "SslCert"))
+        {
+            opts.ssl_ca = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Migration")) {
             opts.migration = Migration.parse(value);
         } else if (std.ascii.eqlIgnoreCase(key, "ShowSql")) {
@@ -384,6 +405,8 @@ pub const Dal = struct {
                     .user = opts.user,
                     .password = opts.password,
                     .database = opts.database,
+                    .ssl_mode = opts.ssl_mode,
+                    .ssl_ca = opts.ssl_ca,
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
                 s.read_only = opts.read_only;
@@ -619,6 +642,8 @@ pub const Dal = struct {
                     .user = self.opts.user,
                     .password = self.opts.password,
                     .database = self.opts.database,
+                    .ssl_mode = self.opts.ssl_mode,
+                    .ssl_ca = self.opts.ssl_ca,
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
                 s.read_only = self.opts.read_only;
