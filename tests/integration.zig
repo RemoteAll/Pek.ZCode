@@ -652,11 +652,11 @@ test "MySQL 真库：建表 → CRUD → 分页（需 -Dmysql-conn）" {
 // ── 事务 ───────────────────────────────────────────────────────────────────
 fn insertOne(dal: *zcode.Dal, s: *zcode.session.Session, code: []const u8) !i64 {
     var e = JiLiYu{};
-    e.@"Code" = code;
-    e.@"Title" = "tx";
-    e.@"Amount" = try zcode.Decimal.parse("1");
-    e.@"Ok" = true;
-    e.@"CreateTime" = zcode.DateTime.nowLocal();
+    e.Code = code;
+    e.Title = "tx";
+    e.Amount = try zcode.Decimal.parse("1");
+    e.Ok = true;
+    e.CreateTime = zcode.DateTime.nowLocal();
     return try zcode.entity.insert(dal, &e, s);
 }
 
