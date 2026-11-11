@@ -1,0 +1,21 @@
+.{
+    // Zig 0.15+ 必需字段：包完整性校验
+    .fingerprint = 0x2311e0f7782ea9dc,
+
+    .name = .zcode,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+
+    .dependencies = .{
+        // XML 解析复用 zzig 公共库（DOM + 扫描器，纯 Zig、无外部依赖）
+        .zzig = .{ .path = "../zzig" },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "docs",
+    },
+}

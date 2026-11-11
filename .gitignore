@@ -12,6 +12,11 @@ zig-out/
 # ---- 运行产物 / 回归报告 ----
 *.log
 artifacts/
+# 测试用的临时 SQLite 库（失败/崩溃时会残留在仓库根目录）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # ---- 发版产物 ----
 dist/

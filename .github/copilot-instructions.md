@@ -12,13 +12,18 @@
 
 ## 项目现状（2026-11-11）
 
-- 仓库为**新建空仓库**：无提交历史、无远端、无源码（无 `build.zig` / `src/`）。
-- 本轮只落地接续基建；**项目定位与目标形态待用户口径确认后补进 `docs/项目接续指南.md` 第 1 节**。
+- 定位：**DH.NCode / Pek.RCode 的 Zig 实现**（共用 `Model.xml` 与数据库），逐项对照见 `docs/移植对照-NCode.md`。
+- 已实现（第一轮）：`model` / `types` / `value` / `decimal` / `datetime` / `dialect`（SQLite、MySQL、SQL Server、
+  PostgreSQL 系、Oracle）/ `query` / `sqlbuild` / `session` / `sqlite`（动态加载 DLL）/ `dbtable` / `dal`（增量建表）。
+- 未实现：对象实体与脏更新、缓存、批量写、分表、其它数据库驱动、反向工程、代码生成、备份、读写分离。
+- 测试：`zig build test`（单元 60 + 集成 2，**62 项全通过**）；`tools/regression.ps1` 已接入构建与测试。
 
 ## 工具链口径（本机实测）
 
 - `zig 0.17.0`（WinGet 安装，`zig.exe` 已在 PATH）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
-- **验证一律走分档**：`zig build` 只做编译验证并按需起本地实例；`dist/` 打包只在用户明确说「打包 / 出包 / 部署」时才做。
+- **验证一律走分档**：`zig build` / `zig build test` 只做编译与测试验证；`dist/` 打包只在用户明确说「打包 / 出包 / 部署」时才做。
+- **Zig 0.17 与旧版差异已踩过**（`std.DynLib` 不支持 Windows、`time.timestamp`/`crypto.random`/`fs.cwd`/`dupeZ` 移除等），
+  详见 `docs/移植对照-NCode.md` 第 4 节——写新代码前先看，别按 0.15/0.16 的记忆写。
 
 ## 仓库约定（沿用已装备的 Zig 仓库）
 
