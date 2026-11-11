@@ -286,6 +286,22 @@ pub const Session = struct {
         };
     }
 
+    /// `LOAD DATA LOCAL INFILE` 批量装载：**只有 MySQL 支持**，其它方言返回 `error.Unsupported`。
+    /// `data` 是已按 SQL 里 `FIELDS/LINES` 规则格式化好的全部文本（由 `dbtable.loadDataBatch` 生成）。
+    pub fn loadDataLocal(self: *Session, sql: []const u8, data: []const u8) !u64 {
+        if (self.read_only) return error.ReadOnly;
+        return switch (self.driver) {
+            .mysql => |*conn| conn.loadDataLocal(sql, data) catch |e| {
+                std.debug.print(
+                    "[zcode] LOAD DATA LOCAL 失败：{s}\n  SQL: {s}\n  数据: {d} 字节\n  原因: {s}\n  （MySQL 8 需服务端 SET GLOBAL local_infile=1）\n",
+                    .{ @errorName(e), sql, data.len, conn.lastError() },
+                );
+                return e;
+            },
+            .sqlite, .postgres => error.Unsupported,
+        };
+    }
+
     // ── 事务（对应 C# `DbSession.BeginTransaction/Commit/Rollback`）──────────
 
     pub fn inTransaction(self: *const Session) bool {

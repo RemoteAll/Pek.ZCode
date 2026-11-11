@@ -23,7 +23,7 @@
 | `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
 | `zzig.mysql` | `MySql.cs` / `DH.MySql` | ✅ **绿色版纯协议驱动**：握手 v10 + `mysql_native_password` / `caching_sha2`（fast auth **与完整鉴权 RSAES-PKCS1-v1_5**）、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
 | `zzig.postgres` | `PostgreSQL.cs` | ✅ **纯协议驱动（协议 3.0）**：Trust / Cleartext / **MD5** / **SCRAM-SHA-256** 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；不依赖 libpq |
-| `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
+| `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count / `insertBatch` / **`loadDataBatch`（MySQL LOCAL INFILE，实测比多行 INSERT 快 ≈4×）** |
 | `entity` | `Entity`（对象实体） | ✅ 脏字段更新（只写变化列、无变化不发 SQL）、insert/save/update/delete/find/query/count、`insert_only`/视图保护 |
 | `batch` | `EntityExtension`（批量写） | ✅ `insertBatch`（多行 VALUES，按方言参数上限分批）/ `deleteByPkBatch` / `saveBatch`（新增合并批插、已有按脏列逐条更新） |
 | `cache` | `Meta.Cache`（整表实体缓存） | ✅ TTL 过期同步重载（Blocking 一致性）、主键 O(1) 命中、**写后自动失效**、`ttl=0` 不过期；另有 `SingleCache`（单对象缓存，按主键缓存单行） |
@@ -98,6 +98,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/regression.ps1   # 一
 ```powershell
 powershell -File tools/mysql-local.ps1 -Action setup   # 一次性：建 3307 端口便携实例
 zig build integration -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
+# MySQL 批量写基准：insertBatch vs LOAD DATA LOCAL INFILE（20000 行）
+zig build bench-mysql -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
 ```
 
 PostgreSQL 同理：`zig build integration -Dpg-conn="Provider=PostgreSQL;Server=127.0.0.1;Port=5432;Database=demo;UserID=pg;Password=…"`
@@ -144,6 +146,18 @@ zig build codegen -Dmodel=Entity/Model.xml -Dout=src/entities
 > 绝对数字随机器负载浮动，**跨轮次不能相减**，只用于同机同轮对比。
 
 回归口径：基准**不进门禁**（机器抖动会误报），只作信息项；改 SQL 生成 / 缓存路径后手动跑一次对比。
+
+### MySQL 批量写（`zig build bench-mysql`）
+
+真库实测（MySQL 8.0.29 / 本机 3307，20000 行 × 5 列，两次取样）：
+
+| 方式 | 总耗时 | 每行 | 吞吐 |
+|---|---|---|---|
+| `insertBatch`（多行 INSERT） | 733~897 ms | 36.6~44.9 µs | 2.2~2.7 万行/秒 |
+| **`loadDataBatch`（LOCAL INFILE）** | **194~224 ms** | **9.7~11.2 µs** | **8.9~10.3 万行/秒** |
+
+**约 3.8~4.0 倍**：多行 INSERT 要逐行做 SQL 语法分析，LOCAL INFILE 走行式解析器。
+万行以上的日志/采集/导入优先用 `loadDataBatch`（它**不回写每行自增 ID**，需要 ID 就用 `insertBatch`/`saveBatch`）。
 
 ## 语义要点（与 C#/Rust 一致的部分，易被误判）
 

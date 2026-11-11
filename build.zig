@@ -123,4 +123,17 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "性能基准：zig build bench（默认 ReleaseFast）");
     bench_step.dependOn(&bench_run.step);
+
+    // MySQL 批量写基准：`zig build bench-mysql -Dmysql-conn="..."`（需要本机有 MySQL 实例）
+    const bench_mysql_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_mysql.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mysql_mod.addImport("zcode", zcode);
+    bench_mysql_mod.addOptions("build_options", build_options);
+    const bench_mysql_exe = b.addExecutable(.{ .name = "zcode-bench-mysql", .root_module = bench_mysql_mod });
+    const bench_mysql_run = b.addRunArtifact(bench_mysql_exe);
+    const bench_mysql_step = b.step("bench-mysql", "MySQL 批量写基准（insertBatch vs LOCAL INFILE）");
+    bench_mysql_step.dependOn(&bench_mysql_run.step);
 }

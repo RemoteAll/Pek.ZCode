@@ -195,6 +195,65 @@ pub const TableRef = struct {
         return affected;
     }
 
+    /// 通过 `LOAD DATA LOCAL INFILE` 批量装载（**MySQL 专属**；其它方言返回 `error.Unsupported`，
+    /// 调用方应回落到 `insertBatch`）。
+    ///
+    /// 为什么快：一次往返 + 服务端批量解析，没有逐行 INSERT 的语法分析与参数绑定。
+    /// 本机实测见 `docs/决策记录.md`（万行级别通常是多行 INSERT 的 3~10 倍）。
+    ///
+    /// 约定：
+    /// - `columns` 是**物理列名**，顺序与 `rows` 里每个元素的顺序一一对应；
+    /// - NULL 写成 `\N`；`\\` / `\t` / `\n` / `\r` 按 MySQL 默认转义规则转义；
+    /// - 二进制列（`Value.blob`）**不支持**文本装载，直接报 `error.Unsupported`（不静默截断）。
+    pub fn loadDataBatch(self: *const TableRef, s: *Session, columns: []const []const u8, rows: []const []const Value) !usize {
+        try self.ensureWritable();
+        if (rows.len == 0) return 0;
+        if (s.kind != .mysql) {
+            std.debug.print("[zcode] loadDataBatch 仅支持 MySQL（当前 {s}），请改用 insertBatch\n", .{@tagName(s.kind)});
+            return error.Unsupported;
+        }
+
+        const gpa = s.gpa;
+
+        // 1) 数据（TSV，MySQL 默认 FIELDS/ESCAPED/LINES 口径）
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(gpa);
+        for (rows) |row| {
+            if (row.len != columns.len) {
+                std.debug.print(
+                    "[zcode] loadDataBatch：行列数不一致（列 {d} / 值 {d}），无法装载\n",
+                    .{ columns.len, row.len },
+                );
+                return error.Model;
+            }
+            for (row, 0..) |v, i| {
+                if (i > 0) try data.append(gpa, '\t');
+                try appendLoadField(&data, gpa, v);
+            }
+            try data.append(gpa, '\n');
+        }
+
+        // 2) SQL（文件名只用于服务端日志；数据由客户端流式发送）
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(gpa);
+        try sql.appendSlice(gpa, "LOAD DATA LOCAL INFILE 'zcode_bulk.tsv' INTO TABLE ");
+        const quoted_table = try self.kind.quoteAlloc(gpa, self.table_name);
+        defer gpa.free(quoted_table);
+        try sql.appendSlice(gpa, quoted_table);
+        try sql.appendSlice(gpa, " CHARACTER SET utf8mb4 FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' (");
+        for (columns, 0..) |c, i| {
+            if (i > 0) try sql.appendSlice(gpa, ", ");
+            const q = try self.kind.quoteAlloc(gpa, c);
+            defer gpa.free(q);
+            try sql.appendSlice(gpa, q);
+        }
+        try sql.appendSlice(gpa, ")");
+
+        const n = try s.loadDataLocal(sql.items, data.items);
+        if (n > 0) self.notifyWrite();
+        return @intCast(n);
+    }
+
     /// 按主键批量删除：`WHERE pk IN (...)`，按参数上限分批（复合主键调用方自己拼 Where）。
     pub fn deleteByPkBatch(self: *const TableRef, s: *Session, pk_values: []const Value) !usize {
         try self.ensureWritable();
@@ -304,6 +363,39 @@ fn normalizeValue(arena: std.mem.Allocator, data_type: model.DataType, raw: Valu
             },
         },
     };
+}
+
+/// 把值写成 MySQL `LOAD DATA` 文本字段（`\N` 表示 NULL，其余按默认转义规则处理）。
+fn appendLoadField(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value) !void {
+    var num_buf: [64]u8 = undefined;
+    const text: []const u8 = switch (v) {
+        .null => {
+            try out.appendSlice(gpa, "\\N");
+            return;
+        },
+        .boolean => |b| if (b) "1" else "0",
+        .int => |n| try std.fmt.bufPrint(&num_buf, "{d}", .{n}),
+        .float => |f| try std.fmt.bufPrint(&num_buf, "{d}", .{f}),
+        .decimal => |d| try d.formatBuf(&num_buf),
+        .datetime => |dt| try dt.formatBuf(&num_buf),
+        .text => |t| t,
+        .blob => {
+            // 文本装载无法安全表达任意二进制（含 \0 与分隔符）
+            std.debug.print("[zcode] loadDataBatch：不支持二进制列（请改用 insertBatch）\n", .{});
+            return error.Unsupported;
+        },
+    };
+
+    for (text) |c| {
+        switch (c) {
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            0 => try out.appendSlice(gpa, "\\0"),
+            else => try out.append(gpa, c),
+        }
+    }
 }
 
 /// 构造字段列表的便捷函数（配合 `insert` / `update` 使用）。

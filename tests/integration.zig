@@ -875,3 +875,8 @@ test {
 test {
     _ = @import("integration_shard.zig");
 }
+
+// MySQL LOAD DATA LOCAL INFILE 批量装载（需 -Dmysql-conn）
+test {
+    _ = @import("integration_mysql_bulk.zig");
+}
