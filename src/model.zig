@@ -294,7 +294,7 @@ pub const EntityModel = struct {
 
     /// 从文件加载。
     pub fn load(gpa: std.mem.Allocator, path: []const u8) !EntityModel {
-        const text = try std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024 * 1024);
+        const text = try zzig.File.ReadAllAlloc(gpa, path, 64 * 1024 * 1024);
         defer gpa.free(text);
         return parse(gpa, text);
     }

@@ -22,6 +22,8 @@
 | `session` | `IDbSession` | ✅ 同步会话：execute / query / 标量 / 自增回写 |
 | `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
 | `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
+| `entity` | `Entity`（对象实体） | ✅ 脏字段更新（只写变化列、无变化不发 SQL）、insert/save/update/delete/find/query/count、`insert_only`/视图保护 |
+| `codegen` + `zcodegen` | `XCodeTool` / `rcodegen` | ✅ `Model.xml` → Zig 实体（meta/脏位图/访问器/取值与装载） |
 | `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等） |
 
 **本轮未做**（后续轮次）：对象实体与脏字段更新、整表/单对象缓存、批量写、分表、
@@ -73,6 +75,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/regression.ps1   # 一
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
 要在 Win7 上运行，把一份自带运行时的 `sqlite3.dll` 放到 exe 同目录即可（无需重新编译）。
+
+## 绿色版（便携自检）
+
+```powershell
+zig build                    # 产出 zig-out/bin/zcode-green.exe
+zig build green-test         # 直接跑自检（临时库，失败则退出码非 0）
+.\zig-out\bin\zcode-green.exe --db D:\tmp\a.db --reset
+```
+
+绿色版不安装、不配置：用内置 `examples/demo-model.xml` 建表，依次验证
+插入（自增回写）/ 按主键取 / **脏字段更新（不整行覆盖）** / 无脏列不发 SQL /
+条件分页 / 计数 / save / 删除。实体来自 `zcodegen` 生成（`examples/entities/`），
+所以它同时是生成产物的编译 + 运行校验。
+
+```powershell
+# 从生产 Model.xml 生成实体
+zig build codegen -Dmodel=Entity/Model.xml -Dout=src/entities
+```
 
 ## 语义要点（与 C#/Rust 一致的部分，易被误判）
 

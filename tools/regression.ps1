@@ -80,7 +80,36 @@ if (-not (Test-Path $buildZig)) {
     } else {
         Add-Log '[SKIP] build.zig 中没有 test 步骤（无 addTest / b.step("test")）——跳过单元测试'
     }
-}
+    # 绿色版自检（真实 SQLite，一次跑通建表/CRUD/脏字段更新）
+    if ($buildText -match 'green-test') {
+        Invoke-External 'zig build green-test（绿色版自检）' $zigCmd.Source @('build', 'green-test')
+    } else {
+        Add-Log '[SKIP] build.zig 中没有 green-test 步骤'
+    }
+
+    # 生成产物漂移：重新生成后工作区必须无差异（防止 Model.xml 改了没重新生成）
+    if ($buildText -match 'codegen' -and (Test-Path (Join-Path $root 'examples\entities'))) {
+        Invoke-External 'zig build codegen（重新生成实体）' $zigCmd.Source @(
+            'build', 'codegen', '-Dmodel=examples/demo-model.xml', '-Dout=examples/entities'
+        )
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = (& git -C $root diff --quiet -- examples/entities 2>&1 | Out-String)
+            $code = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+        if ($code -eq 0) {
+            Add-Log '[PASS] 生成产物无漂移（git diff 为空）'
+        } else {
+            if ($out.Trim().Length -gt 0) { Add-Log $out.Trim() }
+            Add-Log '[FAIL] examples/entities 与 demo-model.xml 不一致——请重新生成并提交'
+            $script:failed++
+        }
+    } else {
+        Add-Log '[SKIP] 没有 codegen 步骤或 examples\entities 目录——跳过生成漂移检查'
+    }}
 
 Add-Log ''
 if ($script:failed -eq 0) {

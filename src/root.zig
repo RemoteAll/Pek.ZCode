@@ -48,6 +48,10 @@ pub const sqlite = zzig.sqlite;
 pub const dbtable = @import("dbtable.zig");
 pub const dal = @import("dal.zig");
 pub const Dal = dal.Dal;
+/// 对象实体（脏字段更新 / insert / save / update / delete / find / query）
+pub const entity = @import("entity.zig");
+/// 代码生成：Model.xml → Zig 实体
+pub const codegen = @import("codegen.zig");
 
 pub const Error = error{
     Model,
@@ -72,4 +76,6 @@ test {
     _ = @import("session.zig");
     _ = @import("dbtable.zig");
     _ = @import("dal.zig");
+    _ = @import("entity.zig");
+    _ = @import("codegen.zig");
 }

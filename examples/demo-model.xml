@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EntityModel xmlns="https://newlifex.com/Model202509.xsd">
+  <Option>
+    <Namespace>ZCode.Demo</Namespace>
+    <ConnName>Demo</ConnName>
+  </Option>
+  <Tables>
+    <Table Name="Article" TableName="ZCode_Article" Description="绿色版演示用文章表">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Title" DataType="String" Length="100" Description="标题" />
+        <Column Name="Author" DataType="String" Length="50" Description="作者" />
+        <Column Name="Score" DataType="Int32" Description="评分" />
+        <Column Name="Ok" DataType="Boolean" Description="是否有效" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+      </Columns>
+      <Indexes>
+        <Index Columns="Title" Unique="True" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>
