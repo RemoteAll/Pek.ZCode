@@ -312,6 +312,45 @@ pub const EntityModel = struct {
         return null;
     }
 
+    /// 模型级连接名（`<Option><ConnName>`，缺省/空白返回 null）。
+    pub fn modelConn(self: *const EntityModel) ?[]const u8 {
+        const v = self.options.connName() orelse return null;
+        const t = std.mem.trim(u8, v, " \t\r\n");
+        return if (t.len == 0) null else t;
+    }
+
+    /// 某张表**实际归属**的连接名：表级 `ConnName` 优先，否则取模型级 `ConnName`。
+    ///
+    /// 这就是 C# `DH.NCode` 的「`TableItem.ConnName` 缺省用 `EntityModel.ConnName`」；
+    /// 建表/迁移与面板「表在哪个库」必须是**同一条规则**，所以只在这里实现一次。
+    /// 两级都没配时返回 null（= 由调用方自己的默认连接代管）。
+    pub fn tableConn(self: *const EntityModel, meta: *const TableMeta) ?[]const u8 {
+        if (meta.conn_name) |c| {
+            const t = std.mem.trim(u8, c, " \t\r\n");
+            if (t.len > 0) return t;
+        }
+        return self.modelConn();
+    }
+
+    /// 表是否归属指定连接（忽略大小写；两级都没配视为归属）。
+    pub fn tableBelongsToConn(self: *const EntityModel, meta: *const TableMeta, conn: []const u8) bool {
+        const target = std.mem.trim(u8, conn, " \t\r\n");
+        const own = self.tableConn(meta) orelse return true;
+        return std.ascii.eqlIgnoreCase(own, target);
+    }
+
+    /// 归属指定连接的全部表（表级 `ConnName` 优先，否则模型级；两级都没配视为归属）。
+    ///
+    /// 盘点/迁移「只处理本库的表」、面板按连接看表都用它，口径与建表一致。
+    pub fn tablesOfConn(self: *const EntityModel, gpa: std.mem.Allocator, conn: []const u8) ![]*const TableMeta {
+        var list: std.ArrayList(*const TableMeta) = .empty;
+        errdefer list.deinit(gpa);
+        for (self.tables) |*t| {
+            if (self.tableBelongsToConn(t, conn)) try list.append(gpa, t);
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
     /// 全部表的 MySQL 行大小问题（空 = 通过；视图不参与）。
     pub fn mysqlRowSizeIssues(self: *const EntityModel, gpa: std.mem.Allocator) ![][]const u8 {
         var list: std.ArrayList([]const u8) = .empty;
@@ -638,6 +677,66 @@ test "表达式索引必须显式命名" {
         \\</Table></Tables></EntityModel>
     ;
     try std.testing.expectError(error.InvalidModel, EntityModel.parse(std.testing.allocator, xml));
+}
+
+// 「表在哪个连接」只有一条规则：表级 `ConnName` 优先，否则模型级；两级都没配 = 归调用方的连接。
+//
+// 与 Rust `Pek.RCode` 的同名 API 语义逐条对齐（建表/迁移/面板必须同一口径）。
+test "表归属连接：表级优先，否则模型级" {
+    const xml =
+        \\<EntityModel>
+        \\  <Option><ConnName>Proxy</ConnName></Option>
+        \\  <Tables>
+        \\    <Table Name="Usage" TableName="DH_Usage">
+        \\      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+        \\    </Table>
+        \\    <Table Name="UserEx" TableName="DH_UserEx" ConnName="DH">
+        \\      <Columns><Column Name="Id" DataType="Int32" PrimaryKey="True" /></Columns>
+        \\    </Table>
+        \\  </Tables>
+        \\</EntityModel>
+    ;
+    var m = try EntityModel.parse(std.testing.allocator, xml);
+    defer m.deinit();
+
+    try std.testing.expectEqualStrings("Proxy", m.modelConn().?);
+
+    const usage = m.table("Usage").?;
+    const user_ex = m.table("DH_UserEx").?;
+
+    // 表级优先：UserEx 归 DH，尽管模型级是 Proxy
+    try std.testing.expectEqualStrings("DH", m.tableConn(user_ex).?);
+    try std.testing.expectEqualStrings("Proxy", m.tableConn(usage).?);
+
+    // 连接名忽略大小写
+    try std.testing.expect(m.tableBelongsToConn(usage, "proxy"));
+    try std.testing.expect(!m.tableBelongsToConn(usage, "DH"));
+    try std.testing.expect(m.tableBelongsToConn(user_ex, "dh"));
+    try std.testing.expect(!m.tableBelongsToConn(user_ex, "Proxy"));
+
+    const of_proxy = try m.tablesOfConn(std.testing.allocator, "Proxy");
+    defer std.testing.allocator.free(of_proxy);
+    try std.testing.expectEqual(@as(usize, 1), of_proxy.len);
+    try std.testing.expectEqualStrings("Usage", of_proxy[0].name);
+
+    const of_dh = try m.tablesOfConn(std.testing.allocator, "DH");
+    defer std.testing.allocator.free(of_dh);
+    try std.testing.expectEqual(@as(usize, 1), of_dh.len);
+    try std.testing.expectEqualStrings("UserEx", of_dh[0].name);
+
+    // 两级都没配：由调用方的默认连接代管（不丢表）
+    const plain =
+        \\<EntityModel><Tables><Table Name="Only">
+        \\  <Columns><Column Name="Id" DataType="Int32" /></Columns></Table></Tables></EntityModel>
+    ;
+    var p = try EntityModel.parse(std.testing.allocator, plain);
+    defer p.deinit();
+    try std.testing.expect(p.modelConn() == null);
+    try std.testing.expect(p.tableConn(&p.tables[0]) == null);
+    try std.testing.expect(p.tableBelongsToConn(&p.tables[0], "Whatever"));
+    const of_plain = try p.tablesOfConn(std.testing.allocator, "Whatever");
+    defer std.testing.allocator.free(of_plain);
+    try std.testing.expectEqual(@as(usize, 1), of_plain.len);
 }
 
 test "MaxCacheCount 缺省 1000，时序列强制 0" {
