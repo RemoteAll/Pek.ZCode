@@ -622,11 +622,11 @@ test "MySQL 真库：建表 → CRUD → 分页（需 -Dmysql-conn）" {
     var id: i32 = 0;
     {
         var e = JiLiYu{};
-        e.@"Code" = "my-1";
-        e.@"Title" = "MySQL 原始";
-        e.@"Amount" = try zcode.Decimal.parse("12.3400");
-        e.@"Ok" = true;
-        e.@"CreateTime" = zcode.DateTime.nowLocal();
+        e.Code = "my-1";
+        e.Title = "MySQL 原始";
+        e.Amount = try zcode.Decimal.parse("12.3400");
+        e.Ok = true;
+        e.CreateTime = zcode.DateTime.nowLocal();
         id = @intCast(try zcode.entity.insert(&dal, &e, &s));
         try std.testing.expect(id > 0);
     }

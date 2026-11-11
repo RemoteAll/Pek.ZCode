@@ -85,7 +85,8 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
         } else if (std.ascii.eqlIgnoreCase(key, "Port")) {
             opts.port = std.fmt.parseInt(u16, value, 10) catch 3306;
         } else if (std.ascii.eqlIgnoreCase(key, "Uid") or std.ascii.eqlIgnoreCase(key, "User") or
-            std.ascii.eqlIgnoreCase(key, "User Id") or std.ascii.eqlIgnoreCase(key, "Username"))
+            std.ascii.eqlIgnoreCase(key, "User Id") or std.ascii.eqlIgnoreCase(key, "UserId") or
+            std.ascii.eqlIgnoreCase(key, "UserID") or std.ascii.eqlIgnoreCase(key, "Username"))
         {
             opts.user = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Pwd") or std.ascii.eqlIgnoreCase(key, "Password")) {

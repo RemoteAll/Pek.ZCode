@@ -21,7 +21,7 @@
 | `sqlbuild` | `InsertBuilder` / `SelectBuilder` | ✅ INSERT / UPDATE / DELETE / SELECT / COUNT |
 | `session` | `IDbSession` | ✅ 同步会话：execute / query / 标量 / 自增回写 |
 | `zzig.sqlite` | `SQLite.cs` | ✅ **动态加载** `sqlite3.dll` / `winsqlite3.dll`，不链 libc |
-| `zzig.mysql` | `MySql.cs` | ✅ **绿色版纯协议驱动**：手握手 v10 + `mysql_native_password` / `caching_sha2` fast auth、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
+| `zzig.mysql` | `MySql.cs` / `DH.MySql` | ✅ **绿色版纯协议驱动**：握手 v10 + `mysql_native_password` / `caching_sha2`（fast auth **与完整鉴权 RSA-OAEP**）、`COM_QUERY`、预处理二进制协议（参数绑定）、结果集解码；不加载 libmysqlclient |
 | `dbtable` | `EntitySession` / `TableRef` | ✅ insert / update / delete / find_by_pk / query / count |
 | `entity` | `Entity`（对象实体） | ✅ 脏字段更新（只写变化列、无变化不发 SQL）、insert/save/update/delete/find/query/count、`insert_only`/视图保护 |
 | `batch` | `EntityExtension`（批量写） | ✅ `insertBatch`（多行 VALUES，按方言参数上限分批）/ `deleteByPkBatch` / `saveBatch`（新增合并批插、已有按脏列逐条更新） |
@@ -31,8 +31,9 @@
 
 **本轮未做**（后续轮次）：分表、反向工程、备份、读写分离、SQL Server / PostgreSQL / Oracle 驱动。
 
-MySQL 驱动的能力边界（均**显式报错**、不静默降级）：不支持 TLS、不支持 `caching_sha2_password` 的
-完整鉴权（明文连接需 RSA 公钥交换）、不开启 `CLIENT_MULTI_STATEMENTS` / `CLIENT_FOUND_ROWS`。
+MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH.MySql`** 为准 ——
+开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
+`caching_sha2` 完整鉴权（RSA-OAEP）；BIT 按小端还原。**不支持**：TLS（`CLIENT_SSL` 不发）、压缩协议、LOCAL INFILE。
 真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
