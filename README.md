@@ -46,7 +46,7 @@ MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH
 开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
 `caching_sha2` 完整鉴权（**RSAES-PKCS1-v1_5**，真库实测：OAEP 服务端回 1045）；BIT 按**大端**还原（真库实测）。
 **TLS 已支持**（`SslMode=Disabled|Preferred|Required|VerifyCA|VerifyFull`，缺省 `Preferred`，与 MySqlConnector 同口径）；
-**不支持**：压缩协议。
+**压缩协议已支持**（`Compression=True`，缺省关，认证完成后套 zlib 压缩帧，与 TLS 可叠加）。
 真库验证：`zig build integration -Dmysql-conn="Server=...;Port=3306;Database=...;Uid=...;Pwd=..."`。
 
 ## 快速开始
@@ -121,6 +121,17 @@ PostgreSQL 同理：`zig build integration -Dpg-conn="Provider=PostgreSQL;Server
 `SslMode=VerifyCA;SslCa=D:\certs\ca.pem` 直接写在连接串里；认不出的取值会在解析期报 `error.InvalidSslMode`（**不会静默按缺省走**）。
 TLS 实现复用 Zig std 的客户端，但**多处理了一条 `CertificateRequest`**（MySQL 8 只要配了 `ssl_ca`——自动生成证书的默认形态——握手必发该消息，std 不处理会直接连不上），
 差异只在这一处，见 `zzig/src/db/tls_client.zig` 头部。
+
+### MySQL 压缩协议（`Compression`）
+
+```text
+Provider=MySQL;Server=…;Compression=True
+```
+
+认证 OK 之后所有包外面再套一层 zlib 压缩帧（`{3 字节压缩长度, 1 字节序号, 3 字节解压后长度}` + 数据），
+**与 TLS 可叠加**（压缩在 TLS 内层）。小于 50 字节的帧按协议直接发未压缩形态；压完反而更大时也发未压缩。
+缺省关闭（与 MySqlConnector 的 `UseCompression` 缺省一致）；服务端没声明 `CLIENT_COMPRESS` 时**明确打印**而不是静默当成功。
+真库断言口径：`SHOW STATUS LIKE 'Compression'` 必须是 `ON`（不是「以为压了」）。
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
 要在 Win7 上运行，把一份自带运行时的 `sqlite3.dll` 放到 exe 同目录即可（无需重新编译）。

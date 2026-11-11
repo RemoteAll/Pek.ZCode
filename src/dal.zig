@@ -40,6 +40,8 @@ pub const ConnectionOptions = struct {
     ssl_mode: mysql.SslMode = .preferred,
     /// 根证书文件（`SslCa`/`CertificateFile`），`verify_ca`/`verify_full` 用；空 = 系统根证书
     ssl_ca: []const u8 = "",
+    /// 压缩协议（`Compression=True`）：缺省关闭（与 MySqlConnector 的 `UseCompression` 缺省一致）
+    compress: bool = false,
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
     extra: []model.KeyValue = &.{},
 
@@ -117,6 +119,10 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
             std.ascii.eqlIgnoreCase(key, "CertificateFile") or std.ascii.eqlIgnoreCase(key, "SslCert"))
         {
             opts.ssl_ca = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Compression") or std.ascii.eqlIgnoreCase(key, "Compress") or
+            std.ascii.eqlIgnoreCase(key, "UseCompression"))
+        {
+            opts.compress = parseBool(value);
         } else if (std.ascii.eqlIgnoreCase(key, "Migration")) {
             opts.migration = Migration.parse(value);
         } else if (std.ascii.eqlIgnoreCase(key, "ShowSql")) {
@@ -407,6 +413,7 @@ pub const Dal = struct {
                     .database = opts.database,
                     .ssl_mode = opts.ssl_mode,
                     .ssl_ca = opts.ssl_ca,
+                    .compress = opts.compress,
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
                 s.read_only = opts.read_only;
@@ -644,6 +651,7 @@ pub const Dal = struct {
                     .database = self.opts.database,
                     .ssl_mode = self.opts.ssl_mode,
                     .ssl_ca = self.opts.ssl_ca,
+                    .compress = self.opts.compress,
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
                 s.read_only = self.opts.read_only;

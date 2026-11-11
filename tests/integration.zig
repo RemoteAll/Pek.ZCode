@@ -885,3 +885,8 @@ test {
 test {
     _ = @import("integration_mysql_tls.zig");
 }
+
+// MySQL 压缩协议（Compression=True，需 -Dmysql-conn）
+test {
+    _ = @import("integration_mysql_compress.zig");
+}
