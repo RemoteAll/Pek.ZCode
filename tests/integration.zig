@@ -890,3 +890,8 @@ test {
 test {
     _ = @import("integration_mysql_compress.zig");
 }
+
+// 数据库远程服务（真 socket + 真 SQLite，无需外部实例）
+test {
+    _ = @import("integration_dbservice.zig");
+}

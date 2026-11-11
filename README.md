@@ -39,8 +39,9 @@
 | `tree` | `Tree/EntityTree` | ✅ 子节点 / 后代（BFS，一层一次 `IN`）/ 向上路径 / 根节点；深度与节点数护栏（成环明确报错） |
 | `backup` | `DAL_Backup` | ✅ SQLite 原生快照（`VACUUM INTO`，校验非 0 字节）+ SQL 脚本（结构同源 DDL + 字面量安全，SQLite/MySQL） |
 
-**本轮未做**（已写进 `docs/移植对照-NCode.md`，不是遗忘）：远程服务（`DbServer`/`DbService`）、
-SQL Server（TDS）与 Oracle（OCI/TNS）**执行驱动**、MySQL TLS / 压缩 / LOCAL INFILE。
+**尚未做**（已写进 `docs/移植对照-NCode.md`，不是遗忘）：SQL Server（TDS）与 Oracle（OCI/TNS）**执行驱动**、
+C# `DbTable` v3 二进制互通（`Db/Query` 目前是 JSON 行列）。
+远程服务（`DbService`/`DbClient`）已实现，见下文「数据库远程服务」。
 
 MySQL 驱动的能力边界：口径以 **C# 绿色版 `G:\Code\Pek.FrameWork\DH.MySql`** 为准 ——
 开启 `CLIENT_FOUND_ROWS`（`affected_rows` = **匹配行数**，XCode 语义）、`MULTI_STATEMENTS`/`MULTI_RESULTS`、
@@ -137,6 +138,45 @@ Provider=MySQL;Server=…;Compression=True
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
 要在 Win7 上运行，把一份自带运行时的 `sqlite3.dll` 放到 exe 同目录即可（无需重新编译）。
+
+## 数据库远程服务（`DbService` / `DbClient`）
+
+对应 DH.NCode 的 `DbServer` / `DbService`：把本进程的 `Dal` 暴露成 **HTTP/1.1 + JSON** 接口，
+让没有数据库直连条件的进程（前后端分离、跨网段、跨语言）通过 `DbClient` 访问。
+
+```zig
+const service = zcode.dbservice.Service.init(gpa, &dal, .{
+    .token = "访问令牌",           // 空 = 不校验（只允许绑回环时这么用）
+    .databases = &.{"DH"},         // 库名白名单；空 = 不限制
+    .tx_timeout_secs = 60,         // 空闲事务自动回滚
+});
+var server = zzig.http_server.Server.init(gpa, io, &service, zcode.dbservice.Service.handle, .{ .max_body = 1 << 20 });
+try server.run("127.0.0.1", 8080); // 阻塞；stop() 后先自连接唤醒 accept 再 deinit
+
+var client = zcode.dbclient.Client.init(gpa, io, "http://127.0.0.1:8080", "DH", "访问令牌");
+const info = try client.login(arena);                       // {dbType, version}
+const rows = try client.query(arena, "SELECT …WHERE Code = @p0", &.{ .{ .name = "p0", .value = .{ .text = "x" } } });
+const tx = try client.beginTx(arena);
+_ = try client.executeTx(arena, tx, "INSERT …", &.{});       // 带 tx 的语句落回事务会话
+try client.commitTx(arena, tx);
+```
+
+| 路由 | 作用 | 响应 `data` |
+|---|---|---|
+| `POST Db/Login` | 登录 | `{dbType, version}` |
+| `POST Db/Query` | 查询 | `{columns:[…], rows:[[…]]}` |
+| `POST Db/Execute` | 增删改 | 影响行数 |
+| `POST Db/InsertAndGetIdentity` | 插入取自增 | 自增 id |
+| `POST Db/QueryCount` | 计数 | 行数 |
+| `POST Db/GetTables` | 表结构 | `[{name, tableName, columns:[…]}]` |
+| `POST Db/Begin` / `Db/Commit` / `Db/Rollback` | 事务（C# 无此三路由） | 事务令牌 |
+
+统一信封 `{code, data, msg}`（`code=0` 成功）；`code=401` → `error.Unauthorized`，404 → `error.Unsupported`（客户端据此降级），
+其余非 0 → `error.Server`（服务端 `msg` 在 `lastError()`）。
+
+- **已知差异**：C# `DbController.Query` 的应答是 `DbTable` v3 二进制，本实现返回 JSON 行列 → **`Db/Query` 不跨语言互通**，其余路由是 JSON 信封可互通。
+- **事务**：HTTP 无状态，`Db/Begin` 取一条独立会话并 `BEGIN`，之后凭令牌把语句路由回该会话；空闲超时（默认 60 s）自动回滚回收。
+- **参数**：请求体 `parameters` 是**键值字典**，服务端按**键名字母序**绑定（与 Rust 版口径一致），不依赖调用方顺序。
 
 ## 绿色版（便携自检）
 

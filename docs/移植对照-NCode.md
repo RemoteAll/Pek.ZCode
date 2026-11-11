@@ -30,7 +30,7 @@
 | 反向工程 | `DbMetaData.GetSchema` + XCodeTool | `reverse.rs` | `src/reverse.zig`（`zcodegen --reverse`） | ✅ SQLite/MySQL：表/列/主键/自增/索引/注释 → `Model.xml` |
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
-| 远程服务 | `DbServer` / `DbService` | `db_service.rs` | — | ⛔ 未做（需要协议栈与服务端形态，单独一轮） |
+| 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**差异**：`Db/Query` 返回 JSON 行列，C# 的 `DbTable` v3 二进制未实现（跨语言调 Query 不互通，其余路由互通） |
 | 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；SQL Server（TDS）与 Oracle（OCI/TNS）**未做** |
 
 ## 2. 逐项语义对齐（已实现部分）

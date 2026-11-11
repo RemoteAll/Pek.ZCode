@@ -36,6 +36,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     itest_mod.addImport("zcode", zcode);
+    // 集成用例要能直接用底层库（如 http_server / compat / File）
+    itest_mod.addImport("zzig", zzig_mod);
 
     // MySQL 真库集成用例：只有传了 `-Dmysql-conn="Server=...;Database=...;Uid=...;Pwd=..."`
     // 才会真正连库；未传时用例显式打印 SKIP 原因（不静默通过）。

@@ -88,6 +88,10 @@ pub const backup = @import("backup.zig");
 pub const navigation = @import("navigation.zig");
 /// 树形实体（子节点 / 后代 / 向上路径 / 根节点）
 pub const tree = @import("tree.zig");
+/// 数据库远程服务（把 Dal 暴露成 `Db/*` HTTP 接口，含事务令牌）
+pub const dbservice = @import("dbservice.zig");
+/// 数据库远程服务的客户端
+pub const dbclient = @import("dbclient.zig");
 
 pub const Error = error{
     Model,
@@ -125,4 +129,6 @@ test {
     _ = @import("backup.zig");
     _ = @import("navigation.zig");
     _ = @import("tree.zig");
+    _ = @import("dbservice.zig");
+    _ = @import("dbclient.zig");
 }
