@@ -97,6 +97,57 @@ pub fn insert(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
+/// 组装多行 INSERT：`INSERT INTO "T" ("a","b") VALUES (?,?),(?,?)`。
+///
+/// 约束（与 XCode 批量写一致）：所有行列集合必须**完全一致**（含顺序），否则报 `error.Model`。
+/// 参数上限由调用方按 `DatabaseKind.maxStatementParams()` 分批。
+pub fn insertMulti(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    rows: []const []const Field,
+) !Sql {
+    if (rows.len == 0) return error.Model;
+    const cols = rows[0].len;
+    if (cols == 0) return error.Model;
+    for (rows[1..]) |row| {
+        if (row.len != cols) return error.Model;
+        for (row, 0..) |field, i| {
+            if (!std.ascii.eqlIgnoreCase(field.name, rows[0][i].name)) return error.Model;
+        }
+    }
+
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+
+    try b.add("INSERT INTO ");
+    try kind.pushQuoted(&b, table_name);
+    try b.add(" (");
+    for (rows[0], 0..) |field, index| {
+        if (index > 0) try b.add(", ");
+        try kind.pushQuoted(&b, try columnName(table, field.name));
+    }
+    try b.add(") VALUES ");
+
+    for (rows, 0..) |row, row_index| {
+        if (row_index > 0) try b.add(", ");
+        try b.add("(");
+        for (row, 0..) |field, col_index| {
+            if (col_index > 0) try b.add(", ");
+            try kind.pushPlaceholder(&b, params.items.len);
+            try params.append(gpa, field.value);
+        }
+        try b.add(")");
+    }
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
 /// 组装 UPDATE（`sets` 为空报错；`filter` 为空即全表，调用方自行保证带上主键条件）。
 pub fn update(
     gpa: std.mem.Allocator,
@@ -398,6 +449,31 @@ test "SELECT 表达式列原样输出" {
     const sql = try select(a, .sqlite, &t, "DH_Order", &q);
     defer sql.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, sql.text, "SELECT COUNT(*) FROM") != null);
+}
+
+test "多行 INSERT：占位符与参数按行展开" {
+    const a = std.testing.allocator;
+    const t = testTable();
+
+    const rows = [_][]const Field{
+        &.{ .{ .name = "Code", .value = .{ .text = "k1" } }, .{ .name = "Status", .value = .{ .int = 1 } } },
+        &.{ .{ .name = "Code", .value = .{ .text = "k2" } }, .{ .name = "Status", .value = .{ .int = 2 } } },
+    };
+    const sql = try insertMulti(a, .sqlite, &t, "DH_Order", &rows);
+    defer sql.deinit(a);
+
+    try std.testing.expectEqualStrings(
+        "INSERT INTO \"DH_Order\" (\"Code\", \"Status\") VALUES (?, ?), (?, ?)",
+        sql.text,
+    );
+    try std.testing.expectEqual(@as(usize, 4), sql.params.len);
+
+    // 列集合不一致必须报错
+    const bad = [_][]const Field{
+        &.{.{ .name = "Code", .value = .{ .text = "k1" } }},
+        &.{.{ .name = "Status", .value = .{ .int = 2 } }},
+    };
+    try std.testing.expectError(error.Model, insertMulti(a, .sqlite, &t, "DH_Order", &bad));
 }
 
 test "SELECT WHERE + 排序（无分页）" {

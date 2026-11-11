@@ -173,12 +173,12 @@ test "二次 sync_schema 幂等，且新增列自动补齐" {
 /// 与 `zcodegen` 生成结构同构的实体（集成测试专用）。
 const JiLiYu = struct {
     dirty: zcode.entity.DirtyBits = 0,
-    @"Id": i32 = 0,
-    @"Code": []const u8 = "",
-    @"Title": []const u8 = "",
-    @"Amount": zcode.Decimal = .{ .mantissa = 0, .scale = 0 },
-    @"Ok": bool = false,
-    @"CreateTime": zcode.DateTime = .{},
+    Id: i32 = 0,
+    Code: []const u8 = "",
+    Title: []const u8 = "",
+    Amount: zcode.Decimal = .{ .mantissa = 0, .scale = 0 },
+    Ok: bool = false,
+    CreateTime: zcode.DateTime = .{},
 
     pub const meta = zcode.entity.EntityMeta{
         .name = "JiLiYu",
@@ -194,26 +194,26 @@ const JiLiYu = struct {
     };
 
     pub fn getTitle(self: @This()) []const u8 {
-        return self.@"Title";
+        return self.Title;
     }
 
     pub fn setTitle(self: *@This(), v: []const u8) void {
-        self.@"Title" = v;
+        self.Title = v;
         zcode.entity.markDirty(&self.dirty, 2);
     }
 
     pub fn getAmount(self: @This()) zcode.Decimal {
-        return self.@"Amount";
+        return self.Amount;
     }
 
     pub fn columnValue(self: @This(), i: usize) zcode.Value {
         return switch (i) {
-            0 => .{ .int = self.@"Id" },
-            1 => .{ .text = self.@"Code" },
-            2 => .{ .text = self.@"Title" },
-            3 => .{ .decimal = self.@"Amount" },
-            4 => .{ .boolean = self.@"Ok" },
-            5 => .{ .datetime = self.@"CreateTime" },
+            0 => .{ .int = self.Id },
+            1 => .{ .text = self.Code },
+            2 => .{ .text = self.Title },
+            3 => .{ .decimal = self.Amount },
+            4 => .{ .boolean = self.Ok },
+            5 => .{ .datetime = self.CreateTime },
             else => .{ .null = {} },
         };
     }
@@ -221,30 +221,30 @@ const JiLiYu = struct {
     pub fn setColumnValue(self: *@This(), i: usize, v: zcode.Value) !void {
         switch (i) {
             0 => {
-                self.@"Id" = v.asI32() orelse 0;
+                self.Id = v.asI32() orelse 0;
             },
             1 => {
                 switch (v) {
-                    .text => |t| self.@"Code" = t,
-                    .null => self.@"Code" = "",
+                    .text => |t| self.Code = t,
+                    .null => self.Code = "",
                     else => {},
                 }
             },
             2 => {
                 switch (v) {
-                    .text => |t| self.@"Title" = t,
-                    .null => self.@"Title" = "",
+                    .text => |t| self.Title = t,
+                    .null => self.Title = "",
                     else => {},
                 }
             },
             3 => {
-                self.@"Amount" = v.asDecimal() orelse .{ .mantissa = 0, .scale = 0 };
+                self.Amount = v.asDecimal() orelse .{ .mantissa = 0, .scale = 0 };
             },
             4 => {
-                self.@"Ok" = v.asBool() orelse false;
+                self.Ok = v.asBool() orelse false;
             },
             5 => {
-                self.@"CreateTime" = v.asDatetime() orelse .{};
+                self.CreateTime = v.asDatetime() orelse .{};
             },
             else => {},
         }
@@ -266,14 +266,14 @@ test "对象实体：脏字段更新只写变化列，无变化不发 SQL" {
 
     // 插入（自增回写）
     var e = JiLiYu{};
-    e.@"Code" = "e-1";
-    e.@"Title" = "原始标题";
-    e.@"Amount" = try zcode.Decimal.parse("1.5");
-    e.@"Ok" = true;
-    e.@"CreateTime" = zcode.DateTime.nowLocal();
+    e.Code = "e-1";
+    e.Title = "原始标题";
+    e.Amount = try zcode.Decimal.parse("1.5");
+    e.Ok = true;
+    e.CreateTime = zcode.DateTime.nowLocal();
     const id = try zcode.entity.insert(&dal, &e, &s);
     try std.testing.expect(id > 0);
-    try std.testing.expectEqual(@as(i32, @intCast(id)), e.@"Id");
+    try std.testing.expectEqual(@as(i32, @intCast(id)), e.Id);
 
     // 按主键取
     var loaded = (try zcode.entity.findByPk(&dal, JiLiYu, &s, &.{.{ .int = id }})).?;
@@ -301,4 +301,78 @@ test "对象实体：脏字段更新只写变化列，无变化不发 SQL" {
     if (try zcode.entity.count(&dal, JiLiYu, &s, null) != 1) return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), try zcode.entity.delete(&dal, &again, &s));
     try std.testing.expectEqual(@as(i64, 0), try zcode.entity.count(&dal, JiLiYu, &s, null));
+}
+
+test "批量写：多行插入 / 主键批量删除 / 实体批量保存" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "batch");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = try openDal(a, db_path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const table = try dal.table("JiLiYu");
+
+    // 1) 多行 INSERT：3 行一次写入
+    var rows: std.ArrayList([]const zcode.sqlbuild.Field) = .empty;
+    defer rows.deinit(a);
+    for (0..3) |k| {
+        const f = try ar.alloc(zcode.sqlbuild.Field, 5);
+        f[0] = .{ .name = "Code", .value = .{ .text = try std.fmt.allocPrint(ar, "b-{d}", .{k}) } };
+        f[1] = .{ .name = "Title", .value = .{ .text = "批量" } };
+        f[2] = .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("1") } };
+        f[3] = .{ .name = "Ok", .value = .{ .boolean = true } };
+        f[4] = .{ .name = "CreateTime", .value = .{ .datetime = zcode.DateTime.nowLocal() } };
+        try rows.append(a, f);
+    }
+    try std.testing.expectEqual(@as(usize, 3), try table.insertBatch(&s, rows.items));
+    try std.testing.expectEqual(@as(i64, 3), try table.count(&s, null));
+
+    // 2) 主键批量删除：先查出三个 ID
+    var q = zcode.Query.init(a);
+    defer q.deinit();
+    const all = try table.queryRows(&s, &q);
+    const ids = try ar.alloc(zcode.Value, all.len);
+    for (all, 0..) |row, i| ids[i] = .{ .int = row.get("Id").?.asI64().? };
+    try std.testing.expectEqual(all.len, try table.deleteByPkBatch(&s, ids));
+    try std.testing.expectEqual(@as(i64, 0), try table.count(&s, null));
+
+    // 3) 实体批量保存：2 个新增合并插入 + 1 个已有按脏列更新
+    var existing = JiLiYu{};
+    existing.@"Code" = "e-existing";
+    existing.@"Title" = "旧";
+    existing.@"Amount" = try zcode.Decimal.parse("0");
+    const existing_id = try zcode.entity.insert(&dal, &existing, &s);
+
+    var e1 = JiLiYu{};
+    e1.@"Code" = "n-1";
+    e1.@"Title" = "新1";
+    e1.@"Amount" = try zcode.Decimal.parse("0");
+
+    var e2 = JiLiYu{};
+    e2.@"Code" = "n-2";
+    e2.@"Title" = "新2";
+    e2.@"Amount" = try zcode.Decimal.parse("0");
+
+    var e3 = (try zcode.entity.findByPk(&dal, JiLiYu, &s, &.{.{ .int = existing_id }})).?;
+    e3.setTitle("改过");
+
+    const report = try zcode.entity.saveBatch(&dal, JiLiYu, &[_]*JiLiYu{ &e1, &e2, &e3 }, &s);
+    try std.testing.expectEqual(@as(usize, 2), report.inserted);
+    try std.testing.expectEqual(@as(usize, 1), report.updated);
+    try std.testing.expectEqual(@as(i64, 3), try table.count(&s, null));
+
+    // 脏列已清：再保存一次只有「无变化」
+    const report2 = try zcode.entity.saveBatch(&dal, JiLiYu, &[_]*JiLiYu{&e3}, &s);
+    try std.testing.expectEqual(@as(usize, 1), report2.unchanged);
+    try std.testing.expectEqual(@as(usize, 0), report2.updated);
 }

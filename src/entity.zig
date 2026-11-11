@@ -158,23 +158,82 @@ pub fn save(dal: *Dal, e: anytype, s: *Session) !i64 {
     const meta = T.meta;
     const t = try tableOf(dal, meta);
 
-    if (t.insert_only) return insert(dal, e, s);
+    if (isNewEntity(meta, t, e)) return insert(dal, e, s);
 
+    _ = try update(dal, e, s);
+    return pkToI64(meta, e);
+}
+
+/// 是否“新实体”：`insert_only` 表恒为是；有自增列看它是否为 0/空；否则看主键是否为空。
+fn isNewEntity(meta: EntityMeta, t: *const TableMeta, e: anytype) bool {
+    if (t.insert_only) return true;
     if (t.identity()) |identity| {
-        const idx = fieldIndex(meta, identity.name) orelse return insert(dal, e, s);
+        const idx = fieldIndex(meta, identity.name) orelse return true;
         const v = e.columnValue(idx);
-        const is_new = switch (v) {
+        return switch (v) {
             .null => true,
             .int => |n| n == 0,
             else => false,
         };
-        if (is_new) return insert(dal, e, s);
-    } else if (countPkValues(meta, e) == 0) {
-        return insert(dal, e, s);
+    }
+    return countPkValues(meta, e) == 0;
+}
+
+pub const SaveBatchReport = struct {
+    /// 批量插入的行数（新增合并成多行 VALUES）
+    inserted: usize = 0,
+    /// 逐条更新且确有变化的实体数
+    updated: usize = 0,
+    /// 逐条更新但无脏列（未发 SQL）的实体数
+    unchanged: usize = 0,
+};
+
+/// 批量保存（对齐 C# `EntityExtension.Save(list)` / Rust `save_batch`）：
+/// 新增行合并为多行 INSERT（按方言参数上限分批），已存在行按脏列逐条更新。
+///
+/// 注意：批量插入**不回写每个实体的自增 ID**（只有最后一条可由 `lastInsertId` 得到）。
+pub fn saveBatch(dal: *Dal, comptime T: type, entities: []const *T, s: *Session) !SaveBatchReport {
+    const meta = T.meta;
+    const t = try tableOf(dal, meta);
+    try assertWritable(t);
+
+    const gpa = dal.gpa;
+    var new_rows: std.ArrayList([]const sqlbuild.Field) = .empty;
+    defer {
+        for (new_rows.items) |r| gpa.free(r);
+        new_rows.deinit(gpa);
     }
 
-    _ = try update(dal, e, s);
-    return pkToI64(meta, e);
+    var report = SaveBatchReport{};
+    for (entities) |e| {
+        if (isNewEntity(meta, t, e)) {
+            var field_count: usize = 0;
+            for (meta.fields) |f| {
+                if (!f.identity) field_count += 1;
+            }
+            const fields = try gpa.alloc(sqlbuild.Field, field_count);
+            var i: usize = 0;
+            for (meta.fields, 0..) |f, idx| {
+                if (f.identity) continue;
+                fields[i] = .{ .name = effectiveName(t, f.name), .value = e.columnValue(idx) };
+                i += 1;
+            }
+            try new_rows.append(gpa, fields);
+            e.dirty = 0;
+        } else {
+            if (try update(dal, e, s) > 0) {
+                report.updated += 1;
+            } else {
+                report.unchanged += 1;
+            }
+        }
+    }
+
+    if (new_rows.items.len > 0) {
+        const ref = try dal.table(meta.table_name);
+        report.inserted = try ref.insertBatch(s, new_rows.items);
+    }
+    return report;
 }
 
 fn countPkValues(meta: EntityMeta, e: anytype) usize {

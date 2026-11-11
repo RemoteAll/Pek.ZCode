@@ -75,6 +75,61 @@ pub const TableRef = struct {
         return self.normalizeRows(s, raw);
     }
 
+    /// 批量插入：多行 VALUES，按方言参数上限自动分批（默认最多 5000 行/批）。
+    ///
+    /// 行列集合必须一致（同 `sqlbuild.insertMulti`）；返回累计影响行数。
+    pub fn insertBatch(self: *const TableRef, s: *Session, rows: []const []const sqlbuild.Field) !usize {
+        try self.ensureWritable();
+        if (rows.len == 0) return 0;
+        const cols = rows[0].len;
+        if (cols == 0) return error.Model;
+
+        var per_batch: usize = 5000;
+        const param_limit = self.kind.maxStatementParams() / cols;
+        if (param_limit > 0 and param_limit < per_batch) per_batch = param_limit;
+        if (per_batch == 0) per_batch = 1;
+
+        var affected: usize = 0;
+        var start: usize = 0;
+        while (start < rows.len) {
+            const end = @min(start + per_batch, rows.len);
+            const sql = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, rows[start..end]);
+            defer sql.deinit(self.gpa);
+            affected += try s.execute(sql.text, sql.params);
+            start = end;
+        }
+        return affected;
+    }
+
+    /// 按主键批量删除：`WHERE pk IN (...)`，按参数上限分批（复合主键调用方自己拼 Where）。
+    pub fn deleteByPkBatch(self: *const TableRef, s: *Session, pk_values: []const Value) !usize {
+        try self.ensureWritable();
+        if (pk_values.len == 0) return 0;
+
+        const pks = try self.table.primaryKeys(self.gpa);
+        defer self.gpa.free(pks);
+        if (pks.len != 1) return error.Unsupported;
+        const pk_name = self.table.effectiveColumnName(pks[0]);
+
+        var per_batch = self.kind.maxStatementParams();
+        if (per_batch > 1000) per_batch = 1000;
+        if (per_batch == 0) per_batch = 1;
+
+        var affected: usize = 0;
+        var start: usize = 0;
+        while (start < pk_values.len) {
+            const end = @min(start + per_batch, pk_values.len);
+            var w = Where.init(self.gpa);
+            defer w.deinit();
+            _ = try w.in(pk_name, pk_values[start..end]);
+            const sql = try sqlbuild.delete(self.gpa, self.kind, self.table_name, &w);
+            defer sql.deinit(self.gpa);
+            affected += try s.execute(sql.text, sql.params);
+            start = end;
+        }
+        return affected;
+    }
+
     /// 按主键取一行。
     pub fn findByPk(self: *const TableRef, s: *Session, pk_values: []const Value) !?Row {
         var w = Where.init(self.gpa);

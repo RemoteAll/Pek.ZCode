@@ -71,11 +71,11 @@ pub fn main(init: std.process.Init) !void {
     var ids: [3]i32 = undefined;
     for (0..3) |k| {
         var a = Article{};
-        a.@"Title" = try std.fmt.allocPrint(arena, "标题-{d}", .{k});
-        a.@"Author" = "green";
-        a.@"Score" = @intCast(k * 10);
-        a.@"Ok" = true;
-        a.@"CreateTime" = now;
+        a.Title = try std.fmt.allocPrint(arena, "标题-{d}", .{k});
+        a.Author = "green";
+        a.Score = @intCast(k * 10);
+        a.Ok = true;
+        a.CreateTime = now;
         ids[k] = @intCast(try zcode.entity.insert(&dal, &a, &s));
     }
     std.debug.print("[green] 插入 3 行，自增 ID：{d}/{d}/{d}\n", .{ ids[0], ids[1], ids[2] });
