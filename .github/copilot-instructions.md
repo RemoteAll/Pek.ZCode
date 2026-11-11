@@ -13,18 +13,23 @@
 ## 项目现状（2026-11-11）
 
 - 定位：**DH.NCode / Pek.RCode 的 Zig 实现**（共用 `Model.xml` 与数据库），逐项对照见 `docs/移植对照-NCode.md`。
-- 已实现（第一轮）：`model` / `types` / `value` / `decimal` / `datetime` / `dialect`（SQLite、MySQL、SQL Server、
-  PostgreSQL 系、Oracle）/ `query` / `sqlbuild` / `session` / `sqlite`（动态加载 DLL）/ `dbtable` / `dal`（增量建表）。
-- 未实现：对象实体与脏更新、缓存、批量写、分表、其它数据库驱动、反向工程、代码生成、备份、读写分离。
-- 测试：`zig build test`（单元 60 + 集成 2，**62 项全通过**）；`tools/regression.ps1` 已接入构建与测试。
+- 已实现：`model` / `types` / `value` / `decimal` / `datetime` / `dialect`（SQLite、MySQL、SQL Server、
+  PostgreSQL 系、Oracle）/ `query` / `sqlbuild` / `session`（含事务）/ **SQLite + MySQL 执行驱动** /
+  `dbtable` / `dal`（增量建表）/ 对象实体与脏更新 / 批量写 / 整表缓存 + 单对象缓存 / **反向工程** / 代码生成。
+- 未实现：分表、读写分离、SQL Server/PostgreSQL/Oracle 执行驱动、备份、MySQL TLS/压缩/LOCAL INFILE。
+- 测试：`zig build test`（单元 48 + 集成 14，**62 项全通过**）；真库另跑
+  `zig build integration -Dmysql-conn="…"`（14/14）；zzig 侧 84 项；`tools/regression.ps1` 已接入构建与测试。
+- 性能：`zig build bench`（ReleaseFast）出数字，实测 insert 7.53 µs / 批量 2.20 µs 条 / 主键查 4.52 µs /
+  缓存命中 0.01 µs / 分页 14.96 µs。**基准不进门禁**（机器抖动会误报），改热路径后手动对比。
 
 ## 工具链口径（本机实测）
 
-- `zig 0.17.0`（WinGet 安装，`zig.exe` 已在 PATH）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
+- `zig 0.17.1`（VS Code Zig 扩展托管，`zig.exe` 已在 PATH；0.17.0 已验证同行为）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
 - **依赖公共库 `G:\Code\Zig\zzig`**（path 依赖）：`zzig.xml` + 通用件 `zzig.Decimal` / `zzig.DateTime` /
   `zzig.db.Value` / `zzig.db.sqlite` / `zzig.Buf` / `zzig.File`。**这些能力只在 zzig 改，本仓不要再复制一份**；
   改 zzig 后必须跑 `cd ..\zzig; zig build test`（并连带回归本仓）。
-- **验证一律走分档**：`zig build` / `zig build test` 只做编译与测试验证；`dist/` 打包只在用户明确说「打包 / 出包 / 部署」时才做。
+- **验证一律走分档**：`zig build` / `zig build test` 只做编译与测试验证；`zig build bench` 只出性能数字（不进门禁）；
+  `dist/` 打包只在用户明确说「打包 / 出包 / 部署」时才做。
 - **Zig 0.17 与旧版差异已踩过**（`std.DynLib` 不支持 Windows、`time.timestamp`/`crypto.random`/`fs.cwd`/`dupeZ` 移除等），
   详见 `docs/移植对照-NCode.md` 第 4 节——写新代码前先看，别按 0.15/0.16 的记忆写。
 

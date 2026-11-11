@@ -27,6 +27,7 @@
 | `batch` | `EntityExtension`（批量写） | ✅ `insertBatch`（多行 VALUES，按方言参数上限分批）/ `deleteByPkBatch` / `saveBatch`（新增合并批插、已有按脏列逐条更新） |
 | `cache` | `Meta.Cache`（整表实体缓存） | ✅ TTL 过期同步重载（Blocking 一致性）、主键 O(1) 命中、**写后自动失效**、`ttl=0` 不过期；另有 `SingleCache`（单对象缓存，按主键缓存单行） |
 | `codegen` + `zcodegen` | `XCodeTool` / `rcodegen` | ✅ `Model.xml` → Zig 实体（meta/脏位图/访问器/取值与装载） |
+| `reverse` + `zcodegen --reverse` | `DbMetaData.GetSchema` + XCodeTool 反查 | ✅ 现有库 → `Model.xml`（SQLite：`sqlite_master`+`PRAGMA`；MySQL：`information_schema`；含列型/主键/自增/索引/注释） |
 | `dal` | `DAL` | ✅ 连接串解析、模型持有、`sync_schema` 增量建表/补列/建索引（幂等） |
 
 **本轮未做**（后续轮次）：分表、反向工程、备份、读写分离、SQL Server / PostgreSQL / Oracle 驱动。
@@ -77,7 +78,15 @@ zig build            # 编译校验
 zig build test       # 单元测试 + 集成测试（需要本机有 sqlite3.dll 或 winsqlite3.dll）
 zig build unit       # 仅单元测试
 zig build integration# 仅集成测试
+zig build bench      # 性能基准（ReleaseFast，打印各组单次耗时）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/regression.ps1   # 一键回归
+```
+
+真库（MySQL）集成测试需要本机有实例，用连接串显式开启，不给则打印 `SKIP`：
+
+```powershell
+powershell -File tools/mysql-local.ps1 -Action setup   # 一次性：建 3307 端口便携实例
+zig build integration -Dmysql-conn="Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root;Password="
 ```
 
 SQLite 加载顺序：**exe 同目录 `sqlite3.dll` → 当前目录 `sqlite3.dll` → 系统 `sqlite3.dll` → `winsqlite3.dll`**。
@@ -100,6 +109,20 @@ zig build green-test         # 直接跑自检（临时库，失败则退出码�
 # 从生产 Model.xml 生成实体
 zig build codegen -Dmodel=Entity/Model.xml -Dout=src/entities
 ```
+
+## 性能基准（`zig build bench`）
+
+`tools/bench.zig`，SQLite 内存库 + `ReleaseFast` + 单事务批量提交，本机实测（Windows / zig 0.17.1）：
+
+| 用例 | 次数 | 总耗时 | 单次 |
+|---|---|---|---|
+| 实体 insert（含自增回写） | 500 | 3.77 ms | **7.53 µs** |
+| 批量 saveBatch（新增 2000 条） | 2000 | 4.40 ms | **2.20 µs/条** |
+| findByPk（直连库，命中） | 2000 | 9.04 ms | **4.52 µs** |
+| 整表缓存 get（命中） | 20000 | 0.22 ms | **0.01 µs** |
+| 条件分页查询（10 行） | 300 | 4.49 ms | **14.96 µs** |
+
+回归口径：基准**不进门禁**（机器抖动会误报），只作信息项；改 SQL 生成 / 缓存路径后手动跑一次对比。
 
 ## 语义要点（与 C#/Rust 一致的部分，易被误判）
 

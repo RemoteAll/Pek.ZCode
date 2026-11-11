@@ -1,10 +1,12 @@
-//! zcodegen：`Model.xml` → Zig 实体。
+//! zcodegen：`Model.xml` → Zig 实体（正向）；`--reverse` 则从数据库反查生成 `Model.xml`。
 //!
 //! 用法：
 //! ```powershell
 //! zig build codegen -- --model Entity\Model.xml --out src\entities
 //! zig build codegen -- --model Model.xml --out src\entities --table JiLiYu
 //! zig build codegen -- --model Model.xml --out src\entities --dry-run
+//! zig build codegen -- --reverse "Data Source=..\Data\DG.db;Provider=SQLite" --out Entity\Model.xml
+//! zig build codegen -- --reverse "Provider=MySQL;Server=127.0.0.1;Port=3307;Database=zcode_test;UserID=root" --out Entity\Model.xml
 //! ```
 
 const std = @import("std");
@@ -18,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     var model_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
     var table: ?[]const u8 = null;
+    var reverse_conn: ?[]const u8 = null;
     var dry_run = false;
 
     var i: usize = 1;
@@ -35,6 +38,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= argv.len) return usage();
             table = argv[i];
+        } else if (std.mem.eql(u8, a, "--reverse")) {
+            i += 1;
+            if (i >= argv.len) return usage();
+            reverse_conn = argv[i];
         } else if (std.mem.eql(u8, a, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -44,6 +51,28 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("未知参数：{s}\n", .{a});
             return usage();
         }
+    }
+
+    // 反向工程：连库 → 生成 Model.xml（--out 这里是**文件路径**而不是目录）
+    // 反查不需要现有模型，用一个空模型建 Dal 即可（Dal 只在 sync/table 时用到表定义）
+    if (reverse_conn) |conn| {
+        const od = out_dir orelse return usage();
+        const empty_model =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><EntityModel xmlns=\"https://newlifex.com/Model202509.xsd\"><Tables></Tables></EntityModel>";
+        var dal = try zcode.Dal.initWithModel(gpa, conn, try zcode.EntityModel.parse(gpa, empty_model));
+        defer dal.deinit();
+        var s = try dal.openSession();
+        defer s.deinit();
+
+        const xml = try zcode.reverse.modelXmlAlloc(gpa, &s, .{ .conn_name = "" });
+        defer gpa.free(xml);
+        if (dry_run) {
+            std.debug.print("{s}", .{xml});
+        } else {
+            try zcode.File.WriteAll(od, xml);
+            std.debug.print("zcodegen --reverse：已生成 {s}（{d} 字节）\n", .{ od, xml.len });
+        }
+        return;
     }
 
     const mp = model_path orelse return usage();

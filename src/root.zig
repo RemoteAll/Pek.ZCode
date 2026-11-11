@@ -68,6 +68,8 @@ pub const entity = @import("entity.zig");
 pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
 pub const codegen = @import("codegen.zig");
+/// 反向工程：现有数据库结构 → Model.xml
+pub const reverse = @import("reverse.zig");
 
 pub const Error = error{
     Model,
@@ -95,4 +97,5 @@ test {
     _ = @import("entity.zig");
     _ = @import("cache.zig");
     _ = @import("codegen.zig");
+    _ = @import("reverse.zig");
 }

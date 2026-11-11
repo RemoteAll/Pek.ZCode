@@ -108,4 +108,16 @@ pub fn build(b: *std.Build) void {
     green_run.addArgs(&.{ "--db", "zcode-green-selfcheck.db", "--reset" });
     const green_test_step = b.step("green-test", "运行绿色版自检（临时库，失败则退出码非 0）");
     green_test_step.dependOn(&green_run.step);
+
+    // 性能基准：`zig build bench`（SQLite 内存库），输出各关键路径的耗时表
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = b.option(std.builtin.OptimizeMode, "bench-optimize", "基准优化档位（默认 ReleaseFast）") orelse .ReleaseFast,
+    });
+    bench_mod.addImport("zcode", zcode);
+    const bench_exe = b.addExecutable(.{ .name = "zcode-bench", .root_module = bench_mod });
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "性能基准：zig build bench（默认 ReleaseFast）");
+    bench_step.dependOn(&bench_run.step);
 }

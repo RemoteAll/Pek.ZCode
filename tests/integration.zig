@@ -773,3 +773,90 @@ test "MySQL 真库：BIT 列字节序（需 -Dmysql-conn）" {
     // 实测结论：MySQL 线上为大端（存 0x0102 → 字节 [0x01,0x02] → 258）
     try std.testing.expectEqual(@as(i64, 258), b16);
 }
+
+// ── 反向工程（DB → Model.xml）──────────────────────────────────────────────
+
+test "反向工程：SQLite 建表 → 反查 → Model.xml 可再解析" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "reverse");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const xml = try zcode.reverse.modelXmlAlloc(a, &s, .{ .namespace = "Test.Entity", .conn_name = "DH" });
+    defer a.free(xml);
+
+    var m2 = try zcode.EntityModel.parse(a, xml);
+    defer m2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), m2.tables.len);
+    const t = &m2.tables[0];
+    try std.testing.expectEqualStrings("DH_JiLiYu", t.effectiveTableName());
+    try std.testing.expectEqual(@as(usize, 6), t.columns.len);
+
+    const id = t.column("Id").?;
+    try std.testing.expect(id.primary_key);
+    try std.testing.expect(id.identity); // INTEGER PRIMARY KEY 视为自增
+    try std.testing.expectEqual(zcode.DataType.int32, id.data_type);
+
+    try std.testing.expectEqual(zcode.DataType.string, t.column("Title").?.data_type);
+    try std.testing.expectEqual(zcode.DataType.decimal, t.column("Amount").?.data_type);
+    try std.testing.expectEqual(zcode.DataType.datetime, t.column("CreateTime").?.data_type);
+
+    // 模型里声明了 2 个索引（Code 唯一 + CreateTime）
+    try std.testing.expectEqual(@as(usize, 2), t.indexes.len);
+    var unique_count: usize = 0;
+    for (t.indexes) |idx| {
+        if (idx.unique) unique_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), unique_count);
+}
+
+test "MySQL 真库：反向工程 → Model.xml（需 -Dmysql-conn）" {
+    const conn_str = build_options.mysql_conn;
+    if (conn_str.len == 0) {
+        std.debug.print("[SKIP] 未提供 -Dmysql-conn，跳过反向工程用例\n", .{});
+        return;
+    }
+
+    const a = std.testing.allocator;
+    var dal = try zcode.Dal.initWithModel(a, conn_str, try zcode.EntityModel.parse(a, model_xml));
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{});
+    _ = try dal.syncSchema(&s);
+    defer _ = s.execute("DROP TABLE IF EXISTS `DH_JiLiYu`", &.{}) catch {};
+
+    const xml = try zcode.reverse.modelXmlAlloc(a, &s, .{ .namespace = "Test.Entity" });
+    defer a.free(xml);
+
+    var m2 = try zcode.EntityModel.parse(a, xml);
+    defer m2.deinit();
+
+    const t = m2.table("DH_JiLiYu") orelse {
+        std.debug.print("[FAIL] 反查结果里没有 DH_JiLiYu；生成内容：\n{s}\n", .{xml});
+        return error.TableNotFound;
+    };
+    try std.testing.expectEqual(@as(usize, 6), t.columns.len);
+    const id = t.column("Id").?;
+    try std.testing.expect(id.primary_key);
+    try std.testing.expect(id.identity);
+    try std.testing.expectEqual(zcode.DataType.string, t.column("Title").?.data_type);
+    try std.testing.expectEqual(zcode.DataType.decimal, t.column("Amount").?.data_type);
+    // MySQL 的 PRIMARY 索引不应作为普通索引重复输出
+    for (t.indexes) |idx| {
+        if (idx.name) |n| try std.testing.expect(!std.ascii.eqlIgnoreCase(n, "PRIMARY"));
+        if (idx.columns.len == 1) try std.testing.expect(!std.mem.eql(u8, idx.columns[0], "Id"));
+    }
+}

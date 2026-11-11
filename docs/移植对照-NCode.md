@@ -22,7 +22,8 @@
 | 整表/单对象缓存 | `Meta.Cache` | `src/cache.rs` | — | ⛔ 未做 |
 | 批量写 / 队列 | `EntityExtension` | `src/batch.rs` / `entity_queue.rs` | — | ⛔ 未做 |
 | 分表 / 分库 | `EntitySplit` / `Shards` | `src/shards.rs` | — | ⛔ 未做 |
-| 反向工程 / 代码生成 | `XCodeTool` | `reverse.rs` / `codegen.rs` | — | ⛔ 未做 |
+| 反向工程 | `DbMetaData.GetSchema` + XCodeTool | `reverse.rs` | `src/reverse.zig`（`zcodegen --reverse`） | ✅ SQLite/MySQL：表/列/主键/自增/索引/注释 → `Model.xml` |
+| 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 / 远程服务 | `DAL_Backup` / `DbServer` | `backup.rs` / `db_service.rs` | — | ⛔ 未做 |
 
 ## 2. 逐项语义对齐（已实现部分）
