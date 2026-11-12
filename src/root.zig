@@ -100,6 +100,8 @@ pub const stat = @import("stat.zig");
 pub const extract = @import("extract.zig");
 /// 窗口函数 SQL 片段（ROW_NUMBER / RANK / DENSE_RANK / 聚合窗口）
 pub const window = @import("window.zig");
+/// MS SQL Server 传统分页算法（TOP + NOT IN / 双 TOP / MaxMin / ROW_NUMBER，对应 `MSPageSplit`）
+pub const pagesplit = @import("pagesplit.zig");
 pub const Error = error{
     Model,
     Xml,
@@ -142,4 +144,5 @@ test {
     _ = @import("stat.zig");
     _ = @import("extract.zig");
     _ = @import("window.zig");
+    _ = @import("pagesplit.zig");
 }

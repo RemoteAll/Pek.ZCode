@@ -35,6 +35,7 @@
 | 统计 | `Statistics/{StatModel,StatHelper,StatField,StatLevels}` | `src/stat.rs` | `src/stat.zig` | ✅ 层级（全局/年/月/日/小时/分钟/季度，整数值与 C# 一致）与时间截断逐分支对齐；`Repository` = `find` / `getOrAdd`（没有就插，并发冲突再查）/ `accumulate`（sum·count·max·min）/ `addValues`；`avg` 明确报 `error.Unsupported`（不静默算错） |
 | 数据抽取 | `Transform/{IdExtracter,TimeExtracter,PagingExtracter,ExtractSetting}` | `src/transform.rs` | `src/extract.zig` | ✅ 三个抽取器都是「一次一批」迭代 + `total` 计数 + `done` 终止：Id 主键步进 / 时间窗切片（空窗加大步进）/ 分页兜底；`Setting` 含起止时间、偏移秒、步进、批大小 |
 | 窗口函数 | `DataAccessLayer/WindowFunction` | — | `src/window.zig` | ✅ `ROW_NUMBER` / `RANK` / `DENSE_RANK` / 聚合窗口 `FUNC(col) OVER(...)`；缺省别名与 C# 一致（`RowNum` / `Rank` / `DenseRank` / `{func}_{column}`） |
+| 传统 MsSql 分页 | `DataAccessLayer/MSPageSplit` | — | `src/pagesplit.zig` | ✅ `topNotIn` / `doubleTop` / `maxMin` / `rowNumber` 四种算法 + 与 C# 相同的选择顺序 + 首页直取 `TOP`；黄金 SQL 断言，`rowNumber` 分支在真 SQLite 上翻页验证 |
 | 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
 
 ## 2. 逐项语义对齐（已实现部分）
@@ -225,3 +226,54 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 8. **数组重复写法 `[_]u8{0} ** N` 在 0.17.1 直接报错**：`error: binary operator '*' has whitespace on one side,
    but not the other`（解析成两个 `*`）。用 `@memset(&buf, 0)` 或把初值逐个写出来（本轮 TDS 驱动与测试都踩到）。
 9. **`std.posix.getenv` 已不存在**（0.17 的 std 里没有），测试要开关就走文件级变量，别读环境变量。
+
+## 6. 覆盖台账（按 C# 源目录逐项对账）
+
+> 口径：**已迁移** = Zig 有对应实现且有测试；**等价** = 语言机制不同但能力覆盖；
+> **未做** = 还没有实现；**不适用** = 目标平台无对应机制。
+> 这张表存在的意义：让「全部迁移完了吗」可以逐行核对，而不是凭印象。
+
+| C# 目录 / 文件 | Zig 对应 | 状态 |
+|---|---|---|
+| `Attributes/`（BindColumn/BindIndex/BindTable/Map/ModelCheckMode/ModelSortMode） | `model.zig`（解析 `Model.xml` 属性）；Zig 无特性（Attribute）机制 | 等价 |
+| `Cache/EntityCache`、`CacheBase` | `cache.Cache(T)`（整表 + 写后失效 + TTL） | 已迁移 |
+| `Cache/` 的单对象缓存（`Meta.SingleCache` 语义） | `cache.SingleCache(T)` | 已迁移 |
+| `Cache/FieldCache`、`Cache/CacheInvalidator`、`Cache/DataCache`、`Cache/DbCache` | — | **未做** |
+| `Configuration/FieldExtension`、`FieldOption` | `model.ColumnMeta`（长度/精度/默认值/DataScale/Map/ShowIn 等） | 等价 |
+| `Configuration/TableItem`（反射实体→模型） | 不需要：Zig 以 `Model.xml` 为唯一源；反向由 `reverse.zig` 承担 | 不适用 |
+| `Configuration/SqlTemplate`、`ShowInOption`、`ModelSortMode` | — | **未做**（面板/工具层） |
+| `DataAccessLayer/DAL*.cs`、`IDbSession`、`DbSession` | `dal.zig`、`session.zig` | 已迁移 |
+| `DataAccessLayer/Common/ConnectionPool` | `pool.zig` | 已迁移 |
+| `DataAccessLayer/InsertBuilder`、`SelectBuilder` | `sqlbuild.zig`、`query.zig`（结构化条件）+ `pagesplit.zig` 的 `Builder` | 已迁移（SelectBuilder 只做了分页需要的子集） |
+| `DataAccessLayer/MSPageSplit` | `pagesplit.zig`（`topNotIn` / `doubleTop` / `maxMin` / `rowNumber` + 选择顺序） | 已迁移 |
+| `DataAccessLayer/WindowFunction` | `window.zig` | 已迁移 |
+| `DataAccessLayer/ReadWriteStrategy` | `readwrite.zig` | 已迁移 |
+| `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL） | 部分（PG / SQL Server 未做） |
+| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig` 5 族 + `zzig.db.{sqlite,mysql,postgres,tds}` | 部分（见 §2.2 未实现方言） |
+| `DataAccessLayer/DbPackage`（数据包导入导出） | — | **未做** |
+| `DataAccessLayer/XDbConnectionStringBuilder` | `dal.parseConnectionString` | 已迁移 |
+| `Entity/Entity*`、`EntitySession`、`IEntityPersistence` | `entity.zig`、`dbtable.zig`、`interceptor.zig` | 已迁移（按表/对象/脏更新三层） |
+| `Entity/EntityQueue`、`EntitySplit`、`EntityTransaction` | `entity_queue.zig`、`shards.zig`、`session.zig`（嵌套事务 + Scoped） | 已迁移 |
+| `Entity/EntityExtension`（71KB 扩展方法集） | 部分：`entity.zig` 的 insert/save/update/find/query。`Clone`/`CopyFrom`/`Valid`/`ToDictionary` 等**未做** | 部分 |
+| `Entity/IEntityModule`（实体模块钩子：Time/User/Trace） | `interceptor.zig`（审计列补全，等价于 ThreeModule） | 等价 |
+| `Extension/数据缓存` | `cache.zig` | 已迁移 |
+| `Linq/EntityQueryProvider`（表达式树 → SQL） | `query.zig`（结构化 `Where`，无表达式树） | 不适用（Zig 无 LINQ） |
+| `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | — | **未做**（独立子系统，~500KB C#；对应 Rust 生态的 `Pek.RPermissions`） |
+| `Model/WhereExpression`、`OrderExpression`、`FieldExpression`、`InExpression`、`LikeExpression` | `query.zig`（14 种运算符 + 排序/分页） | 已迁移 |
+| `Model/ConcatExpression`、`FormatExpression` | `sqlbuild` 的字符串拼接能力部分覆盖；函数式拼接**未做** | 部分 |
+| `Model/BatchFinder`、`BatchOption` | — | **未做** |
+| `Model/Navigation*` | `navigation.zig` | 已迁移 |
+| `Model/IPModule`、`TimeModule`、`TraceModule`、`UserModule` | `interceptor.zig` | 已迁移 |
+| `Services/DbServer`、`DbService`、`DbClient`、`DbController` | `dbservice.zig`、`dbclient.zig`（服务端在 `zzig` HTTP） | 已迁移 |
+| `Shards/*` | `shards.zig` | 已迁移 |
+| `Statistics/*` | `stat.zig` | 已迁移 |
+| `Transform/*` | `extract.zig` | 已迁移 |
+| `Tree/EntityTree` | `tree.zig` | 已迁移 |
+| `Exceptions/*` | `root.zig` 的 `Error` 错误集 + 具体错误名 | 等价 |
+| `InfluxDB/`、`TDengine/`（时序库专用协议驱动） | — | **未做** |
+| `XCodeTool/`（代码生成模板引擎） | `codegen.zig`（`Model.xml` → Zig 实体） | 部分（模板引擎未做，Zig 不需要 Razor） |
+| `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | — | **未做**（日志开关由调用方决定） |
+
+**一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取）已覆盖；
+**剩余最大块是 `Membership` 整套**，其次是 `FieldCache`/`CacheInvalidator`、`DbPackage`、`BatchFinder`、
+`EntityExtension` 的扩展方法集、PG/SQL Server 的反向工程、20+ 小众方言与两个时序库驱动。

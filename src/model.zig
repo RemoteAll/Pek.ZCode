@@ -617,11 +617,11 @@ const table_known_attrs = [_][]const u8{
 };
 
 const column_known_attrs = [_][]const u8{
-    "Name",        "ColumnName",   "DataType", "RawType",    "Length",
-    "Precision",   "Scale",        "Identity", "PrimaryKey", "Master",
-    "Nullable",    "DefaultValue", "Type",     "DataScale",  "Map",
-    "ShowIn",      "Model",        "Category", "ItemType",   "UsingCache",
-    "Additional",  "Description",
+    "Name",       "ColumnName",   "DataType", "RawType",    "Length",
+    "Precision",  "Scale",        "Identity", "PrimaryKey", "Master",
+    "Nullable",   "DefaultValue", "Type",     "DataScale",  "Map",
+    "ShowIn",     "Model",        "Category", "ItemType",   "UsingCache",
+    "Additional", "Description",
 };
 
 /// 收集未识别属性（跳过 `xmlns*` 与带前缀的属性）。

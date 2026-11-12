@@ -219,7 +219,7 @@ pub const Repository = struct {
     fn buildKeyWhere(self: Repository, model: StatModel) !Where {
         var w = Where.init(self.table.gpa);
         errdefer w.deinit();
-        _ = try w.eq(self.level_column, .{ .int = @intFromEnum(model.level) });
+        _ = try w.eq(self.level_column, .{ .int = @backingInt(model.level) });
         _ = try w.eq(self.time_column, .{ .datetime = model.time });
         return w;
     }
@@ -251,7 +251,7 @@ pub const Repository = struct {
 
         var fields: std.ArrayList(sqlbuild.Field) = .empty;
         defer fields.deinit(self.table.gpa);
-        try fields.append(self.table.gpa, .{ .name = self.level_column, .value = .{ .int = @intFromEnum(model.level) } });
+        try fields.append(self.table.gpa, .{ .name = self.level_column, .value = .{ .int = @backingInt(model.level) } });
         try fields.append(self.table.gpa, .{ .name = self.time_column, .value = .{ .datetime = model.time } });
         if (self.create_time_column) |col| {
             try fields.append(self.table.gpa, .{ .name = col, .value = .{ .datetime = DateTime.nowLocal() } });
@@ -383,9 +383,9 @@ test "层级格式化与拆分" {
 }
 
 test "层级整数映射与 C# 落库值一致" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Levels.all));
-    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(Levels.minute));
-    try std.testing.expectEqual(@as(u8, 11), @intFromEnum(Levels.quarter));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(Levels.all));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(Levels.minute));
+    try std.testing.expectEqual(@as(u8, 11), @backingInt(Levels.quarter));
     try std.testing.expectEqual(Levels.quarter, Levels.fromInt(11).?);
     try std.testing.expect(Levels.fromInt(6) == null);
 }

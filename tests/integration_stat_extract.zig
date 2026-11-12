@@ -296,3 +296,54 @@ test "抽取：时间空档不会死循环（C# 会原地打转，这里明确�
     try std.testing.expectEqual(@as(usize, 1), seen);
     try std.testing.expect(ex.done);
 }
+
+// ───────────────────────── MS 传统分页（真库验证） ─────────────────────────
+
+test "分页：MSPageSplit 的 rowNumber 算法在真库上翻页正确" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "pagesplit");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Item");
+    try seedItems(&table, &s, 10);
+
+    // 生成的 SQL 是 SQL Server 2005 口径，但 `rowNumber` 分支本身是标准窗口函数，SQLite 也能跑
+    var spec = zcode.pagesplit.Spec{
+        .table = "\"DH_Item\"",
+        .column = "\"Id\", \"Name\"",
+        .order_by = "\"Id\" Asc",
+        .key = "\"Id\"",
+        .key_is_int = true,
+    };
+
+    const page2 = try zcode.pagesplit.rowNumberAlloc(a, spec, 4, 3); // 第 5~7 行
+    defer a.free(page2);
+
+    const rows = try s.queryRows(page2, &.{});
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqual(@as(i64, 5), rows[0].get("Id").?.asI64().?);
+    try std.testing.expectEqual(@as(i64, 7), rows[2].get("Id").?.asI64().?);
+    try std.testing.expectEqualStrings("n-5", rows[0].get("Name").?.asText().?);
+
+    // 最后一页只有 1 行（10 条数据，取第 10 行）
+    const last = try zcode.pagesplit.rowNumberAlloc(a, spec, 9, 5);
+    defer a.free(last);
+    const last_rows = try s.queryRows(last, &.{});
+    try std.testing.expectEqual(@as(usize, 1), last_rows.len);
+    try std.testing.expectEqual(@as(i64, 10), last_rows[0].get("Id").?.asI64().?);
+
+    // 页大小为 0（从某行到末尾）
+    const open_end = try zcode.pagesplit.rowNumberAlloc(a, spec, 7, 0);
+    defer a.free(open_end);
+    const rest = try s.queryRows(open_end, &.{});
+    try std.testing.expectEqual(@as(usize, 3), rest.len);
+
+    _ = &spec;
+}
