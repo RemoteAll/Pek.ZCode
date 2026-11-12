@@ -134,7 +134,8 @@ pub const DatabaseKind = enum {
     /// 标识符引用。
     pub fn pushQuoted(self: DatabaseKind, b: *Buf, ident: []const u8) !void {
         const style: struct { open: u8, close: u8, escape: u8 } = switch (self) {
-            .mysql, .clickhouse, .tdengine => .{ .open = '`', .close = '`', .escape = '`' },
+            // NovaDb 虽是 `RemoteDb` 子类，但 `C# NovaDb.cs:89-91` 的 FormatName 用反引号
+            .mysql, .clickhouse, .tdengine, .nova => .{ .open = '`', .close = '`', .escape = '`' },
             .sqlserver, .access, .sqlce => .{ .open = '[', .close = ']', .escape = ']' },
             else => .{ .open = '"', .close = '"', .escape = '"' },
         };
@@ -468,6 +469,11 @@ pub const DatabaseKind = enum {
     }
 
     /// 最近一次自增 ID 的查询语句（诊断/脚本用）。
+    ///
+    /// 来源：`Access.cs:154` / `SqlCe.cs:161`（`Select @@Identity`）；`Hana.cs:238` / `IRIS.cs:288`
+    /// （`Select LAST_INSERT_ID()`）；`DB2.cs:320` / `DaMeng.cs:203`（`\.nextval` 序列 → `<SEQ>.currval`）；
+    /// `Firebird.cs:206`（`GEN_ID(SEQ` → `Select SEQ.currval`）；`DuckDB.cs:201`（`RETURNING *`）。
+    /// **无自增**的库（ClickHouse / TDengine / InfluxDB）返回空串，不编造语句。
     pub fn lastIdentitySql(self: DatabaseKind) []const u8 {
         return switch (self) {
             .sqlite => "SELECT last_insert_rowid()",
@@ -475,8 +481,24 @@ pub const DatabaseKind = enum {
             .sqlserver => "SELECT SCOPE_IDENTITY()",
             .postgresql, .kingbase, .highgo, .vastbase => "SELECT lastval()",
             .oracle => "SELECT \"SEQ_<表名>\".CURRVAL FROM DUAL",
+            .access, .sqlce => "Select @@Identity",
+            .hana, .iris => "Select LAST_INSERT_ID()",
+            .duckdb => "（插入语句末尾追加 RETURNING *）",
+            .db2, .dameng => "Select <序列名>.currval",
+            .firebird => "Select <生成器名>.currval",
+            .nova => "SELECT LAST_INSERT_ID()",
+            // 无自增语义：ClickHouse / TDengine / InfluxDB / MongoDB
             else => "",
         };
+    }
+
+    /// 是否只能靠 `TOP` 分页（没有 `OFFSET` 语义）。
+    ///
+    /// `Access.cs:102-119` 与 `SqlCe.cs:110-127` 都走 `SqlServer.PageSplitByTopNotIn`，
+    /// 所以 `applyPagingAlloc` 对它们只在 `offset == 0` 时可用；其它情况请改用
+    /// `pagesplit.pageSplitAlloc`（同一个 TOP 算法，与本方言的引号风格无关）。
+    pub fn usesTopPaging(self: DatabaseKind) bool {
+        return self == .access or self == .sqlce;
     }
 
     /// 索引名（缺省 `ix_{表}_{列1}_{列2}`）。
@@ -1310,4 +1332,74 @@ test "Provider 解析" {
     try std.testing.expectEqual(DatabaseKind.postgresql, DatabaseKind.fromProvider("PostgreSQL").?);
     try std.testing.expectEqual(DatabaseKind.sqlserver, DatabaseKind.fromProvider("MSSQL").?);
     try std.testing.expect(DatabaseKind.fromProvider("unknown-db") == null);
+}
+
+test "小语种方言：标识符引号风格（对照 C# 各驱动 FormatName）" {
+    const a = std.testing.allocator;
+
+    // NovaDb 虽是 RemoteDb 子类，FormatName 却用反引号（NovaDb.cs:89-91）
+    const nova = try DatabaseKind.nova.quoteAlloc(a, "Name");
+    defer a.free(nova);
+    try std.testing.expectEqualStrings("`Name`", nova);
+
+    const td = try DatabaseKind.tdengine.quoteAlloc(a, "Name");
+    defer a.free(td);
+    try std.testing.expectEqualStrings("`Name`", td);
+
+    // 标准 SQL 双引号 + 内部双写转义
+    const pg = try DatabaseKind.postgresql.quoteAlloc(a, "a\"b");
+    defer a.free(pg);
+    try std.testing.expectEqualStrings("\"a\"\"b\"", pg);
+
+    // Access / SqlCe 方括号
+    const acc = try DatabaseKind.access.quoteAlloc(a, "Name");
+    defer a.free(acc);
+    try std.testing.expectEqualStrings("[Name]", acc);
+}
+
+test "小语种方言：自增取值语句（对照 C# 各驱动 InsertAndGetIdentity）" {
+    // 有自增语义的库必须给语句，不能返回空串
+    const with_identity = [_]DatabaseKind{
+        .sqlite,   .mysql,     .sqlserver, .postgresql, .kingbase, .highgo,
+        .vastbase, .oracle,    .access,    .sqlce,      .hana,     .iris,
+        .duckdb,   .db2,       .dameng,    .firebird,   .nova,
+    };
+    for (with_identity) |k| {
+        if (k.lastIdentitySql().len == 0) {
+            std.debug.print("方言 {s} 缺自增取值语句\n", .{k.name()});
+            return error.MissingIdentitySql;
+        }
+    }
+    // 无自增的库返回空串（不编造）
+    try std.testing.expectEqualStrings("", DatabaseKind.clickhouse.lastIdentitySql());
+    try std.testing.expectEqualStrings("", DatabaseKind.tdengine.lastIdentitySql());
+
+    try std.testing.expectEqualStrings("Select @@Identity", DatabaseKind.access.lastIdentitySql());
+    try std.testing.expectEqualStrings("Select LAST_INSERT_ID()", DatabaseKind.hana.lastIdentitySql());
+}
+
+test "Access / SqlCe 只有 TOP 分页：首页可用、带 offset 明确报错并指路 TOP 算法" {
+    const a = std.testing.allocator;
+
+    // offset == 0 可以生成 TOP
+    const first = try DatabaseKind.access.applyPagingAlloc(a, "Select * From T", "", 0, 5);
+    defer a.free(first);
+    try std.testing.expectEqualStrings("Select Top 5 * From T", first);
+
+    // 带 offset：明确 Unsupported（不静默降级成错误 SQL）
+    try std.testing.expectError(error.Unsupported, DatabaseKind.access.applyPagingAlloc(a, "Select * From T", "", 5, 5));
+    try std.testing.expectError(error.Unsupported, DatabaseKind.sqlce.applyPagingAlloc(a, "Select * From T", "", 5, 5));
+
+    // 调用方据此选路
+    try std.testing.expect(DatabaseKind.access.usesTopPaging());
+    try std.testing.expect(DatabaseKind.sqlce.usesTopPaging());
+    try std.testing.expect(!DatabaseKind.sqlserver.usesTopPaging());
+
+    // 同一个 TOP 算法对 Access 也可用（pagesplit 是方言无关的 Select 片段器）
+    // Access/SqlCe 没有 ROW_NUMBER，所以 is_sql2005 传 false（走 maxMin / doubleTop / topNotIn）
+    const ps = @import("pagesplit.zig");
+    const spec = ps.Spec{ .table = "T", .order_by = "Id", .key = "Id", .key_is_int = true };
+    const page = try ps.pageSplitAlloc(a, spec, 5, 5, false);
+    defer a.free(page);
+    try std.testing.expect(std.mem.indexOf(u8, page, "Top") != null);
 }

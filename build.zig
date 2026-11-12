@@ -71,6 +71,22 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration", "仅运行集成测试（真实 SQLite）");
     integration_step.dependOn(&run_itests.step);
 
+    // 方言覆盖审计：把所有方言 × 各生成函数跑一遍，列缺口（不连库）
+    const audit_mod = b.createModule(.{
+        .root_source_file = b.path("tools/audit_dialects.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audit_mod.addImport("zcode", zcode);
+    audit_mod.addImport("zzig", zzig_mod);
+    const audit_exe = b.addExecutable(.{
+        .name = "audit-dialects",
+        .root_module = audit_mod,
+    });
+    const run_audit = b.addRunArtifact(audit_exe);
+    const audit_step = b.step("audit-dialects", "方言覆盖审计（列出入 SQL 生成缺口）");
+    audit_step.dependOn(&run_audit.step);
+
     // zcodegen：Model.xml → Zig 实体
     const gen_mod = b.createModule(.{
         .root_source_file = b.path("tools/zcodegen.zig"),

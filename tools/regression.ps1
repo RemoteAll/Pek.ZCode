@@ -87,6 +87,13 @@ if (-not (Test-Path $buildZig)) {
         Add-Log '[SKIP] build.zig 中没有 green-test 步骤'
     }
 
+    # 方言覆盖审计：19 个可实现方言 × 全部 SQL 生成函数（不连库，纯生成层）
+    if ($buildText -match 'audit-dialects') {
+        Invoke-External 'zig build audit-dialects（方言覆盖审计）' $zigCmd.Source @('build', 'audit-dialects')
+    } else {
+        Add-Log '[SKIP] build.zig 中没有 audit-dialects 步骤'
+    }
+
     # 生成产物漂移：重新生成后工作区必须无差异（防止 Model.xml 改了没重新生成）
     if ($buildText -match 'codegen' -and (Test-Path (Join-Path $root 'examples\entities'))) {
         Invoke-External 'zig build codegen（重新生成实体）' $zigCmd.Source @(

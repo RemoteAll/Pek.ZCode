@@ -10,7 +10,7 @@
 | `Model.xml` 解析 | `Entity/EntityBuilder` | `src/model.rs` | `src/model.zig` | ✅ 对齐（含未识别属性保留） |
 | 类型系统 | `DataType`（CLR 名） | `src/types.rs` | `src/types.zig` | ✅ 12 种类型 + 同义别名 |
 | 字段值 | `Object` + `DbType` | `src/value.rs` | `zzig`：`db/value.zig` | ✅ 子集（无 `Decimal` 运算，仅解析/格式化/比较） |
-| 方言语义 | `DH.NCode.*` 各驱动 | `src/dialect.rs` | `src/dialect.zig` | ⚠️ **5 族已实现**：SQLite / MySQL / SQL Server / PostgreSQL 系 / Oracle；其余显式 `error.Unsupported` |
+| 方言语义 | `DH.NCode.*` 各驱动 | `src/dialect.rs` | `src/dialect.zig` | ✅ **19 个可实现方言全覆盖**（`zig build audit-dialects` 19/19 无缺口）；仅 `mongodb` / `influxdb` 非 SQL 库显式 `error.Unsupported` |
 | 条件表达式 | `WhereExpression` | `src/query.rs` | `src/query.zig` | ✅ 14 种运算符 |
 | SQL 组装 | `InsertBuilder` / `SelectBuilder` | `src/sqlbuild.rs` | `src/sqlbuild.zig` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT + 多行批量 INSERT |
 | 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接 + **SQLite 预处理语句缓存** + 事务（含嵌套计数/Scoped） |
@@ -83,6 +83,21 @@ DuckDB / ClickHouse / TDengine / HANA / Firebird / DB2 / 达孟（DaMeng）/ IRI
 **仍未实现**：`mongodb`（文档库，无 SQL）与 `influxdb`（Line Protocol）—— 它们**不是 SQL 库**，`isImplemented()` 永远为 false，
 建表/分页一律 `error.Unsupported`。DuckDB / ClickHouse 在 C# 侧没有静态类型表（走驱动自带 schema），
 这里的类型名按两者**原生类型名**给出（DuckDB 兼容 PG 类型名、ClickHouse 用 `Int*/String/Decimal(p, s)`）。
+
+**覆盖审计（机器可验，2026-11-12）**：`zig build audit-dialects` —— 把 19 个可实现方言逐个跑一遍
+类型映射（12 种 `DataType`）/ 引用 / 占位符 / 分页 / 建表 / 建索引 / 改列 / 删列 / 自增语句，
+凡失败即打 `[GAP]` 并以退出码 1 结束。**当前结果：19/19 无缺口**。
+
+这轮审计顺手抓到两处「不报错但生成错」的静默问题，已修：
+
+| 问题 | 证据 | 处理 |
+|---|---|---|
+| `.nova` 标识符引号走了 `else` → 双引号 | C# `NovaDb.cs:89-91` 的 `FormatName` 用**反引号** | 归入反引号分支 |
+| `lastIdentitySql` 只覆盖 5 族，其余 12 家返回空串 | `Access.cs:154` / `SqlCe.cs:161` `Select @@Identity`；`Hana.cs:238` / `IRIS.cs:288` `Select LAST_INSERT_ID()`；`DB2.cs:320` / `DaMeng.cs:203` 序列 `.currval`；`Firebird.cs:206` `GEN_ID` → `Select SEQ.currval`；`DuckDB.cs:201` `RETURNING *` | 逐家补齐；ClickHouse / TDengine 无自增 → 空串（不编造） |
+
+**Access / SqlCe 的分页**：`applyPagingAlloc` 只在 `offset == 0` 出 `TOP`，带 offset 明确 `error.Unsupported`
+并打印指路文案；等价能力用 `pagesplit.pageSplitAlloc`（C# 同样走 `SqlServer.PageSplitByTopNotIn`，
+`Access.cs:102-119` / `SqlCe.cs:110-127`），新增 `DatabaseKind.usesTopPaging()` 供调用方选路。
 
 > 口径说明（2026-11-12）：以上方言只做了 **SQL 生成层**（类型/DDL/分页/占位符/引用）并全部有黄金断言；
 > 除 SQLite/MySQL/PostgreSQL/SQL Server 外的驱动**未接执行层**，也没有真实库可实测——
@@ -255,7 +270,7 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 | 窗口函数别名按方言引用 | C# 原样拼别名；SQLite 会把未引用别名当标识符且大小写折叠，故 Zig 侧引起来（函数名与 OVER 子句仍逐字一致） |
 | `MSPageSplit`（SQL Server 2000/2005 的 TOP + NOT IN / 双 TOP / ROW_NUMBER 分页）未移植 | 本库的 SQL Server 分页走 `OFFSET..FETCH`（SQL Server 2012+）；老版本分页属遗留算法，且需要整套 `SelectBuilder` 克隆/子查询设施，收益低于成本 |
 | `Membership`（用户/角色/部门/菜单/租户/日志/参数/地区 + DataScope）、`Linq/EntityQueryProvider`、`XCodeTool` 的模板引擎未移植 | 前者是独立子系统（对应 Rust 生态里的 `Pek.RPermissions`，本库定位是 ORM 核心）；LINQ 表达式树在 Zig 无对应语法，条件用 `Where` 结构化拼装；模板引擎由 `codegen.zig`（Model.xml → Zig 实体）承担 |
-| 20+ 种小众方言（Access/ClickHouse/TDengine/DuckDB/Hana/Firebird/DB2/达梦/IRIS/MongoDB/NovaDb…）未实现 | 枚举与连接串可识别，但类型映射/DDL 明确 `error.Unsupported`，不生成“看起来能跑”的错误 SQL |
+| 20+ 种小众方言（Access/ClickHouse/TDengine/DuckDB/Hana/Firebird/DB2/达梦/IRIS/MongoDB/NovaDb…）未实现 | ~~枚举与连接串可识别，但类型映射/DDL 明确 `error.Unsupported`~~ **已推翻（2026-11-12）**：19 家 SQL 方言全量实现并由 `zig build audit-dialects` 守住；只有 MongoDB（文档库）/ InfluxDB（Line Protocol）保持 `error.Unsupported` |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）
 
