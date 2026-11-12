@@ -913,4 +913,5 @@ test {
     _ = @import("integration_shard_batch.zig");
     _ = @import("integration_sql_log.zig");
     _ = @import("integration_membership_orm.zig");
+    _ = @import("integration_area.zig");
 }

@@ -102,6 +102,8 @@ pub const extract = @import("extract.zig");
 pub const window = @import("window.zig");
 /// MS SQL Server 传统分页算法（TOP + NOT IN / 双 TOP / MaxMin / ROW_NUMBER，对应 `MSPageSplit`）
 pub const pagesplit = @import("pagesplit.zig");
+/// 汉字拼音（`Get` / `GetFirst` / `GetAll`，对应 C# `DH.NCore/Common/PinYin.cs`）
+pub const pinyin = @import("pinyin.zig");
 /// 字段缓存（键列 → 值列整表字典，写后自动失效，对应 C# `Cache/FieldCache`）
 pub const fieldcache = @import("fieldcache.zig");
 /// XCode 全局设置（对应 C# `Setting.cs` / `XCodeSetting`）
@@ -176,6 +178,7 @@ test {
     _ = @import("extract.zig");
     _ = @import("window.zig");
     _ = @import("pagesplit.zig");
+    _ = @import("pinyin.zig");
     _ = @import("fieldcache.zig");
     _ = @import("setting.zig");
     _ = @import("sqltemplate.zig");

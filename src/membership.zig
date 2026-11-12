@@ -19,6 +19,8 @@ pub const datascope = @import("membership/datascope.zig");
 pub const log = @import("membership/log.zig");
 /// 各实体业务规则（用户/角色/菜单/租户关系/字典参数/部门的纯计算部分）。
 pub const rules = @import("membership/rules.zig");
+/// 地区（行政区划）算法：层级/简称/大区/HTML 解析/合并/CSV 导入导出
+pub const area = @import("membership/area.zig");
 /// 登录提供者（LoginCore 八步 / 注册 / 改密，数据读写由 UserStore 注入）。
 pub const provider = @import("membership/provider.zig");
 /// 九张表的实体（由 `Member.xml` 生成）。
@@ -50,6 +52,7 @@ test {
     _ = datascope;
     _ = log;
     _ = rules;
+    _ = area;
     _ = provider;
     _ = entities;
 }
