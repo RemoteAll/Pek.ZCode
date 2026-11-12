@@ -111,6 +111,40 @@ if (-not (Test-Path $buildZig)) {
         Add-Log '[SKIP] 没有 codegen 步骤或 examples\entities 目录——跳过生成漂移检查'
     }
 
+    # 生成器自检：拿 C# / Rust 的真实 Model.xml 生成实体 → 编译 → 真 SQLite 建表 + 增删改查
+    #   （这是「模型完全共用 + 有实体代码生成器」的可执行证明；三个夹具任一缺失就显式 SKIP）
+    if ((Test-Path (Join-Path $root 'tools\gencheck.zig')) -and ($buildText -match 'gen-check')) {
+        $fixtures = @(
+            @{ Name = 'C# DH.NCode 模型'; Path = 'tests/fixtures/dh-ncode-model.xml'; Out = 'zig-out/gen-check-csharp' },
+            @{ Name = 'C# 测试模型';       Path = 'tests/fixtures/dh-ncode-test-model.xml'; Out = 'zig-out/gen-check-csharp-test' },
+            @{ Name = 'Rust Pek.RCode 模型'; Path = 'tests/fixtures/wms-model-sample.xml'; Out = 'zig-out/gen-check-rust' }
+        )
+        foreach ($f in $fixtures) {
+            if (-not (Test-Path (Join-Path $root $f.Path))) {
+                Add-Log ('[SKIP] 缺少夹具 {0}——跳过 {1} 的生成器自检' -f $f.Path, $f.Name)
+                continue
+            }
+            Push-Location $root
+            try {
+                Invoke-External ("codegen：{0}" -f $f.Name) $zigCmd.Source @(
+                    'build', 'codegen', ("-Dmodel={0}" -f $f.Path), ("-Dout={0}" -f $f.Out)
+                )
+                # 生成了 mod.zig 才继续编译自检；否则说明 codegen 已失败（上面已记 FAIL）
+                if (Test-Path (Join-Path $root ("{0}/mod.zig" -f $f.Out))) {
+                    Invoke-External ("gen-check：{0}" -f $f.Name) $zigCmd.Source @(
+                        'build', 'gen-check', ("-Dgen-check={0}" -f $f.Out), ("-Dmodel={0}" -f $f.Path)
+                    )
+                } else {
+                    Add-Log ("[SKIP] {0} 未生成 mod.zig——跳过 {1} 的自检" -f $f.Out, $f.Name)
+                }
+            } finally {
+                Pop-Location
+            }
+        }
+    } else {
+        Add-Log '[SKIP] 没有 tools\gencheck.zig 或 build.zig 无 gen-check 步骤——跳过生成器自检'
+    }
+
     # 公共库 zzig（源码依赖）：改了它必须一起回归，否则本仓可能被下游改动打破而不自知
     $zzigDir = Join-Path (Split-Path $root -Parent) 'zzig'
     if (Test-Path (Join-Path $zzigDir 'build.zig')) {

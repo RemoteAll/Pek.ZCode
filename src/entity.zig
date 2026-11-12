@@ -41,11 +41,30 @@ pub const max_fields = 256;
 pub const DirtyBits = u256;
 
 pub const FieldMeta = struct {
-    /// 物理列名（与 `Model.xml` 的 `Name`/`ColumnName` 一致）
+    /// 模型里的逻辑列名（`Model.xml` 的 `Column@Name`）
     name: []const u8,
     data_type: DataType,
     primary_key: bool = false,
     identity: bool = false,
+    /// 物理列名（`Column@ColumnName`；为空表示与 `name` 相同）
+    column_name: ?[]const u8 = null,
+    /// 是否允许 NULL（`Column@Nullable`）
+    nullable: bool = false,
+    /// 累加字段（`Column@Additional`）：更新时按 `col = col + 值` 累加
+    additional: bool = false,
+    length: i32 = 0,
+    precision: i32 = 0,
+    scale: i32 = 0,
+    /// 列注释（生成代码里同时作为文档注释）
+    description: []const u8 = "",
+
+    /// 物理列名（`ColumnName` 缺省等于 `name`）。
+    pub fn effectiveName(self: FieldMeta) []const u8 {
+        if (self.column_name) |c| {
+            if (c.len > 0) return c;
+        }
+        return self.name;
+    }
 };
 
 pub const EntityMeta = struct {

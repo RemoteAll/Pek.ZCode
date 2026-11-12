@@ -53,7 +53,9 @@ pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options)
         if (opts.dry_run) {
             std.debug.print("===== {s}.zig =====\n{s}\n", .{ t.name, src });
         } else {
-            const file_name = try std.fmt.allocPrint(gpa, "{s}.zig", .{fileSafeName(t.name)});
+            const safe = try fileSafeName(gpa, t.name);
+            defer gpa.free(safe);
+            const file_name = try std.fmt.allocPrint(gpa, "{s}.zig", .{safe});
             defer gpa.free(file_name);
             const path = try std.fs.path.join(gpa, &.{ opts.out_dir, file_name });
             defer gpa.free(path);
@@ -94,6 +96,11 @@ pub fn generateTableAlloc(gpa: std.mem.Allocator, t: *const TableMeta) ![]u8 {
     try b.add("    dirty: zcode.entity.DirtyBits = 0,\n\n");
 
     for (t.columns) |*c| {
+        if (c.description.len > 0) {
+            try b.add("    /// ");
+            try addOneLine(&b, c.description);
+            try b.add("\n");
+        }
         try b.fmt("    @\"{s}\": {s}{s},\n", .{
             c.name,
             zigType(c.data_type),
@@ -111,13 +118,95 @@ pub fn generateTableAlloc(gpa: std.mem.Allocator, t: *const TableMeta) ![]u8 {
         try b.fmt("            .{{ .name = \"{s}\", .data_type = .{s}", .{ c.name, @tagName(c.data_type) });
         if (c.primary_key) try b.add(", .primary_key = true");
         if (c.identity) try b.add(", .identity = true");
+        if (c.nullable) try b.add(", .nullable = true");
+        if (c.additional) try b.add(", .additional = true");
+        if (c.length > 0) try b.fmt(", .length = {d}", .{c.length});
+        if (c.precision > 0) try b.fmt(", .precision = {d}", .{c.precision});
+        if (c.scale > 0) try b.fmt(", .scale = {d}", .{c.scale});
+        if (!std.mem.eql(u8, c.name, t.effectiveColumnName(c))) {
+            try b.fmt(", .column_name = \"{s}\"", .{t.effectiveColumnName(c)});
+        }
+        if (c.description.len > 0) {
+            try b.add(", .description = \"");
+            try addOneLine(&b, c.description);
+            try b.add("\"");
+        }
         try b.add(" },\n");
     }
     try b.add("        },\n    };\n\n");
 
+    // 主键 / 自增 / 累加字段的列下标（避免业务代码自己数下标）
+    try b.add("    /// 主键列下标（按模型声明顺序）\n");
+    try b.add("    pub const main_keys: []const usize = &.{");
+    {
+        var first = true;
+        for (t.columns, 0..) |*c, i| {
+            if (!c.primary_key) continue;
+            if (!first) try b.add(", ");
+            first = false;
+            try b.fmt("{d}", .{i});
+        }
+    }
+    try b.add("};\n");
+
+    if (t.identity() != null) {
+        for (t.columns, 0..) |*c, i| {
+            if (!c.identity) continue;
+            try b.fmt("    /// 自增列下标（{s}）\n", .{c.name});
+            try b.fmt("    pub const identity_index: usize = {d};\n", .{i});
+            break;
+        }
+    }
+    {
+        const adds = try t.additionalFields(gpa);
+        defer if (adds.len > 0) gpa.free(adds);
+        if (adds.len > 0) {
+            try b.add("    /// 累加字段列下标（更新时按 `col + 值`）\n");
+            try b.add("    pub const additional_indexes: []const usize = &.{");
+            var first = true;
+            for (adds) |a| {
+                for (t.columns, 0..) |*c, i| {
+                    if (!std.mem.eql(u8, c.name, a.name)) continue;
+                    if (!first) try b.add(", ");
+                    first = false;
+                    try b.fmt("{d}", .{i});
+                    break;
+                }
+            }
+            try b.add("};\n");
+        }
+    }
+    try b.add("\n");
+
+    // 索引元数据（与 Model.xml 同源，建表/对账都靠它）
+    if (t.indexes.len > 0) {
+        try b.add("    /// 索引（对应 `Model.xml` 的 `Index`）\n");
+        try b.add("    pub const indexes = [_]zcode.codegen.IndexInfo{\n");
+        for (t.indexes) |idx| {
+            try b.add("        .{ ");
+            if (idx.name) |n| try b.fmt(".name = \"{s}\", ", .{n});
+            try b.add(".columns = &.{");
+            for (idx.columns, 0..) |col, i| {
+                if (i > 0) try b.add(", ");
+                try b.fmt("\"{s}\"", .{col});
+            }
+            try b.fmt("}}, .unique = {s}", .{if (idx.unique) "true" else "false"});
+            if (idx.expression) |e| try b.fmt(", .expression = \"{s}\"", .{e});
+            try b.add(" },\n");
+        }
+        try b.add("    };\n\n");
+    }
+
+    // 表句柄（业务代码拿它做表级操作，不需要自己拼表名）
+    try b.add("    /// 取表句柄（表级 CRUD / 分片路由都用它）。\n");
+    try b.add("    pub fn table(dal: *zcode.Dal) !zcode.dbtable.TableRef {\n");
+    try b.fmt("        return dal.table(\"{s}\");\n", .{t.effectiveTableName()});
+    try b.add("    }\n");
+
     // 访问器
     for (t.columns, 0..) |*c, i| {
-        const suffix = accessorName(c.name);
+        const suffix = try accessorName(gpa, c.name);
+        defer gpa.free(suffix);
         try b.fmt("    pub fn get{s}(self: @This()) {s} {{ return self.@\"{s}\"; }}\n", .{ suffix, zigType(c.data_type), c.name });
         try b.fmt("    pub fn set{s}(self: *@This(), v: {s}) void {{\n", .{ suffix, zigType(c.data_type) });
         try b.fmt("        self.@\"{s}\" = v;\n", .{c.name});
@@ -157,7 +246,18 @@ pub fn moduleIndexAlloc(gpa: std.mem.Allocator, names: []const []const u8) ![]u8
     defer b.deinit();
     try b.add("//! 由 zcodegen 生成：实体索引，请勿手改。\n\n");
     for (names) |n| {
-        try b.fmt("pub const {s} = @import(\"{s}.zig\").{s};\n", .{ n, fileSafeName(n), n });
+        const safe = try fileSafeName(gpa, n);
+        defer gpa.free(safe);
+        try b.fmt("pub const {s} = @import(\"{s}.zig\").{s};\n", .{ n, safe, n });
+    }
+    if (names.len > 0) {
+        try b.add("\n/// 全部实体（用 `inline for (all) |T|` 编译期逐个处理）\n");
+        try b.add("pub const all = .{");
+        for (names, 0..) |n, i| {
+            if (i > 0) try b.add(", ");
+            try b.add(n);
+        }
+        try b.add("};\n");
     }
     return b.toOwnedSlice();
 }
@@ -218,16 +318,40 @@ fn addAssignStmt(b: *zzig.Buf, dt: DataType, name: []const u8) !void {
     }
 }
 
-/// 文件名安全化（保留 ASCII 字母数字，其余换 `_`）。
-fn fileSafeName(name: []const u8) []const u8 {
-    // 表名一般是标识符，直接返回；这里只做保守处理
-    return name;
+/// 索引元数据（生成代码里以 `indexes` 常量形式出现）。
+pub const IndexInfo = struct {
+    name: []const u8 = "",
+    columns: []const []const u8 = &.{},
+    unique: bool = false,
+    expression: ?[]const u8 = null,
+};
+
+/// 文件名安全化（保留 ASCII 字母数字与 `_`，其余换 `_`）。
+fn fileSafeName(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, name.len);
+    for (name, 0..) |c, i| {
+        out[i] = if (std.ascii.isAlphanumeric(c) or c == '_') c else '_';
+    }
+    if (out.len == 0) {
+        gpa.free(out);
+        return gpa.dupe(u8, "Entity");
+    }
+    return out;
 }
 
 /// 访问器后缀：非字母数字换 `_`，首字符是数字时补 `_`。
-fn accessorName(name: []const u8) []const u8 {
-    // 生成时缓冲区复用：借用 `name` 本身（表名/列名来自模型 arena）
-    return name;
+fn accessorName(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
+    const out = try gpa.alloc(u8, name.len + 1);
+    var n: usize = 0;
+    if (name.len > 0 and std.ascii.isDigit(name[0])) {
+        out[0] = '_';
+        n = 1;
+    }
+    for (name) |c| {
+        out[n] = if (std.ascii.isAlphanumeric(c) or c == '_') c else '_';
+        n += 1;
+    }
+    return gpa.realloc(out, n);
 }
 
 fn addOneLine(b: *zzig.Buf, text: []const u8) !void {

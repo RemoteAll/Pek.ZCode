@@ -81,7 +81,8 @@ pub fn build(b: *std.Build) void {
     const gen_run = b.addRunArtifact(gen_exe);
     // 0.17 已移除 `b.args`，改用 build option：
     //   zig build codegen -Dmodel=Entity\Model.xml -Dout=src\entities
-    if (b.option([]const u8, "model", "Model.xml 路径")) |v| {
+    const model_arg = b.option([]const u8, "model", "Model.xml 路径");
+    if (model_arg) |v| {
         gen_run.addArg("--model");
         gen_run.addArg(v);
     }
@@ -98,6 +99,39 @@ pub fn build(b: *std.Build) void {
     }
     const gen_step = b.step("codegen", "从 Model.xml 生成实体：zig build codegen -Dmodel=<xml> -Dout=<dir>");
     gen_step.dependOn(&gen_run.step);
+
+    // 生成器自检：把已生成的实体编译出来，在临时 SQLite 上真建表 + 增删改查
+    //   zig build codegen -Dmodel=<Model.xml> -Dout=zig-out\gen-csharp
+    //   zig build gen-check -Dgen-check=zig-out\gen-csharp -Dmodel=<Model.xml>
+    if (b.option([]const u8, "gen-check", "已生成实体的目录（需含 mod.zig），编译并跑一遍增删改查")) |dir| {
+        const entities_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/mod.zig", .{dir})),
+            .target = target,
+            .optimize = optimize,
+        });
+        entities_mod.addImport("zcode", zcode);
+
+        const check_mod = b.createModule(.{
+            .root_source_file = b.path("tools/gencheck.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        check_mod.addImport("zcode", zcode);
+        check_mod.addImport("entities", entities_mod);
+
+        const check_exe = b.addExecutable(.{ .name = "gencheck", .root_module = check_mod });
+        const check_run = b.addRunArtifact(check_exe);
+        // 复用上面已经声明过的 `model` 选项值（同一 build 里不能重复 declare）
+        if (model_arg) |v| {
+            check_run.addArg("--model");
+            check_run.addArg(v);
+        }
+        check_run.addArg("--db");
+        check_run.addArg(b.fmt("{s}/gencheck.db", .{dir}));
+
+        const check_step = b.step("gen-check", "生成器自检：编译生成实体并真库增删改查（需 -Dgen-check=<dir>）");
+        check_step.dependOn(&check_run.step);
+    }
 
     // 绿色版（便携 exe）：不安装、不配置，直接跑通建表与增删改查
     const green_mod = b.createModule(.{

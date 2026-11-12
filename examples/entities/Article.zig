@@ -7,26 +7,46 @@ pub const Article = struct {
     /// 脏列位图（setter 置位；`zcode.entity.update` 只写脏列）
     dirty: zcode.entity.DirtyBits = 0,
 
+    /// 编号
     @"Id": i32 = 0,
+    /// 标题
     @"Title": []const u8 = "",
+    /// 作者
     @"Author": []const u8 = "",
+    /// 评分
     @"Score": i32 = 0,
+    /// 是否有效
     @"Ok": bool = false,
+    /// 创建时间
     @"CreateTime": zcode.DateTime = .{},
 
     pub const meta = zcode.entity.EntityMeta{
         .name = "Article",
         .table_name = "ZCode_Article",
         .fields = &.{
-            .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true },
-            .{ .name = "Title", .data_type = .string },
-            .{ .name = "Author", .data_type = .string },
-            .{ .name = "Score", .data_type = .int32 },
-            .{ .name = "Ok", .data_type = .boolean },
-            .{ .name = "CreateTime", .data_type = .datetime },
+            .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
+            .{ .name = "Title", .data_type = .string, .length = 100, .description = "标题" },
+            .{ .name = "Author", .data_type = .string, .length = 50, .description = "作者" },
+            .{ .name = "Score", .data_type = .int32, .description = "评分" },
+            .{ .name = "Ok", .data_type = .boolean, .description = "是否有效" },
+            .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
         },
     };
 
+    /// 主键列下标（按模型声明顺序）
+    pub const main_keys: []const usize = &.{0};
+    /// 自增列下标（Id）
+    pub const identity_index: usize = 0;
+
+    /// 索引（对应 `Model.xml` 的 `Index`）
+    pub const indexes = [_]zcode.codegen.IndexInfo{
+        .{ .columns = &.{"Title"}, .unique = true },
+    };
+
+    /// 取表句柄（表级 CRUD / 分片路由都用它）。
+    pub fn table(dal: *zcode.Dal) !zcode.dbtable.TableRef {
+        return dal.table("ZCode_Article");
+    }
     pub fn getId(self: @This()) i32 { return self.@"Id"; }
     pub fn setId(self: *@This(), v: i32) void {
         self.@"Id" = v;

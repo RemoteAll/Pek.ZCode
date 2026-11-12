@@ -165,8 +165,41 @@
 - 三者都维护 `total`（累计行数）与 `done`（终止）；断点续跑用 `row`（Id/分页）或 `start`（时间）。
 - `TimeExtractor` 的空窗处理：**起点推进到窗口末尾**并加倍步进（60s → 1 天封顶），保证单调前进。
 
-## 3. 与 C#/Rust 的行为差异（有意为之）
-| 差异 | 原因 |
+### 2.7 `Model.xml` 完全共用 + 实体代码生成器（`zcodegen`）
+
+**共用口径**：同一份 `Model.xml` 同时被 C# `XCodeTool`、Rust `Pek.RCode` 与 Zig `zcodegen` 读取；
+Zig 侧不引入任何私有字段，C# 里认不出的属性（如 `Attribute="XmlIgnore, …"`、`IgnoreNameCase`）
+按 `Column@extra` / `Table@extra` **原样保留并回写**，因此 C#/Rust 再读回来不丢信息。
+
+验证入口：`zcodegen --model <xml> --verify`（解析 → 回写 → 再解析，比表/列/索引/未识别属性计数）。
+
+| 真实模型 | 表 | 列 | 索引 | 回写后一致 |
+|---|---|---|---|---|
+| `tests/fixtures/dh-ncode-model.xml`（C# `DH.NCode/Model.xml`，即成员权限模型） | 9 | 200 | 31 | ✅ |
+| `tests/fixtures/dh-ncode-test-model.xml`（C# `XUnitTest.XCode/TestEntity/Model.xml`） | 18 | 101 | 10 | ✅ |
+| `tests/fixtures/wms-model-sample.xml`（Rust `Pek.RCode/tests/fixtures`） | 27 | 123 | 27 | ✅ |
+
+**代码生成器**（`src/codegen.zig` + `tools/zcodegen.zig`，对应 C# `XCodeTool` / Rust `codegen.rs`）：
+
+- 生成物：每表一个 `<Name>.zig` + `mod.zig`（含 `pub const all = .{ … }` 便于 `inline for` 遍历）；
+- 每个实体带：`dirty` 脏位图、列文档注释、`meta.fields`（类型/主键/自增/**可空/累加/长度/精度/物理列名/注释**）、
+  `main_keys` / `identity_index` / `additional_indexes`、`indexes` 常量、`table(dal)` 表句柄、
+  `getXxx` / `setXxx`（setter 自动置脏）、`columnValue` / `setColumnValue`（装载不置脏）；
+- 文件名与访问器后缀会做安全化（非 ASCII/非标识符字符换 `_`，数字开头补 `_`）；
+- **自检**：`zig build gen-check -Dgen-check=<dir> -Dmodel=<xml>` 把生成的实体编译出来，
+  在临时 SQLite 上 `syncSchema` + 逐实体插入/按主键取回/删除。
+
+自检实测（本机）：
+
+```text
+C# DH.NCode 模型：建表 9 / 补列 0 / 建索引 31；实体 9 个，真实增删改查通过 8 个，跳过 1 个（Log 为 InsertOnly）
+C# 测试模型：     实体 18 个，通过 18 个
+Rust Pek.RCode 模型：实体 27 个，通过 27 个
+```
+
+`tools/regression.ps1` 已把这三条「生成 → 编译 → 真库」链路纳入一键回归（任一夹具缺失显式 `SKIP` 并说明原因）。
+
+## 3. 与 C#/Rust 的行为差异（有意为之）| 差异 | 原因 |
 |---|---|
 | `Decimal` 只有解析/格式化/比较，没有四则运算 | ORM 层不需要算术；C# 的 `decimal` 运算属于业务层 |
 | `DateTime` 固定 100ns 精度、不做时区换算 | 与 XCode 落库文本（7 位小数秒）一致 |
@@ -240,7 +273,7 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Cache/` 的单对象缓存（`Meta.SingleCache` 语义） | `cache.SingleCache(T)` | 已迁移 |
 | `Cache/FieldCache`、`Cache/CacheInvalidator`、`Cache/DataCache`、`Cache/DbCache` | — | **未做** |
 | `Configuration/FieldExtension`、`FieldOption` | `model.ColumnMeta`（长度/精度/默认值/DataScale/Map/ShowIn 等） | 等价 |
-| `Configuration/TableItem`（反射实体→模型） | 不需要：Zig 以 `Model.xml` 为唯一源；反向由 `reverse.zig` 承担 | 不适用 |
+| `Configuration/TableItem`（反射实体→模型） | 反向方向不需要：Zig 以 `Model.xml` 为唯一源；**正向**由 `codegen.zig`（`XCodeTool` 等价）完成 | 等价 |
 | `Configuration/SqlTemplate`、`ShowInOption`、`ModelSortMode` | — | **未做**（面板/工具层） |
 | `DataAccessLayer/DAL*.cs`、`IDbSession`、`DbSession` | `dal.zig`、`session.zig` | 已迁移 |
 | `DataAccessLayer/Common/ConnectionPool` | `pool.zig` | 已迁移 |
@@ -271,7 +304,7 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Tree/EntityTree` | `tree.zig` | 已迁移 |
 | `Exceptions/*` | `root.zig` 的 `Error` 错误集 + 具体错误名 | 等价 |
 | `InfluxDB/`、`TDengine/`（时序库专用协议驱动） | — | **未做** |
-| `XCodeTool/`（代码生成模板引擎） | `codegen.zig`（`Model.xml` → Zig 实体） | 部分（模板引擎未做，Zig 不需要 Razor） |
+| `XCodeTool/`（代码生成模板引擎） | `codegen.zig` + `tools/zcodegen.zig`（`Model.xml` → Zig 实体，带元数据/索引/辅助函数）+ `tools/gencheck.zig` 生成后自检 | 已迁移（Razor 模板引擎不适用：Zig 侧只需生成代码，不需要模板语言） |
 | `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | — | **未做**（日志开关由调用方决定） |
 
 **一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取）已覆盖；
