@@ -1452,8 +1452,11 @@ fn canonicalBaseType(base: []const u8) []const u8 {
 /// MySQL 的 `bit(1)` / `int(11)` 这类显示宽度、`tinyint` 与 `tinyint(1)` 的口径差异
 /// 都不该被当成「类型变了」而反复 ALTER（反复 ALTER 是真实的生产事故源）。
 fn typesEquivalent(model_type: []const u8, db_type: []const u8) bool {
-    var mbuf: [128]u8 = undefined;
-    var dbuf: [128]u8 = undefined;
+    // 超长类型文本（真实库里几乎不会出现）直接判等价：宁可少改一次，也不要因截断
+    // 造成「每轮同步都判定不一致」→ 反复 ALTER（那是会破坏生产的循环）
+    var mbuf: [192]u8 = undefined;
+    var dbuf: [192]u8 = undefined;
+    if (model_type.len >= mbuf.len or db_type.len >= dbuf.len) return true;
     const m = splitType(normalizeTypeInto(&mbuf, model_type));
     const d = splitType(normalizeTypeInto(&dbuf, db_type));
     if (!std.ascii.eqlIgnoreCase(canonicalBaseType(m.base), canonicalBaseType(d.base))) return false;
