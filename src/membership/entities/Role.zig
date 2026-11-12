@@ -1,0 +1,307 @@
+//! 由 zcodegen 生成，请勿手改。
+//! 重新生成：zig build codegen -Dmodel=<Model.xml> -Dout=<目录>
+//! 角色。业务场景中的岗位，功能权限的集合。不管是用户还是租户，都以角色来管理权限
+const zcode = @import("../../root.zig");
+
+pub const Role = struct {
+    /// 脏列位图（setter 置位；`zcode.entity.update` 只写脏列）
+    dirty: zcode.entity.DirtyBits = 0,
+
+    /// 编号
+    @"ID": i32 = 0,
+    /// 名称
+    @"Name": []const u8 = "",
+    /// 类型。1系统/2普通/3租户
+    @"Type": i32 = 0,
+    /// 启用
+    @"Enable": bool = false,
+    /// 系统。用于业务系统开发使用，不受数据权限约束，禁止修改名称或删除
+    @"IsSystem": bool = false,
+    /// 租户。角色所属组合，0表示全局角色
+    @"TenantId": i32 = 0,
+    /// 数据范围。控制用户可访问的数据范围，0全部/1本部门及下级/2本部门/3仅本人/4自定义
+    @"DataScope": i32 = 0,
+    /// 数据部门。数据范围为自定义时，选择的部门编号列表
+    @"DataDepartmentIds": []const u8 = "",
+    /// 敏感字段。是否可以查看其他人的敏感字段数据
+    @"ViewSensitive": bool = false,
+    /// 权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7
+    @"Permission": []const u8 = "",
+    /// 排序
+    @"Sort": i32 = 0,
+    /// 扩展1
+    @"Ex1": i32 = 0,
+    /// 扩展2
+    @"Ex2": i32 = 0,
+    /// 扩展3
+    @"Ex3": f64 = 0,
+    /// 扩展4
+    @"Ex4": []const u8 = "",
+    /// 扩展5
+    @"Ex5": []const u8 = "",
+    /// 扩展6
+    @"Ex6": []const u8 = "",
+    /// 创建者
+    @"CreateUser": []const u8 = "",
+    /// 创建用户
+    @"CreateUserID": i32 = 0,
+    /// 创建地址
+    @"CreateIP": []const u8 = "",
+    /// 创建时间
+    @"CreateTime": zcode.DateTime = .{},
+    /// 更新者
+    @"UpdateUser": []const u8 = "",
+    /// 更新用户
+    @"UpdateUserID": i32 = 0,
+    /// 更新地址
+    @"UpdateIP": []const u8 = "",
+    /// 更新时间
+    @"UpdateTime": zcode.DateTime = .{},
+    /// 备注
+    @"Remark": []const u8 = "",
+
+    pub const meta = zcode.entity.EntityMeta{
+        .name = "Role",
+        .table_name = "Role",
+        .fields = &.{
+            .{ .name = "ID", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
+            .{ .name = "Name", .data_type = .string, .description = "名称" },
+            .{ .name = "Type", .data_type = .int32, .description = "类型。1系统/2普通/3租户" },
+            .{ .name = "Enable", .data_type = .boolean, .description = "启用" },
+            .{ .name = "IsSystem", .data_type = .boolean, .description = "系统。用于业务系统开发使用，不受数据权限约束，禁止修改名称或删除" },
+            .{ .name = "TenantId", .data_type = .int32, .description = "租户。角色所属组合，0表示全局角色" },
+            .{ .name = "DataScope", .data_type = .int32, .description = "数据范围。控制用户可访问的数据范围，0全部/1本部门及下级/2本部门/3仅本人/4自定义" },
+            .{ .name = "DataDepartmentIds", .data_type = .string, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
+            .{ .name = "ViewSensitive", .data_type = .boolean, .description = "敏感字段。是否可以查看其他人的敏感字段数据" },
+            .{ .name = "Permission", .data_type = .string, .description = "权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7" },
+            .{ .name = "Sort", .data_type = .int32, .description = "排序" },
+            .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
+            .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
+            .{ .name = "Ex3", .data_type = .double, .description = "扩展3" },
+            .{ .name = "Ex4", .data_type = .string, .description = "扩展4" },
+            .{ .name = "Ex5", .data_type = .string, .description = "扩展5" },
+            .{ .name = "Ex6", .data_type = .string, .description = "扩展6" },
+            .{ .name = "CreateUser", .data_type = .string, .description = "创建者" },
+            .{ .name = "CreateUserID", .data_type = .int32, .description = "创建用户" },
+            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
+            .{ .name = "UpdateUser", .data_type = .string, .description = "更新者" },
+            .{ .name = "UpdateUserID", .data_type = .int32, .description = "更新用户" },
+            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
+            .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
+            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "备注" },
+        },
+    };
+
+    /// 主键列下标（按模型声明顺序）
+    pub const main_keys: []const usize = &.{0};
+    /// 自增列下标（ID）
+    pub const identity_index: usize = 0;
+
+    /// 索引（对应 `Model.xml` 的 `Index`）
+    pub const indexes = [_]zcode.codegen.IndexInfo{
+        .{ .columns = &.{"Name"}, .unique = false },
+        .{ .columns = &.{"TenantId", "Name"}, .unique = false },
+    };
+
+    /// 取表句柄（表级 CRUD / 分片路由都用它）。
+    pub fn table(dal: *zcode.Dal) !zcode.dbtable.TableRef {
+        return dal.table("Role");
+    }
+    pub fn getID(self: @This()) i32 { return self.@"ID"; }
+    pub fn setID(self: *@This(), v: i32) void {
+        self.@"ID" = v;
+        zcode.entity.markDirty(&self.dirty, 0);
+    }
+    pub fn getName(self: @This()) []const u8 { return self.@"Name"; }
+    pub fn setName(self: *@This(), v: []const u8) void {
+        self.@"Name" = v;
+        zcode.entity.markDirty(&self.dirty, 1);
+    }
+    pub fn getType(self: @This()) i32 { return self.@"Type"; }
+    pub fn setType(self: *@This(), v: i32) void {
+        self.@"Type" = v;
+        zcode.entity.markDirty(&self.dirty, 2);
+    }
+    pub fn getEnable(self: @This()) bool { return self.@"Enable"; }
+    pub fn setEnable(self: *@This(), v: bool) void {
+        self.@"Enable" = v;
+        zcode.entity.markDirty(&self.dirty, 3);
+    }
+    pub fn getIsSystem(self: @This()) bool { return self.@"IsSystem"; }
+    pub fn setIsSystem(self: *@This(), v: bool) void {
+        self.@"IsSystem" = v;
+        zcode.entity.markDirty(&self.dirty, 4);
+    }
+    pub fn getTenantId(self: @This()) i32 { return self.@"TenantId"; }
+    pub fn setTenantId(self: *@This(), v: i32) void {
+        self.@"TenantId" = v;
+        zcode.entity.markDirty(&self.dirty, 5);
+    }
+    pub fn getDataScope(self: @This()) i32 { return self.@"DataScope"; }
+    pub fn setDataScope(self: *@This(), v: i32) void {
+        self.@"DataScope" = v;
+        zcode.entity.markDirty(&self.dirty, 6);
+    }
+    pub fn getDataDepartmentIds(self: @This()) []const u8 { return self.@"DataDepartmentIds"; }
+    pub fn setDataDepartmentIds(self: *@This(), v: []const u8) void {
+        self.@"DataDepartmentIds" = v;
+        zcode.entity.markDirty(&self.dirty, 7);
+    }
+    pub fn getViewSensitive(self: @This()) bool { return self.@"ViewSensitive"; }
+    pub fn setViewSensitive(self: *@This(), v: bool) void {
+        self.@"ViewSensitive" = v;
+        zcode.entity.markDirty(&self.dirty, 8);
+    }
+    pub fn getPermission(self: @This()) []const u8 { return self.@"Permission"; }
+    pub fn setPermission(self: *@This(), v: []const u8) void {
+        self.@"Permission" = v;
+        zcode.entity.markDirty(&self.dirty, 9);
+    }
+    pub fn getSort(self: @This()) i32 { return self.@"Sort"; }
+    pub fn setSort(self: *@This(), v: i32) void {
+        self.@"Sort" = v;
+        zcode.entity.markDirty(&self.dirty, 10);
+    }
+    pub fn getEx1(self: @This()) i32 { return self.@"Ex1"; }
+    pub fn setEx1(self: *@This(), v: i32) void {
+        self.@"Ex1" = v;
+        zcode.entity.markDirty(&self.dirty, 11);
+    }
+    pub fn getEx2(self: @This()) i32 { return self.@"Ex2"; }
+    pub fn setEx2(self: *@This(), v: i32) void {
+        self.@"Ex2" = v;
+        zcode.entity.markDirty(&self.dirty, 12);
+    }
+    pub fn getEx3(self: @This()) f64 { return self.@"Ex3"; }
+    pub fn setEx3(self: *@This(), v: f64) void {
+        self.@"Ex3" = v;
+        zcode.entity.markDirty(&self.dirty, 13);
+    }
+    pub fn getEx4(self: @This()) []const u8 { return self.@"Ex4"; }
+    pub fn setEx4(self: *@This(), v: []const u8) void {
+        self.@"Ex4" = v;
+        zcode.entity.markDirty(&self.dirty, 14);
+    }
+    pub fn getEx5(self: @This()) []const u8 { return self.@"Ex5"; }
+    pub fn setEx5(self: *@This(), v: []const u8) void {
+        self.@"Ex5" = v;
+        zcode.entity.markDirty(&self.dirty, 15);
+    }
+    pub fn getEx6(self: @This()) []const u8 { return self.@"Ex6"; }
+    pub fn setEx6(self: *@This(), v: []const u8) void {
+        self.@"Ex6" = v;
+        zcode.entity.markDirty(&self.dirty, 16);
+    }
+    pub fn getCreateUser(self: @This()) []const u8 { return self.@"CreateUser"; }
+    pub fn setCreateUser(self: *@This(), v: []const u8) void {
+        self.@"CreateUser" = v;
+        zcode.entity.markDirty(&self.dirty, 17);
+    }
+    pub fn getCreateUserID(self: @This()) i32 { return self.@"CreateUserID"; }
+    pub fn setCreateUserID(self: *@This(), v: i32) void {
+        self.@"CreateUserID" = v;
+        zcode.entity.markDirty(&self.dirty, 18);
+    }
+    pub fn getCreateIP(self: @This()) []const u8 { return self.@"CreateIP"; }
+    pub fn setCreateIP(self: *@This(), v: []const u8) void {
+        self.@"CreateIP" = v;
+        zcode.entity.markDirty(&self.dirty, 19);
+    }
+    pub fn getCreateTime(self: @This()) zcode.DateTime { return self.@"CreateTime"; }
+    pub fn setCreateTime(self: *@This(), v: zcode.DateTime) void {
+        self.@"CreateTime" = v;
+        zcode.entity.markDirty(&self.dirty, 20);
+    }
+    pub fn getUpdateUser(self: @This()) []const u8 { return self.@"UpdateUser"; }
+    pub fn setUpdateUser(self: *@This(), v: []const u8) void {
+        self.@"UpdateUser" = v;
+        zcode.entity.markDirty(&self.dirty, 21);
+    }
+    pub fn getUpdateUserID(self: @This()) i32 { return self.@"UpdateUserID"; }
+    pub fn setUpdateUserID(self: *@This(), v: i32) void {
+        self.@"UpdateUserID" = v;
+        zcode.entity.markDirty(&self.dirty, 22);
+    }
+    pub fn getUpdateIP(self: @This()) []const u8 { return self.@"UpdateIP"; }
+    pub fn setUpdateIP(self: *@This(), v: []const u8) void {
+        self.@"UpdateIP" = v;
+        zcode.entity.markDirty(&self.dirty, 23);
+    }
+    pub fn getUpdateTime(self: @This()) zcode.DateTime { return self.@"UpdateTime"; }
+    pub fn setUpdateTime(self: *@This(), v: zcode.DateTime) void {
+        self.@"UpdateTime" = v;
+        zcode.entity.markDirty(&self.dirty, 24);
+    }
+    pub fn getRemark(self: @This()) []const u8 { return self.@"Remark"; }
+    pub fn setRemark(self: *@This(), v: []const u8) void {
+        self.@"Remark" = v;
+        zcode.entity.markDirty(&self.dirty, 25);
+    }
+
+    /// 读取第 i 列（与 meta.fields 同序）。
+    pub fn columnValue(self: @This(), i: usize) zcode.Value {
+        return switch (i) {
+            0 => .{ .int = @intCast(self.@"ID") },
+            1 => .{ .text = self.@"Name" },
+            2 => .{ .int = @intCast(self.@"Type") },
+            3 => .{ .boolean = self.@"Enable" },
+            4 => .{ .boolean = self.@"IsSystem" },
+            5 => .{ .int = @intCast(self.@"TenantId") },
+            6 => .{ .int = @intCast(self.@"DataScope") },
+            7 => .{ .text = self.@"DataDepartmentIds" },
+            8 => .{ .boolean = self.@"ViewSensitive" },
+            9 => .{ .text = self.@"Permission" },
+            10 => .{ .int = @intCast(self.@"Sort") },
+            11 => .{ .int = @intCast(self.@"Ex1") },
+            12 => .{ .int = @intCast(self.@"Ex2") },
+            13 => .{ .float = self.@"Ex3" },
+            14 => .{ .text = self.@"Ex4" },
+            15 => .{ .text = self.@"Ex5" },
+            16 => .{ .text = self.@"Ex6" },
+            17 => .{ .text = self.@"CreateUser" },
+            18 => .{ .int = @intCast(self.@"CreateUserID") },
+            19 => .{ .text = self.@"CreateIP" },
+            20 => .{ .datetime = self.@"CreateTime" },
+            21 => .{ .text = self.@"UpdateUser" },
+            22 => .{ .int = @intCast(self.@"UpdateUserID") },
+            23 => .{ .text = self.@"UpdateIP" },
+            24 => .{ .datetime = self.@"UpdateTime" },
+            25 => .{ .text = self.@"Remark" },
+            else => .{ .null = {} },
+        };
+    }
+
+    /// 装载第 i 列（不置脏）。
+    pub fn setColumnValue(self: *@This(), i: usize, v: zcode.Value) !void {
+        switch (i) {
+            0 => { self.@"ID" = v.asI32() orelse 0; },
+            1 => { switch (v) { .text => |t| self.@"Name" = t, .null => self.@"Name" = "", else => {} } },
+            2 => { self.@"Type" = v.asI32() orelse 0; },
+            3 => { self.@"Enable" = v.asBool() orelse false; },
+            4 => { self.@"IsSystem" = v.asBool() orelse false; },
+            5 => { self.@"TenantId" = v.asI32() orelse 0; },
+            6 => { self.@"DataScope" = v.asI32() orelse 0; },
+            7 => { switch (v) { .text => |t| self.@"DataDepartmentIds" = t, .null => self.@"DataDepartmentIds" = "", else => {} } },
+            8 => { self.@"ViewSensitive" = v.asBool() orelse false; },
+            9 => { switch (v) { .text => |t| self.@"Permission" = t, .null => self.@"Permission" = "", else => {} } },
+            10 => { self.@"Sort" = v.asI32() orelse 0; },
+            11 => { self.@"Ex1" = v.asI32() orelse 0; },
+            12 => { self.@"Ex2" = v.asI32() orelse 0; },
+            13 => { self.@"Ex3" = v.asF64() orelse 0; },
+            14 => { switch (v) { .text => |t| self.@"Ex4" = t, .null => self.@"Ex4" = "", else => {} } },
+            15 => { switch (v) { .text => |t| self.@"Ex5" = t, .null => self.@"Ex5" = "", else => {} } },
+            16 => { switch (v) { .text => |t| self.@"Ex6" = t, .null => self.@"Ex6" = "", else => {} } },
+            17 => { switch (v) { .text => |t| self.@"CreateUser" = t, .null => self.@"CreateUser" = "", else => {} } },
+            18 => { self.@"CreateUserID" = v.asI32() orelse 0; },
+            19 => { switch (v) { .text => |t| self.@"CreateIP" = t, .null => self.@"CreateIP" = "", else => {} } },
+            20 => { self.@"CreateTime" = v.asDatetime() orelse .{}; },
+            21 => { switch (v) { .text => |t| self.@"UpdateUser" = t, .null => self.@"UpdateUser" = "", else => {} } },
+            22 => { self.@"UpdateUserID" = v.asI32() orelse 0; },
+            23 => { switch (v) { .text => |t| self.@"UpdateIP" = t, .null => self.@"UpdateIP" = "", else => {} } },
+            24 => { self.@"UpdateTime" = v.asDatetime() orelse .{}; },
+            25 => { switch (v) { .text => |t| self.@"Remark" = t, .null => self.@"Remark" = "", else => {} } },
+            else => {},
+        }
+    }
+};

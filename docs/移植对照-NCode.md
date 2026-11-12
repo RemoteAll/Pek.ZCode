@@ -358,7 +358,7 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Entity/IEntityModule`（实体模块钩子：Time/User/Trace） | `interceptor.zig`（审计列补全，等价于 ThreeModule） | 等价 |
 | `Extension/数据缓存` | `cache.zig` | 已迁移 |
 | `Linq/EntityQueryProvider`（表达式树 → SQL） | `query.zig`（结构化 `Where`，无表达式树） | 不适用（Zig 无 LINQ） |
-| `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | — | **未做**（独立子系统，~500KB C#；对应 Rust 生态的 `Pek.RPermissions`） |
+| `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | `membership.zig`：`enums` / `password` / `datascope` + `entities/*`（9 张表由 `membership/Member.xml` 生成） | **部分**（2026-11-13 第一刀）：枚举/PermissionFlags 文本、口令散列 `md5+sha1` 字节互通、数据权限（上下文/翻译/掩码）、九张表实体全部到位；**待做**：`ManageProvider`（`LoginCore` 八步）、`LogProvider` 实体钩子、各实体的 `Valid`/`InitData`/`FindXxx` 业务规则、`Area` 地区算法 |
 | `Model/WhereExpression`、`OrderExpression`、`FieldExpression`、`InExpression`、`LikeExpression` | `query.zig`（14 种运算符 + 排序/分页） | 已迁移 |
 | `Model/ConcatExpression`、`FormatExpression` | `expression.zig`（`ConcatExpression` / `FormatExpression` / `FieldExpression` / `Expression`） | 已迁移 |
 | `Model/BatchFinder`、`BatchOption` | `batch.zig`（批量 `IN` 预取 + 去重 + 可替换 loader；`BatchOption` 参数载体） | 已迁移 |
@@ -375,5 +375,6 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | `setting.zig`（字段与默认值逐项对齐 + `Key=Value` 读写） | 已迁移（无面板元数据） |
 
 **一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取）已覆盖；
-**剩余最大块是 `Membership` 整套**，其次是 `EntityExtension` 的扩展方法集、`InfluxDB` / `TDengine` 两个时序库驱动、
+**剩余最大块是 `Membership` 整套**（已落地枚举/口令/数据权限/九张表实体，剩 `ManageProvider` 与各实体业务规则），
+其次是 `EntityExtension` 的扩展方法集、`InfluxDB` / `TDengine` 两个时序库驱动、
 `DbPackage` 的 zip 多表归档。

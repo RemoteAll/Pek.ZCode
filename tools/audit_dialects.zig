@@ -21,10 +21,10 @@ const Buf = zzig.Buf;
 
 /// 全部方言（与 `DatabaseKind` 一一对应；新增方言时必须同步加进来，否则审计会漏）。
 const all_kinds = [_]DatabaseKind{
-    .sqlite,   .mysql,     .sqlserver, .postgresql, .kingbase, .highgo,
-    .vastbase, .oracle,    .duckdb,    .clickhouse, .tdengine, .influxdb,
-    .hana,     .firebird,  .db2,       .dameng,     .iris,     .access,
-    .sqlce,    .mongodb,   .nova,
+    .sqlite,   .mysql,    .sqlserver, .postgresql, .kingbase, .highgo,
+    .vastbase, .oracle,   .duckdb,    .clickhouse, .tdengine, .influxdb,
+    .hana,     .firebird, .db2,       .dameng,     .iris,     .access,
+    .sqlce,    .mongodb,  .nova,
 };
 
 const Gap = struct { kind: DatabaseKind, area: []const u8, detail: []const u8 };

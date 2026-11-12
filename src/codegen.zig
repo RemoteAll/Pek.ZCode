@@ -24,6 +24,11 @@ pub const Options = struct {
     table: ?[]const u8 = null,
     /// 只打印不落盘
     dry_run: bool = false,
+    /// 生成代码里的 `zcode` 导入路径。
+    ///
+    /// 默认 `zcode`（包外消费方）；**库内自用**（如 `src/membership/entities/`）要传相对路径，
+    /// 否则 `@import("zcode")` 在自身包里会变成循环依赖。
+    import: []const u8 = "zcode",
 };
 
 pub const Report = struct {
@@ -47,7 +52,7 @@ pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options)
             if (!std.ascii.eqlIgnoreCase(t.name, want) and
                 !std.ascii.eqlIgnoreCase(t.effectiveTableName(), want)) continue;
         }
-        const src = try generateTableAlloc(gpa, t);
+        const src = try generateTableAllocOpt(gpa, t, .{ .out_dir = opts.out_dir, .import = opts.import });
         defer gpa.free(src);
 
         if (opts.dry_run) {
@@ -79,6 +84,11 @@ pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options)
 
 /// 单表源码。
 pub fn generateTableAlloc(gpa: std.mem.Allocator, t: *const TableMeta) ![]u8 {
+    return generateTableAllocOpt(gpa, t, .{ .out_dir = "" });
+}
+
+/// 单表源码（可指定导入路径）。
+pub fn generateTableAllocOpt(gpa: std.mem.Allocator, t: *const TableMeta, opts: Options) ![]u8 {
     var b = zzig.Buf.init(gpa);
     defer b.deinit();
 
@@ -89,7 +99,7 @@ pub fn generateTableAlloc(gpa: std.mem.Allocator, t: *const TableMeta) ![]u8 {
         try addOneLine(&b, t.description);
         try b.add("\n");
     }
-    try b.add("const zcode = @import(\"zcode\");\n\n");
+    try b.fmt("const zcode = @import(\"{s}\");\n\n", .{opts.import});
 
     try b.fmt("pub const {s} = struct {{\n", .{t.name});
     try b.add("    /// 脏列位图（setter 置位；`zcode.entity.update` 只写脏列）\n");

@@ -128,6 +128,11 @@ pub const DataCache = dbcache.DataCache;
 pub const DbCache = dbcache.DbCache;
 /// 数据包（表级导出 / 导入 / 跳库同步，对应 C# `DataAccessLayer/DbPackage.cs`）
 pub const dbpackage = @import("dbpackage.zig");
+/// Membership 子系统（用户 / 角色 / 部门 / 菜单 / 租户 / 日志 / 参数 / 地区 + 数据权限 + 口令散列）
+/// （对应 C# `DH.NCode/Membership/`）
+pub const membership = @import("membership.zig");
+pub const DataScopes = membership.DataScopes;
+pub const DataScopeContext = membership.DataScopeContext;
 pub const Error = error{
     Model,
     Xml,
@@ -178,4 +183,5 @@ test {
     _ = @import("batch.zig");
     _ = @import("dbcache.zig");
     _ = @import("dbpackage.zig");
+    _ = @import("membership.zig");
 }

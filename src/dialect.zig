@@ -1360,9 +1360,9 @@ test "小语种方言：标识符引号风格（对照 C# 各驱动 FormatName�
 test "小语种方言：自增取值语句（对照 C# 各驱动 InsertAndGetIdentity）" {
     // 有自增语义的库必须给语句，不能返回空串
     const with_identity = [_]DatabaseKind{
-        .sqlite,   .mysql,     .sqlserver, .postgresql, .kingbase, .highgo,
-        .vastbase, .oracle,    .access,    .sqlce,      .hana,     .iris,
-        .duckdb,   .db2,       .dameng,    .firebird,   .nova,
+        .sqlite,   .mysql,  .sqlserver, .postgresql, .kingbase, .highgo,
+        .vastbase, .oracle, .access,    .sqlce,      .hana,     .iris,
+        .duckdb,   .db2,    .dameng,    .firebird,   .nova,
     };
     for (with_identity) |k| {
         if (k.lastIdentitySql().len == 0) {

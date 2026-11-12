@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     var reverse_conn: ?[]const u8 = null;
     var dry_run = false;
     var verify = false;
+    var import_path: []const u8 = "zcode";
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -45,6 +46,10 @@ pub fn main(init: std.process.Init) !void {
             reverse_conn = argv[i];
         } else if (std.mem.eql(u8, a, "--dry-run")) {
             dry_run = true;
+        } else if (std.mem.eql(u8, a, "--import")) {
+            i += 1;
+            if (i >= argv.len) return usage();
+            import_path = argv[i];
         } else if (std.mem.eql(u8, a, "--verify")) {
             verify = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
@@ -95,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
         .out_dir = od,
         .table = table,
         .dry_run = dry_run,
+        .import = import_path,
     });
     std.debug.print("zcodegen：生成 {d} 个实体 / {d} 个文件 → {s}{s}\n", .{
         report.tables,
