@@ -49,7 +49,6 @@ const Ctx = struct {
             };
         }
     }
-
 };
 
 test "数据库远程服务：Login/Query/Execute/Identity/Count/GetTables/事务/负向" {
@@ -176,6 +175,25 @@ test "数据库远程服务：Login/Query/Execute/Identity/Count/GetTables/事�
         if (typed_ok.query(aa, "SELECT 1", &.{})) |_| {
             return error.TestUnexpectedResult;
         } else |e| try std.testing.expectEqual(error.Unsupported, e);
+
+        // ⑨ `?format=packet` → C# `DbTable` v3 二进制；客户端解回来必须一致
+        {
+            var pa = std.heap.ArenaAllocator.init(a);
+            defer pa.deinit();
+            const t = try client.queryPacket(pa.allocator(), "SELECT `Id`,`Code`,`Title` FROM `DH_SvcRow` ORDER BY `Id`", &.{});
+            try std.testing.expectEqual(@as(usize, 3), t.columns.len);
+            try std.testing.expectEqualStrings("Id", t.columns[0]);
+            try std.testing.expectEqualStrings("Code", t.columns[1]);
+            try std.testing.expectEqualStrings("Title", t.columns[2]);
+            // Id 是 Int32 列 → 推断成 int64（C# 的 BigInteger 口径一致：整数统一 int64）
+            try std.testing.expectEqual(zcode.dbtable_packet.TypeCode.int64, t.types[0]);
+            try std.testing.expectEqual(zcode.dbtable_packet.TypeCode.string, t.types[1]);
+            try std.testing.expect(t.rows.len >= 1);
+            try std.testing.expectEqual(@as(i64, 1), t.rows[0][0].int);
+            try std.testing.expectEqualStrings("svc-1", t.rows[0][1].text);
+            try std.testing.expectEqualStrings("来自远程服务", t.rows[0][2].text);
+            std.debug.print("[dbservice] packet：列 {d} / 行 {d}（DbTable v3 二进制）\n", .{ t.columns.len, t.rows.len });
+        }
     }
 
     ctx.stop.store(true, .release);

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const zzig = @import("zzig");
+const dbtable_packet = @import("dbtable_packet.zig");
 const Value = zzig.db.Value;
 
 pub const Error = error{
@@ -91,6 +92,53 @@ pub const Client = struct {
     /// 在事务里查询（`tx` 来自 `beginTx`）。
     pub fn queryTx(self: *Client, arena: std.mem.Allocator, tx: []const u8, sql: []const u8, parameters: []const Param) !Rows {
         return self.queryWith(arena, sql, parameters, tx);
+    }
+
+    /// 查询：要求服务端返回 C# `DbTable` **v3 二进制**（`?format=packet`）并解码。
+    ///
+    /// 适合与 C# 客户端互通（C# 侧直接 `new DbTable().Read(pk)`）；
+    /// 需要 NULL 语义时继续用 `query`（JSON），v3 里 NULL 按类型默认值落字节。
+    pub fn queryPacket(self: *Client, arena: std.mem.Allocator, sql: []const u8, parameters: []const Param) !dbtable_packet.Decoded {
+        const body = try self.buildRequest(arena, sql, parameters, null);
+        const url = try std.fmt.allocPrint(arena, "{s}/Db/Query?format=packet", .{std.mem.trimEnd(u8, self.server, "/")});
+        const resp = zzig.Http.fetchBytes(arena, &self.http, .{
+            .url = url,
+            .method = .POST,
+            .payload = body,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json; charset=utf-8" }},
+        }) catch |e| {
+            self.setError("请求 Db/Query（packet）失败：{s}", .{@errorName(e)});
+            return e;
+        };
+
+        if (resp.status == .not_found) {
+            self.setError("服务端没有 Db/Query 路由（404），降级为 Unsupported", .{});
+            return error.Unsupported;
+        }
+        if (resp.status != .ok) {
+            // 错误路径服务端仍然回 JSON 信封，这里把 msg 取出来供调用方定位
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch null;
+            var msg: []const u8 = "";
+            if (parsed) |p| {
+                if (p == .object) {
+                    if (p.object.get("msg")) |m| {
+                        if (m == .string) msg = m.string;
+                    }
+                    if (p.object.get("code")) |c| {
+                        if (c == .integer and c.integer == 401) {
+                            self.setError("服务端返回 401：{s}", .{msg});
+                            return error.Unauthorized;
+                        }
+                    }
+                }
+            }
+            self.setError("服务端返回 HTTP {d}：{s}", .{ @backingInt(resp.status), truncate(msg) });
+            return error.Server;
+        }
+        return dbtable_packet.decodeAlloc(arena, resp.body) catch |e| {
+            self.setError("解码 DbTable v3 失败：{s}（响应 {d} 字节，开头：{s}）", .{ @errorName(e), resp.body.len, truncate(resp.body) });
+            return e;
+        };
     }
 
     fn queryWith(self: *Client, arena: std.mem.Allocator, sql: []const u8, parameters: []const Param, tx: ?[]const u8) !Rows {

@@ -15,11 +15,16 @@
 //!
 //! 统一信封 `{code, data, msg}`（`code=0` 成功），与 C# `ApiHelper.ProcessResponse` 兼容。
 //!
-//! ## 与 C# 的**已知差异**（不静默降级）
+//! ## `Db/Query` 的两种载荷（默认 JSON，可要求二进制）
 //!
-//! C# `DbController.Query` 的应答是 **`DbTable` v3 二进制**（`rs.ToPacket()`），本实现返回
-//! **JSON 行列**。因此「C# 客户端 ↔ Zig 服务端」调 `Db/Query` 不互通；其余路由是 JSON 信封，互通。
-//! 需要二进制互通时再补 `DbTable` v3 编解码（本轮没做，已在 `docs/移植对照-NCode.md` 记明）。
+//! - **默认**：JSON 行列 `{columns:[c0..], rows:[[...]]}`（与 Rust `Pek.RCode` 一致）。
+//! - **`?format=packet`（或 `v3`/`binary`）**：响应体是 **C# `NewLife.Data.DbTable` v3 二进制**，
+//!   Content-Type `application/x-db-table; version=3`，C# 侧可直接 `new DbTable().Read(pk)`。
+//!   编码规则见 `dbtable_packet.zig`（字节级对照真实 C# 运行时产出，已固化进单测）。
+//!   空结果集时**拿不到列名**（`Session` 不暴露列元数据）→ 返回 0 列 0 行的合法包。
+//!
+//! 二进制模式下 NULL 按 C# 口径写成**类型默认值**（C# 的 `BinaryGeneral` 写值类型 null 会抛异常，
+//! 且它自己读库时也把 `DBNull` 换成默认值）；需要区分 NULL 就用 JSON。
 //!
 //! ## 事务
 //!
@@ -28,6 +33,7 @@
 //! **防泄漏**：任何事务相关请求最多每 1 秒扫一次，空闲超时（默认 60 秒）自动回滚回收。
 
 const std = @import("std");
+const dbtable_packet = @import("dbtable_packet.zig");
 const zcode = struct {
     // 本模块在库内部，直接用相对导入
     const session = @import("session.zig");
@@ -110,7 +116,7 @@ pub const Service = struct {
         }
 
         if (std.mem.eql(u8, path, "Db/Login")) return self.login(arena);
-        if (std.mem.eql(u8, path, "Db/Query")) return self.query(arena, body, parsed);
+        if (std.mem.eql(u8, path, "Db/Query")) return self.query(arena, body, parsed, wantsPacket(req.query));
         if (std.mem.eql(u8, path, "Db/Execute")) return self.execute(arena, body, parsed);
         if (std.mem.eql(u8, path, "Db/InsertAndGetIdentity")) return self.insertIdentity(arena, body, parsed);
         if (std.mem.eql(u8, path, "Db/QueryCount")) return self.queryCount(arena, body, parsed);
@@ -131,7 +137,7 @@ pub const Service = struct {
         return replyOk(arena, data);
     }
 
-    fn query(self: *Service, arena: std.mem.Allocator, body: []const u8, parsed: ?std.json.Parsed(std.json.Value)) !http_server.Reply {
+    fn query(self: *Service, arena: std.mem.Allocator, body: []const u8, parsed: ?std.json.Parsed(std.json.Value), want_packet: bool) !http_server.Reply {
         const sql = (try requireSql(arena, body, parsed)) orelse return replyErr(arena, .bad_request, 400, "缺少 sql");
         const params = try parseParams(arena, parsed);
         var tmp: Session = undefined;
@@ -142,6 +148,14 @@ pub const Service = struct {
         const rows = s.queryRows(sql, params.list) catch |e| {
             return replyErr(arena, .internal_server_error, 500, try std.fmt.allocPrint(arena, "{s}；{s}", .{ @errorName(e), s.lastError() }));
         };
+
+        // `?format=packet` → 返回 C# `NewLife.Data.DbTable` v3 二进制（与原实现 JSON 行列并存）
+        if (want_packet) {
+            const bytes = encodePacket(arena, rows) catch |e| {
+                return replyErr(arena, .internal_server_error, 500, try std.fmt.allocPrint(arena, "编码 DbTable v3 失败：{s}", .{@errorName(e)}));
+            };
+            return .{ .body = bytes, .content_type = dbtable_packet_content_type };
+        }
         var out: std.Io.Writer.Allocating = .init(arena);
         try out.writer.writeAll("{\"columns\":[");
         // 列名从第一行取不到（行里没有列清单），故按结果列顺序输出位置名
@@ -355,6 +369,30 @@ pub const Service = struct {
 };
 
 // ── JSON 小工具（信封 + 取值 + 序列化）────────────────────────────────────
+
+/// DbTable v3 二进制的 Content-Type（客户端据此判断要不要按 packet 解）
+pub const dbtable_packet_content_type = "application/x-db-table; version=3";
+
+/// `?format=packet|v3|binary` → 要求二进制响应
+fn wantsPacket(query: []const u8) bool {
+    const f = queryParam(query, "format") orelse return false;
+    return std.ascii.eqlIgnoreCase(f, "packet") or
+        std.ascii.eqlIgnoreCase(f, "v3") or
+        std.ascii.eqlIgnoreCase(f, "binary");
+}
+
+/// 把查询结果编码成 DbTable v3。
+///
+/// 没有行时拿不到列名（`Session` 不暴露列元数据），此时输出「0 列 0 行」的合法包 ——
+/// 与 JSON 口径的 `columns: []` 一致，不静默塞假列名。
+fn encodePacket(arena: std.mem.Allocator, rows: []const @import("zzig").db.Row) ![]u8 {
+    if (rows.len == 0) {
+        const no_cols = [_]dbtable_packet.Column{};
+        const no_rows = [_][]const Value{};
+        return dbtable_packet.encodeAlloc(arena, &no_cols, &no_rows);
+    }
+    return dbtable_packet.encodeRowsAlloc(arena, rows);
+}
 
 fn replyOk(arena: std.mem.Allocator, data_json: []const u8) !http_server.Reply {
     return .{ .body = try std.fmt.allocPrint(arena, "{{\"code\":0,\"data\":{s},\"msg\":\"\"}}", .{data_json}) };

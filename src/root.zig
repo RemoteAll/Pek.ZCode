@@ -92,7 +92,8 @@ pub const tree = @import("tree.zig");
 pub const dbservice = @import("dbservice.zig");
 /// 数据库远程服务的客户端
 pub const dbclient = @import("dbclient.zig");
-
+/// C# `DbTable` v3 二进制编解码（`Db/Query` 的跨语言互通）
+pub const dbtable_packet = @import("dbtable_packet.zig");
 pub const Error = error{
     Model,
     Xml,
@@ -131,4 +132,5 @@ test {
     _ = @import("tree.zig");
     _ = @import("dbservice.zig");
     _ = @import("dbclient.zig");
+    _ = @import("dbtable_packet.zig");
 }

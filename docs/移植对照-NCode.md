@@ -30,7 +30,7 @@
 | 反向工程 | `DbMetaData.GetSchema` + XCodeTool | `reverse.rs` | `src/reverse.zig`（`zcodegen --reverse`） | ✅ SQLite/MySQL：表/列/主键/自增/索引/注释 → `Model.xml` |
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
-| 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**差异**：`Db/Query` 返回 JSON 行列，C# 的 `DbTable` v3 二进制未实现（跨语言调 Query 不互通，其余路由互通） |
+| 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**`Db/Query` 两种载荷**：默认 JSON 行列；**`?format=packet` 返回 C# `DbTable` v3 二进制**（`src/dbtable_packet.zig`，字节级对齐真实 C# 运行时，C# 侧 `new DbTable().Read(pk)` 直接可读） |
 | 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
 
 ## 2. 逐项语义对齐（已实现部分）
@@ -94,8 +94,35 @@
     （因此只在 `Full` 档触发）。
 - **幂等**：二次同步 `tables_created / columns_added / columns_altered / indexes_created` 均为 0（集成测试固化）。
 
-## 3. 与 C#/Rust 的行为差异（有意为之）
+### 2.5 C# `DbTable` v3 二进制（`Db/Query?format=packet`）
 
+字节规则来自 C# 源码（`DH.NCore/Data/DbTable.cs` + `Serialization/Binary/*.cs`），并用**真实 C# 运行时**
+（`DH.NCore.dll` / net10.0）生成黄金字节逐字节比对（`src/dbtable_packet.zig` 末尾的常量）。
+
+```text
+"NewLifeDbTable"(14B) + 版本(1B)=3 + 保留位(varint 0) + 列数(varint)
+每列: varint(字节数) + UTF-8 列名 + TypeCode(1B) [+ TypeCode=1 时 varint(长度)+类型全名]
+行数: **4 字节小端**（不是 varint，C# 用 Total.GetBytes() 原样写）
+每行按列序写值
+```
+
+| TypeCode | 值编码 |
+|---|---|
+| 3 Boolean / 6 Byte | 1 字节 |
+| 7 / 9 / 11 Int16/32/64 | **7bit varint**（负数按补码无符号展开：Int32 的 -1 = 5 字节，Int64 = 10 字节） |
+| 13 Single / 14 Double | 4 / 8 字节 **大端**（`Binary.IsLittleEndian` 默认 false） |
+| 15 Decimal | 4 个 varint：`.NET Decimal.GetBits` 的 `lo/mid/hi/flags`（flags = scale<<16 \| 0x80000000） |
+| 16 DateTime | varint(`DateTime.ToBinary()` = ticks，kind=0) |
+| 18 String | varint(UTF-8 字节数) + UTF-8 |
+| 1 Object(`System.Byte[]`) | varint(字节数) + 原始字节 |
+
+**NULL 口径**：C# `BinaryGeneral` 对值类型列写 `null` 会抛 `InvalidCastException`（实测），它自己读库时
+已把 `DBNull` 换成类型默认值 → 本实现与之一致：NULL 写成默认值（`0` / `""` / `0m` / ticks=0 / 空数组）。
+需要区分 NULL 请用 JSON 载荷。
+
+**空结果集**：`Session` 不暴露列元数据，0 行时拿不到列名 → 返回 0 列 0 行的合法包（不塞假列名）。
+
+## 3. 与 C#/Rust 的行为差异（有意为之）
 | 差异 | 原因 |
 |---|---|
 | `Decimal` 只有解析/格式化/比较，没有四则运算 | ORM 层不需要算术；C# 的 `decimal` 运算属于业务层 |
@@ -103,7 +130,7 @@
 | 同步实现，无连接池/异步门面 | 第一轮只做「能正确跑通」的核心链路；池化与异步在后续轮次 |
 | SQLite 通过 DLL 动态加载 | 不链 libc / UCRT（`-lc` 在 Win7 起不来）；也便于替换 SQLite 版本 |
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
-| `Db/Query` 回 JSON 行列而非 C# 的 `DbTable` v3 二进制 | C# 侧 `DbController.Query` 自己写着「`ToPacket` 暂时有问题」；该格式是 NewLife `Binary` 序列化器的私有编码（`EncodeInt=7bit` 等），没有官方字节级规范，无 dotnet 环境就无法做「对齐验证」。按“不能猜”的规矩**不写不可验证的编解码**，其余路由（Login/Execute/…）仍是 JSON 信封可互通 |
+| `Db/Query` 默认回 JSON 行列（二进制需 `?format=packet`） | Rust 版也是 JSON；二进制模式是为 C# `DbTable.Read` 互通而加，两者并存不改变旧行为。C# 侧 `DbController.Query` 只有二进制一种形态（它的 `ToPacket` 自己标着“暂时有问题”），所以“跟 C# 一模一样”就只能二选一：默认 JSON 保持与 Rust 一致，需要 C# 互通时客户端显式要 packet |
 | Oracle 执行驱动未做 | 无 `oci.dll` / `libclntsh`、也无实例：写了也无法验证，违反“实测优先” |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）
