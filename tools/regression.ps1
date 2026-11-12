@@ -92,20 +92,31 @@ if (-not (Test-Path $buildZig)) {
         Invoke-External 'zig build codegen（重新生成实体）' $zigCmd.Source @(
             'build', 'codegen', '-Dmodel=examples/demo-model.xml', '-Dout=examples/entities'
         )
-        $prev = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try {
-            $out = (& git -C $root diff --quiet -- examples/entities 2>&1 | Out-String)
-            $code = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $prev
+        # git 可能不在 PATH（-NoProfile 下 Git 的 PATH 注入会失效）：先找一遍，找不到就显式 SKIP
+        $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $gitCmd) {
+            foreach ($p in @("$env:ProgramFiles\Git\cmd\git.exe", "${env:ProgramFiles(x86)}\Git\cmd\git.exe", "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe")) {
+                if (Test-Path $p) { $gitCmd = Get-Item $p; break }
+            }
         }
-        if ($code -eq 0) {
-            Add-Log '[PASS] 生成产物无漂移（git diff 为空）'
+        if (-not $gitCmd) {
+            Add-Log '[SKIP] 找不到 git（PATH 与常见安装路径都没有）——跳过生成漂移检查，请人工确认 examples\entities 已重新生成'
         } else {
-            if ($out.Trim().Length -gt 0) { Add-Log $out.Trim() }
-            Add-Log '[FAIL] examples/entities 与 demo-model.xml 不一致——请重新生成并提交'
-            $script:failed++
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = (& $gitCmd.Source -C $root diff --quiet -- examples/entities 2>&1 | Out-String)
+                $code = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prev
+            }
+            if ($code -eq 0) {
+                Add-Log '[PASS] 生成产物无漂移（git diff 为空）'
+            } else {
+                if ($out.Trim().Length -gt 0) { Add-Log $out.Trim() }
+                Add-Log '[FAIL] examples/entities 与 demo-model.xml 不一致——请重新生成并提交'
+                $script:failed++
+            }
         }
     } else {
         Add-Log '[SKIP] 没有 codegen 步骤或 examples\entities 目录——跳过生成漂移检查'

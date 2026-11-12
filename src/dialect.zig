@@ -37,6 +37,8 @@ pub const DatabaseKind = enum {
     dameng,
     iris,
     access,
+    /// SQL Server Compact Edition
+    sqlce,
     mongodb,
     /// NovaDb（复用 MySQL 协议）
     nova,
@@ -62,6 +64,7 @@ pub const DatabaseKind = enum {
         if (eq(t, "dameng") or eq(t, "dm")) return .dameng;
         if (eq(t, "iris")) return .iris;
         if (eq(t, "access") or eq(t, "oledb")) return .access;
+        if (eq(t, "sqlce") or eq(t, "sqlce35") or eq(t, "sqlserverce")) return .sqlce;
         if (eq(t, "mongodb") or eq(t, "mongo")) return .mongodb;
         if (eq(t, "novadb") or eq(t, "nova")) return .nova;
         return null;
@@ -87,6 +90,7 @@ pub const DatabaseKind = enum {
             .dameng => "DaMeng",
             .iris => "Iris",
             .access => "Access",
+            .sqlce => "SqlCe",
             .mongodb => "MongoDb",
             .nova => "NovaDb",
         };
@@ -100,11 +104,14 @@ pub const DatabaseKind = enum {
         return self == .sqlite or self == .duckdb or self == .access;
     }
 
-    /// 是否已实现完整语义（第一轮范围之外的一律显式 Unsupported）。
+    /// 是否已实现完整语义。
+    ///
+    /// 注：`mongodb`（文档库，无 SQL）与 `influxdb`（Line Protocol）没有 DDL/分页语义，
+    /// 因此它们永远返回 `false`；其余 SQL 方言均已按 C# 驱动里的类型表/分页实现对齐。
     pub fn isImplemented(self: DatabaseKind) bool {
         return switch (self) {
-            .sqlite, .mysql, .sqlserver, .oracle => true,
-            else => self.isPostgresFamily(),
+            .mongodb, .influxdb => false,
+            else => true,
         };
     }
 
@@ -128,7 +135,7 @@ pub const DatabaseKind = enum {
     pub fn pushQuoted(self: DatabaseKind, b: *Buf, ident: []const u8) !void {
         const style: struct { open: u8, close: u8, escape: u8 } = switch (self) {
             .mysql, .clickhouse, .tdengine => .{ .open = '`', .close = '`', .escape = '`' },
-            .sqlserver, .access => .{ .open = '[', .close = ']', .escape = ']' },
+            .sqlserver, .access, .sqlce => .{ .open = '[', .close = ']', .escape = ']' },
             else => .{ .open = '"', .close = '"', .escape = '"' },
         };
         try b.addByte(style.open);
@@ -150,7 +157,7 @@ pub const DatabaseKind = enum {
     pub fn pushPlaceholder(self: DatabaseKind, b: *Buf, index: usize) !void {
         switch (self) {
             .sqlserver => try b.fmt("@p{d}", .{index}),
-            .oracle => try b.fmt(":{d}", .{index + 1}),
+            .oracle, .dameng => try b.fmt(":{d}", .{index + 1}),
             else => {
                 if (self.isPostgresFamily()) {
                     try b.fmt("${d}", .{index + 1});
@@ -256,6 +263,180 @@ pub const DatabaseKind = enum {
                 .binary => gpa.dupe(u8, "blob"),
                 .json => gpa.dupe(u8, "clob"),
             },
+            // 达孟（C# `DaMeng.cs` 的 _DataTypes）：Oracle 系语法，占位符 `:n`
+            .dameng => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "BIT"),
+                .byte => gpa.dupe(u8, "TINYINT"),
+                .int16 => gpa.dupe(u8, "SMALLINT"),
+                .int32 => gpa.dupe(u8, "INT"),
+                .int64 => gpa.dupe(u8, "BIGINT"),
+                .single => gpa.dupe(u8, "REAL"),
+                .double => gpa.dupe(u8, "DOUBLE"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "DEC({d},{d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "DEC"),
+                .string => if (col.length > 0 and col.length < 4000)
+                    std.fmt.allocPrint(gpa, "VARCHAR({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "TEXT"),
+                .datetime => gpa.dupe(u8, "DATETIME"),
+                .binary => gpa.dupe(u8, "BLOB"),
+                .json => gpa.dupe(u8, "TEXT"),
+            },
+            // DB2（C# `DB2.cs`）：数字/字符串走 Oracle 风格类型名，时间只有 DATE
+            .db2 => switch (col.data_type) {
+                .boolean, .byte => gpa.dupe(u8, "NUMBER(1,0)"),
+                .int16 => gpa.dupe(u8, "NUMBER(5,0)"),
+                .int32 => gpa.dupe(u8, "NUMBER(10,0)"),
+                .int64 => gpa.dupe(u8, "NUMBER(20,0)"),
+                .single => gpa.dupe(u8, "BINARY_FLOAT"),
+                .double => gpa.dupe(u8, "BINARY_DOUBLE"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "NUMBER({d},{d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "NUMBER"),
+                .string => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "VARCHAR2({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "CLOB"),
+                .datetime => gpa.dupe(u8, "DATE"),
+                .binary => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "RAW({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "BLOB"),
+                .json => gpa.dupe(u8, "CLOB"),
+            },
+            // Firebird（C# `Firebird.cs`）：无布尔/无 Guid，Bool 用 SMALLINT
+            .firebird => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "SMALLINT"),
+                .byte => gpa.dupe(u8, "SMALLINT"),
+                .int16 => gpa.dupe(u8, "SMALLINT"),
+                .int32 => gpa.dupe(u8, "INT"),
+                .int64 => gpa.dupe(u8, "BIGINT"),
+                .single => gpa.dupe(u8, "FLOAT"),
+                .double => gpa.dupe(u8, "DOUBLE"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "DECIMAL({d},{d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "DECIMAL"),
+                .string => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "NVARCHAR({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "BLOB SUB_TYPE TEXT"),
+                .datetime => gpa.dupe(u8, "TIMESTAMP"),
+                .binary => gpa.dupe(u8, "BLOB"),
+                .json => gpa.dupe(u8, "BLOB SUB_TYPE TEXT"),
+            },
+            // HANA / IRIS / NovaDb（C# 三份 _DataTypes 几乎一致：MySQL 风格类型名）
+            .hana, .iris, .nova => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "TINYINT"),
+                .byte => gpa.dupe(u8, "TINYINT"),
+                .int16 => gpa.dupe(u8, "SMALLINT"),
+                .int32 => gpa.dupe(u8, "INT"),
+                .int64 => gpa.dupe(u8, "BIGINT"),
+                .single => gpa.dupe(u8, "FLOAT"),
+                .double => gpa.dupe(u8, "DOUBLE"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "DECIMAL({d},{d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "DECIMAL"),
+                .string => if (col.length > 0 and col.length < 5000)
+                    std.fmt.allocPrint(gpa, "VARCHAR({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "LONGTEXT"),
+                .datetime => gpa.dupe(u8, "DATETIME"),
+                .binary => gpa.dupe(u8, "BLOB"),
+                .json => gpa.dupe(u8, "LONGTEXT"),
+            },
+            // Access / SqlCe（C# 两份：SqlServer 家族类型名，标识符用 []）
+            .access => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "bit"),
+                .byte => gpa.dupe(u8, "tinyint"),
+                .int16 => gpa.dupe(u8, "smallint"),
+                .int32 => gpa.dupe(u8, "int"),
+                .int64 => gpa.dupe(u8, "integer"),
+                .single => gpa.dupe(u8, "single"),
+                .double => gpa.dupe(u8, "real"),
+                .decimal => gpa.dupe(u8, "money"),
+                .string => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "nvarchar({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "ntext"),
+                .datetime => gpa.dupe(u8, "datetime"),
+                .binary => gpa.dupe(u8, "binary"),
+                .json => gpa.dupe(u8, "ntext"),
+            },
+            .sqlce => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "bit"),
+                .byte => gpa.dupe(u8, "tinyint"),
+                .int16 => gpa.dupe(u8, "smallint"),
+                .int32 => gpa.dupe(u8, "int"),
+                .int64 => gpa.dupe(u8, "bigint"),
+                .single => gpa.dupe(u8, "real"),
+                .double => gpa.dupe(u8, "float"),
+                .decimal => gpa.dupe(u8, "money"),
+                .string => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "nvarchar({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "ntext"),
+                .datetime => gpa.dupe(u8, "datetime"),
+                .binary => gpa.dupe(u8, "varbinary(8000)"),
+                .json => gpa.dupe(u8, "ntext"),
+            },
+            // DuckDB / ClickHouse：C# 侧没有静态类型表（走驱动自己的 schema），
+            // 这里按两者的**原生类型名**给出（DuckDB 兼容 PG 类型名，ClickHouse 用 String/Int*）
+            .duckdb => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "BOOLEAN"),
+                .byte => gpa.dupe(u8, "TINYINT"),
+                .int16 => gpa.dupe(u8, "SMALLINT"),
+                .int32 => gpa.dupe(u8, "INTEGER"),
+                .int64 => gpa.dupe(u8, "BIGINT"),
+                .single => gpa.dupe(u8, "REAL"),
+                .double => gpa.dupe(u8, "DOUBLE"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "DECIMAL({d},{d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "DECIMAL(18,4)"),
+                .string => gpa.dupe(u8, "VARCHAR"),
+                .datetime => gpa.dupe(u8, "TIMESTAMP"),
+                .binary => gpa.dupe(u8, "BLOB"),
+                .json => gpa.dupe(u8, "JSON"),
+            },
+            .clickhouse => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "UInt8"),
+                .byte => gpa.dupe(u8, "UInt8"),
+                .int16 => gpa.dupe(u8, "Int16"),
+                .int32 => gpa.dupe(u8, "Int32"),
+                .int64 => gpa.dupe(u8, "Int64"),
+                .single => gpa.dupe(u8, "Float32"),
+                .double => gpa.dupe(u8, "Float64"),
+                .decimal => if (col.precision > 0)
+                    std.fmt.allocPrint(gpa, "Decimal({d}, {d})", .{ col.precision, col.scale })
+                else
+                    gpa.dupe(u8, "Decimal(18, 4)"),
+                .string => gpa.dupe(u8, "String"),
+                .datetime => gpa.dupe(u8, "DateTime"),
+                .binary => gpa.dupe(u8, "String"),
+                .json => gpa.dupe(u8, "String"),
+            },
+            // TDengine（C# `Tdengine.cs` 的 _DataTypes）：无布尔以外的复杂类型，时间固定 TIMESTAMP
+            .tdengine => switch (col.data_type) {
+                .boolean => gpa.dupe(u8, "BOOL"),
+                .byte => gpa.dupe(u8, "TINYINT"),
+                .int16 => gpa.dupe(u8, "SMALLINT"),
+                .int32 => gpa.dupe(u8, "INT"),
+                .int64 => gpa.dupe(u8, "BIGINT"),
+                .single => gpa.dupe(u8, "FLOAT"),
+                .double, .decimal => gpa.dupe(u8, "DOUBLE"),
+                .string => if (col.length > 0)
+                    std.fmt.allocPrint(gpa, "NCHAR({d})", .{col.length})
+                else
+                    gpa.dupe(u8, "NCHAR(64)"),
+                .datetime => gpa.dupe(u8, "TIMESTAMP"),
+                .binary => gpa.dupe(u8, "BINARY(64)"),
+                .json => gpa.dupe(u8, "NCHAR(256)"),
+            },
             else => error.Unsupported,
         };
     }
@@ -270,10 +451,18 @@ pub const DatabaseKind = enum {
     }
 
     /// 自增列的列内联修饰（null 表示该方言不用内联写法）。
+    ///
+    /// 来源：`DaMeng.cs`（`IDENTITY NOT NULL`）、`Hana/IRIS/NovaDb`（`AUTO_INCREMENT`）、
+    /// `Access.cs`（`AUTOINCREMENT(1,1)`）、`SqlCe.cs`（`IDENTITY(1,1)`）；
+    /// DB2 / Firebird / DuckDB 用的是标准 SQL 的 identity 子句。
     fn identityClause(self: DatabaseKind) ?[]const u8 {
         return switch (self) {
-            .mysql => " AUTO_INCREMENT",
-            .sqlserver => " IDENTITY(1,1)",
+            .mysql, .hana, .iris, .nova => " AUTO_INCREMENT",
+            .sqlserver, .sqlce => " IDENTITY(1,1)",
+            .dameng => " IDENTITY",
+            .db2, .duckdb => " GENERATED ALWAYS AS IDENTITY",
+            .firebird => " GENERATED BY DEFAULT AS IDENTITY",
+            .access => " AUTOINCREMENT(1,1)",
             else => null,
         };
     }
@@ -624,7 +813,8 @@ pub const DatabaseKind = enum {
     ) ![]u8 {
         if (!self.isImplemented()) return error.Unsupported;
 
-        if (self == .oracle) {
+        // ROWNUM 双层包装（Oracle / 达孟 兼容 11g 写法）
+        if (self == .oracle or self == .dameng) {
             // ROWNUM 双层包装（兼容 11g）：整条语句重建，不能在前缀上追加
             var inner = Buf.init(gpa);
             defer inner.deinit();
@@ -651,6 +841,47 @@ pub const DatabaseKind = enum {
             .sqlserver => {
                 if (order_sql.len == 0) try b.add(" ORDER BY (SELECT NULL)");
                 try b.fmt(" OFFSET {d} ROWS FETCH NEXT {d} ROWS ONLY", .{ offset, size });
+            },
+            // DB2（C# `DB2.cs`）：rownum 双层；首页无排序时用单层 rownum 优化
+            .db2 => {
+                const inner = try b.toOwnedSlice();
+                defer gpa.free(inner);
+                var out = Buf.init(gpa);
+                defer out.deinit();
+                if (offset == 0 and std.mem.indexOf(u8, inner, "order by") == null and order_sql.len == 0) {
+                    try out.fmt("Select * From ({s}) T0 Where rownum<={d}", .{ inner, size });
+                } else {
+                    try out.fmt("Select * From (Select T0.*, rownum as rowNumber From ({s}) T0) T1 Where rowNumber>{d} And rowNumber<={d}", .{ inner, offset, offset + size });
+                }
+                return out.toOwnedSlice();
+            },
+            // Firebird（C# `Firebird.cs`）：`ROWS a TO b`（1 基，闭区间）
+            .firebird => {
+                const inner = try b.toOwnedSlice();
+                defer gpa.free(inner);
+                if (offset == 0) {
+                    return std.fmt.allocPrint(gpa, "{s} ROWS 1 TO {d}", .{ inner, size });
+                }
+                return std.fmt.allocPrint(gpa, "{s} ROWS {d} TO {d}", .{ inner, offset + 1, offset + size });
+            },
+            // Access / SqlCe：只有 TOP，没有 OFFSET 语义
+            .access, .sqlce => {
+                if (offset != 0) {
+                    std.debug.print(
+                        "[zcode] {s} 不支持 OFFSET 分页（只有 TOP），offset={d}；请改用 MSSplit 的 TOP 算法或换库\n",
+                        .{ self.name(), offset },
+                    );
+                    return error.Unsupported;
+                }
+                const inner = try b.toOwnedSlice();
+                defer gpa.free(inner);
+                if (std.mem.startsWith(u8, inner, "Select ")) {
+                    var out = Buf.init(gpa);
+                    defer out.deinit();
+                    try out.fmt("Select Top {d} {s}", .{ size, inner["Select ".len..] });
+                    return out.toOwnedSlice();
+                }
+                return std.fmt.allocPrint(gpa, "Select Top {d} * From ({s}) T0", .{ size, inner });
             },
             else => try b.fmt(" LIMIT {d} OFFSET {d}", .{ size, offset }),
         }
@@ -1000,11 +1231,77 @@ test "默认值渲染" {
     try std.testing.expect(std.mem.indexOf(u8, sqlite_sql, "NOT NULL") == null);
 }
 
-test "未实现的方言显式报错" {
+test "文档库/时序库之外一律可生成 SQL（原「未实现方言」已补齐）" {
     const a = std.testing.allocator;
     const t = sampleTable();
-    try std.testing.expectError(error.Unsupported, DatabaseKind.clickhouse.createTableAlloc(a, &t));
+
+    // ClickHouse 现在能建表（类型名走原生 ClickHouse 类型）
+    const ddl = try DatabaseKind.clickhouse.createTableAlloc(a, &t);
+    defer {
+        for (ddl) |stmt| a.free(stmt);
+        a.free(ddl);
+    }
+    try std.testing.expect(ddl.len > 0);
+
+    // 只有「不是 SQL 库」的两家保持未实现：MongoDB（文档库）、InfluxDB（Line Protocol）
     try std.testing.expect(!DatabaseKind.mongodb.isImplemented());
+    try std.testing.expect(!DatabaseKind.influxdb.isImplemented());
+    try std.testing.expectError(error.Unsupported, DatabaseKind.mongodb.createTableAlloc(a, &t));
+}
+
+test "新补方言：类型名 / 占位符 / 分页（对照 C# 各驱动的 _DataTypes）" {
+    const a = std.testing.allocator;
+
+    const col = ColumnMeta{ .name = "C", .data_type = .int32 };
+    const sc = ColumnMeta{ .name = "S", .data_type = .string, .length = 50 };
+    const dc = ColumnMeta{ .name = "D", .data_type = .decimal, .precision = 18, .scale = 4 };
+
+    const cases = [_]struct { kind: DatabaseKind, int32: []const u8, string50: []const u8, decimal: []const u8 }{
+        .{ .kind = .dameng, .int32 = "INT", .string50 = "VARCHAR(50)", .decimal = "DEC(18,4)" },
+        .{ .kind = .db2, .int32 = "NUMBER(10,0)", .string50 = "VARCHAR2(50)", .decimal = "NUMBER(18,4)" },
+        .{ .kind = .firebird, .int32 = "INT", .string50 = "NVARCHAR(50)", .decimal = "DECIMAL(18,4)" },
+        .{ .kind = .hana, .int32 = "INT", .string50 = "VARCHAR(50)", .decimal = "DECIMAL(18,4)" },
+        .{ .kind = .iris, .int32 = "INT", .string50 = "VARCHAR(50)", .decimal = "DECIMAL(18,4)" },
+        .{ .kind = .nova, .int32 = "INT", .string50 = "VARCHAR(50)", .decimal = "DECIMAL(18,4)" },
+        .{ .kind = .access, .int32 = "int", .string50 = "nvarchar(50)", .decimal = "money" },
+        .{ .kind = .sqlce, .int32 = "int", .string50 = "nvarchar(50)", .decimal = "money" },
+        .{ .kind = .duckdb, .int32 = "INTEGER", .string50 = "VARCHAR", .decimal = "DECIMAL(18,4)" },
+        .{ .kind = .clickhouse, .int32 = "Int32", .string50 = "String", .decimal = "Decimal(18, 4)" },
+        .{ .kind = .tdengine, .int32 = "INT", .string50 = "NCHAR(50)", .decimal = "DOUBLE" },
+    };
+    for (cases) |c| {
+        const i32_type = try c.kind.fieldTypeAlloc(a, col);
+        defer a.free(i32_type);
+        try std.testing.expectEqualStrings(c.int32, i32_type);
+
+        const s_type = try c.kind.fieldTypeAlloc(a, sc);
+        defer a.free(s_type);
+        try std.testing.expectEqualStrings(c.string50, s_type);
+
+        const d_type = try c.kind.fieldTypeAlloc(a, dc);
+        defer a.free(d_type);
+        try std.testing.expectEqualStrings(c.decimal, d_type);
+    }
+
+    // 占位符：达梦走 `:n`（Oracle 口径）
+    var b = Buf.init(a);
+    defer b.deinit();
+    try DatabaseKind.dameng.pushPlaceholder(&b, 0);
+    try std.testing.expectEqualStrings(":1", b.slice());
+
+    // 分页：DB2 rownum 双层、Firebird `ROWS a TO b`、Access 只支持首页 TOP
+    const db2_page = try DatabaseKind.db2.applyPagingAlloc(a, "Select * From T", "Order By Id", 10, 5);
+    defer a.free(db2_page);
+    try std.testing.expect(std.mem.indexOf(u8, db2_page, "rownum") != null);
+
+    const fb_page = try DatabaseKind.firebird.applyPagingAlloc(a, "Select * From T", "", 10, 5);
+    defer a.free(fb_page);
+    try std.testing.expectEqualStrings("Select * From T ROWS 11 TO 15", fb_page);
+
+    const access_page = try DatabaseKind.access.applyPagingAlloc(a, "Select * From T", "", 0, 5);
+    defer a.free(access_page);
+    try std.testing.expectEqualStrings("Select Top 5 * From T", access_page);
+    try std.testing.expectError(error.Unsupported, DatabaseKind.access.applyPagingAlloc(a, "Select * From T", "", 5, 5));
 }
 
 test "Provider 解析" {

@@ -68,9 +68,19 @@
 - 默认值：数值原样；布尔 PG 系 `TRUE/FALSE`、其它 `1/0`；字符串单引号包裹并双写单引号；MySQL 的 TEXT/BLOB 列用表达式默认。
 - 新增列：**无默认值时不追加 `NOT NULL`**（存量数据无法通过约束）。
 
-**未实现方言**：`duckdb` / `clickhouse` / `tdengine` / `influxdb` / `hana` / `firebird` / `db2` / `dameng` /
-`iris` / `access` / `mongodb` / `nova` 在枚举与连接串解析里占位，但类型映射/DDL **明确返回 `error.Unsupported`**
-（`DatabaseKind.isImplemented()` 可查）——避免生成“看起来能跑”的错误 SQL。
+**方言覆盖**（`isImplemented()`）：SQLite / MySQL / SQL Server / Oracle / PostgreSQL 系（KingBase、HighGo、VastBase）/
+DuckDB / ClickHouse / TDengine / HANA / Firebird / DB2 / 达孟（DaMeng）/ IRIS / Access / SqlCe / NovaDb ——
+类型映射按 C# 各驱动的 `_DataTypes` 表逐项拷录（`DaMeng.cs` / `DB2.cs` / `Firebird.cs` / `Hana.cs` / `IRIS.cs` /
+`Access.cs` / `SqlCe.cs` / `NovaDb.cs` / `Tdengine.cs`）；自增子句与分页也按各自 `GetFieldConstraints` / `PageSplit` 实现
+（Db2 与达孟 rownum 双层、Firebird `ROWS a TO b`、Access/SqlCe 只支持首页 `TOP`、HANA/IRIS/Nova `AUTO_INCREMENT`…）。
+
+**仍未实现**：`mongodb`（文档库，无 SQL）与 `influxdb`（Line Protocol）—— 它们**不是 SQL 库**，`isImplemented()` 永远为 false，
+建表/分页一律 `error.Unsupported`。DuckDB / ClickHouse 在 C# 侧没有静态类型表（走驱动自带 schema），
+这里的类型名按两者**原生类型名**给出（DuckDB 兼容 PG 类型名、ClickHouse 用 `Int*/String/Decimal(p, s)`）。
+
+> 口径说明（2026-11-12）：以上方言只做了 **SQL 生成层**（类型/DDL/分页/占位符/引用）并全部有黄金断言；
+> 除 SQLite/MySQL/PostgreSQL/SQL Server 外的驱动**未接执行层**，也没有真实库可实测——
+> 属于用户明确同意的「先迁移代码，有环境再验证」范围。
 
 ### 2.3 查询与 SQL 组装
 
@@ -282,7 +292,7 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `DataAccessLayer/WindowFunction` | `window.zig` | 已迁移 |
 | `DataAccessLayer/ReadWriteStrategy` | `readwrite.zig` | 已迁移 |
 | `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL） | 部分（PG / SQL Server 未做） |
-| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig` 5 族 + `zzig.db.{sqlite,mysql,postgres,tds}` | 部分（见 §2.2 未实现方言） |
+| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds}` 执行层 | 部分：SQL 生成层齐了；执行层只有 4 家驱动（其余无客户端库/无实例） |
 | `DataAccessLayer/DbPackage`（数据包导入导出） | — | **未做** |
 | `DataAccessLayer/XDbConnectionStringBuilder` | `dal.parseConnectionString` | 已迁移 |
 | `Entity/Entity*`、`EntitySession`、`IEntityPersistence` | `entity.zig`、`dbtable.zig`、`interceptor.zig` | 已迁移（按表/对象/脏更新三层） |
