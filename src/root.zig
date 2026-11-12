@@ -104,6 +104,30 @@ pub const window = @import("window.zig");
 pub const pagesplit = @import("pagesplit.zig");
 /// 字段缓存（键列 → 值列整表字典，写后自动失效，对应 C# `Cache/FieldCache`）
 pub const fieldcache = @import("fieldcache.zig");
+/// XCode 全局设置（对应 C# `Setting.cs` / `XCodeSetting`）
+pub const setting = @import("setting.zig");
+/// 保存模式（对应 C# `DataAccessLayer/SaveModes.cs`）
+pub const SaveModes = setting.SaveModes;
+/// SQL 模版 / 显示位置三态 / 字段排序模式（对应 C# `Configuration/SqlTemplate.cs` 等）
+pub const sqltemplate = @import("sqltemplate.zig");
+pub const SqlTemplate = sqltemplate.SqlTemplate;
+pub const ShowInOption = sqltemplate.ShowInOption;
+pub const ModelSortMode = sqltemplate.ModelSortMode;
+/// 表达式树（文本 / 字段 / 格式化 / 逗号拼接，对应 C# `Model/*Expression.cs`）
+pub const expression = @import("expression.zig");
+/// 批量查找器 + 批操作选项（对应 C# `Model/BatchFinder.cs` / `Model/BatchOption.cs`）
+pub const batch = @import("batch.zig");
+pub const BatchFinder = batch.BatchFinder;
+pub const BatchOption = batch.BatchOption;
+/// 缓存层四件：惰性串行消费者 / 跨进程失效协调 / 运行数据缓存 / 表缓存
+/// （对应 C# `Cache/` 的 `LazyConsumer`、`CacheInvalidator`、`DataCache`、`DbCache`）
+pub const dbcache = @import("dbcache.zig");
+pub const LazyConsumer = dbcache.LazyConsumer;
+pub const CacheInvalidator = dbcache.CacheInvalidator;
+pub const DataCache = dbcache.DataCache;
+pub const DbCache = dbcache.DbCache;
+/// 数据包（表级导出 / 导入 / 跳库同步，对应 C# `DataAccessLayer/DbPackage.cs`）
+pub const dbpackage = @import("dbpackage.zig");
 pub const Error = error{
     Model,
     Xml,
@@ -148,4 +172,10 @@ test {
     _ = @import("window.zig");
     _ = @import("pagesplit.zig");
     _ = @import("fieldcache.zig");
+    _ = @import("setting.zig");
+    _ = @import("sqltemplate.zig");
+    _ = @import("expression.zig");
+    _ = @import("batch.zig");
+    _ = @import("dbcache.zig");
+    _ = @import("dbpackage.zig");
 }

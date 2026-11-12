@@ -27,7 +27,7 @@
 | 写入拦截器 | `EntityInterceptor` / `TimeModule` / `UserModule` / `TraceModule` | `src/interceptor.rs` | `src/interceptor.zig` | ✅ 审计列自动补全（插入补、更新刷），单条与批量都生效 |
 | 导航属性 | `NavigationLoader` / `NavigationExtensions` | `src/navigation.rs` | `src/navigation.zig` | ✅ 单条 / 列表 / **批量填充（消除 N+1）**；多级级联由调用方组合 |
 | 树形实体 | `Tree/EntityTree` | `src/tree.rs` | `src/tree.zig` | ✅ 子节点 / 后代（BFS）/ 向上路径 / 根节点；深度与节点数护栏 |
-| 反向工程 | `DbMetaData.GetSchema` + XCodeTool | `reverse.rs` | `src/reverse.zig`（`zcodegen --reverse`） | ✅ SQLite/MySQL：表/列/主键/自增/索引/注释 → `Model.xml` |
+| 反向工程 | `DbMetaData.GetSchema` + XCodeTool | `reverse.rs` | `src/reverse.zig`（`zcodegen --reverse`） | ✅ **SQLite / MySQL / PostgreSQL / SQL Server** 四家：表/列/主键/自增/索引/注释 → `Model.xml`（PG 与 SQL Server 的查询语句尚未在真库实测，见 §2.8） |
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
 | 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**`Db/Query` 两种载荷**：默认 JSON 行列；**`?format=packet` 返回 C# `DbTable` v3 二进制**（`src/dbtable_packet.zig`，字节级对齐真实 C# 运行时，C# 侧 `new DbTable().Read(pk)` 直接可读） |
@@ -36,6 +36,12 @@
 | 数据抽取 | `Transform/{IdExtracter,TimeExtracter,PagingExtracter,ExtractSetting}` | `src/transform.rs` | `src/extract.zig` | ✅ 三个抽取器都是「一次一批」迭代 + `total` 计数 + `done` 终止：Id 主键步进 / 时间窗切片（空窗加大步进）/ 分页兜底；`Setting` 含起止时间、偏移秒、步进、批大小 |
 | 窗口函数 | `DataAccessLayer/WindowFunction` | — | `src/window.zig` | ✅ `ROW_NUMBER` / `RANK` / `DENSE_RANK` / 聚合窗口 `FUNC(col) OVER(...)`；缺省别名与 C# 一致（`RowNum` / `Rank` / `DenseRank` / `{func}_{column}`） |
 | 传统 MsSql 分页 | `DataAccessLayer/MSPageSplit` | — | `src/pagesplit.zig` | ✅ `topNotIn` / `doubleTop` / `maxMin` / `rowNumber` 四种算法 + 与 C# 相同的选择顺序 + 首页直取 `TOP`；黄金 SQL 断言，`rowNumber` 分支在真 SQLite 上翻页验证 |
+| 表达式树 | `Model/{Expression,FieldExpression,FormatExpression,ConcatExpression}` | — | `src/expression.zig` | ✅ 文本（`Or` 自动加括号）/ 字段（按方言引用）/ 格式化（`{0}` 列名、`{1}` 右值，参数化与字面量两种口径）/ 逗号拼接（可嵌套） |
+| 批量查找器 | `Model/{BatchFinder,BatchOption}` | — | `src/batch.zig` | ✅ 登记主键去重（跳过 0 / 空串）→ 按 `batch_size` 分批 `IN` 预取、游标只前进、可替换 loader；`BatchOption` 作为批操作参数载体 |
+| 全局设置 | `Setting.cs` / `XCodeSetting` | — | `src/setting.zig` | ✅ 字段与默认值逐项对齐（Debug/ShowSQL/TraceSQLTime/UseParameter/BatchSize/Migration/缓存过期…），支持 `Key=Value` 文本读写与未识别键上报 |
+| SQL 模版 / 显示选项 | `Configuration/{SqlTemplate,ShowInOption}`、`Attributes/ModelSortMode` | — | `src/sqltemplate.zig` | ✅ `-- [方言]` 分段解析 + 回落默认；`ShowInOption` 三种写法（具名列表+宏 / 管道 5 段 / 5 字符掩码）；`ModelSortMode` 枚举 |
+| 缓存协调与表缓存 | `Cache/{CacheInvalidator,DataCache,DbCache,LazyConsumer}` | — | `src/dbcache.zig` | ✅ 分布式版本号（可插 Provider + 内存实现）联动本地失效；运行数据缓存（表行数 + 字段键值，可落文本）；**表当缓存**（Name/Value/CreateTime/ExpiredTime + 过期清理）；惰性串行消费者（空闲不占线程） |
+| 数据包 | `DataAccessLayer/DbPackage` | — | `src/dbpackage.zig` | ✅ 表级导出/导入/跨库同步（按页抽取，内存只留一页）；四种保存模式；**未做**：`.gz` / `zip` 多表归档（本仓与 zzig 都没有 zip 实现）、Actor 双线程并行 |
 | 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
 
 ## 2. 逐项语义对齐（已实现部分）
@@ -209,6 +215,28 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 
 `tools/regression.ps1` 已把这三条「生成 → 编译 → 真库」链路纳入一键回归（任一夹具缺失显式 `SKIP` 并说明原因）。
 
+### 2.8 缓存协调 / 表达式 / 批查找 / 设置 / 模版 / 数据包 / PG·SQL Server 反向工程（2026-11-12 第二十二轮）
+
+这一轮把台账里剩下的「中小件」一次补完，共 7 个新模块：
+
+| 模块 | 对齐的 C# 源 | 关键语义 |
+|---|---|---|
+| `src/setting.zig` | `Setting.cs` / `XCodeSetting` | 字段与默认值逐项照抄（`Debug=true`、`ShowSQL=true`、`TraceSQLTime=1000`、`BatchSize=5000`、`Migration=On`、`EntityCacheExpire=10`、`FieldCacheExpire=3600` …）；`Key=Value` 文本读写，**不认识的键与非法值都进 `unknown` 上报**，不静默吞掉 |
+| `src/sqltemplate.zig` | `Configuration/SqlTemplate`、`ShowInOption`、`Attributes/ModelSortMode` | `-- [MySql]` 分段；同名方言后者覆盖；取不到方言回落默认。`ShowInOption` 三种写法与优先级（含 `|` → 管道；`[10A?-]{5}` → 掩码；否则具名列表 + 宏顺序覆盖） |
+| `src/expression.zig` | `Model/{Expression,FieldExpression,FormatExpression,ConcatExpression}` | `Or` 按**独立单词**判定（等价 `\bOr\b`，`OrderId` 不触发）；`FieldExpression` 按方言引用；`FormatExpression` 参数化走占位符、非参数化内联字面量（`Value.toSqlLiteralAlloc`）；`ConcatExpression` 逗号拼接可嵌套 |
+| `src/batch.zig` | `Model/{BatchFinder,BatchOption}` | 跳过 `0` / 空串、按键去重、游标只前进、每批 `IN` 预取、未登记者报 `error.NotInKeys`；`loader` 可替换 |
+| `src/dbcache.zig` | `Cache/{CacheInvalidator,DataCache,DbCache,LazyConsumer}` | 版本号键名沿用 C# 的 `XCode:Cache:Ver:{table}`；`poll()` 比对远端版本后失效本地缓存；`DbCache` 过期项读取时顺手删除、`removeExpired()` 定时清理 |
+| `src/dbpackage.zig` | `DataAccessLayer/DbPackage` | 表级导出/导入/跨库同步；文本包格式（`\N` / `\t` 转义 / 二进制 `0x<hex>`）；四种保存模式 |
+| `src/reverse.zig`（扩展） | `DbMetaData.GetSchema` | 新增 **PostgreSQL**（`pg_class` + `information_schema` + `pg_index`）与 **SQL Server**（`INFORMATION_SCHEMA` + `sys.indexes`） |
+
+**验证口径（如实说明）**：
+
+- `setting` / `sqltemplate` / `expression` / `batch` / `dbcache` / `dbpackage` 全部有单元测试（真 SQLite 内存库），
+  `zig build test` 退出码 0；
+- `reverse` 的 **PG / SQL Server**：只做了「类型映射」与「SQL 字面量转义」的单元测试，
+  **取结构的 SQL 尚未在真库跑过**（本机无 PG / SQL Server 实例）。按用户口径「先迁移代码，有环境再实测」记录在此，
+  下次有实例时必须补真库用例（`zcodegen --reverse`）。
+
 ## 3. 与 C#/Rust 的行为差异（有意为之）| 差异 | 原因 |
 |---|---|
 | `Decimal` 只有解析/格式化/比较，没有四则运算 | ORM 层不需要算术；C# 的 `decimal` 运算属于业务层 |
@@ -269,6 +297,13 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 8. **数组重复写法 `[_]u8{0} ** N` 在 0.17.1 直接报错**：`error: binary operator '*' has whitespace on one side,
    but not the other`（解析成两个 `*`）。用 `@memset(&buf, 0)` 或把初值逐个写出来（本轮 TDS 驱动与测试都踩到）。
 9. **`std.posix.getenv` 已不存在**（0.17 的 std 里没有），测试要开关就走文件级变量，别读环境变量。
+10. **`std.Thread.Mutex` / `std.Thread.Condition` / `std.Thread.sleep` 已移除**：同步原语楼到需要 `Io` 实例的
+    `std.Io.Mutex`。本仓做法：用公共库 `zzig.compat.Mutex`（自旋 + `Thread.yield`）做临界区、`zzig.compat.sleep` 睡，
+    并**不用条件变量**（worker 发现队列空就退出，下次 submit 重新拉起）。
+11. **`zzig.Buf` 不暴露分配器**：需要临时分配时自己收 `gpa` 传进去，不能从 `Buf` 里拿。
+12. **注释里不能出现制表符**：`error: comment contains invalid byte: '\t'`。文档注释里的表格用 `<TAB>` 占位。
+13. **函数名不能是 `and`**（关键字）：`ConcatExpression.and` 改名 `append`。
+14. **互相递归的函数不能用推导错误集**（`dependency loop with length 2`）：显式写 `RenderError!void`。
 
 ## 6. 覆盖台账（按 C# 源目录逐项对账）
 
@@ -282,19 +317,22 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Cache/EntityCache`、`CacheBase` | `cache.Cache(T)`（整表 + 写后失效 + TTL） | 已迁移 |
 | `Cache/` 的单对象缓存（`Meta.SingleCache` 语义） | `cache.SingleCache(T)` | 已迁移 |
 | `Cache/FieldCache`（键列→值列整表字典） | `fieldcache.FieldCache`（物理列名工作、写后自动失效、TTL） | 已迁移 |
-| `Cache/CacheInvalidator`、`Cache/DataCache`、`Cache/DbCache` | — | **未做** |
+| `Cache/CacheInvalidator`（分布式版本号协调） | `dbcache.CacheInvalidator`（可插 Provider + `MemoryProvider`，`poll()` 发现变化即过期本地缓存） | 已迁移 |
+| `Cache/DataCache`（运行数据缓存：表行数 + 字段键值） | `dbcache.DataCache`（文本档读写，可往返） | 已迁移 |
+| `Cache/DbCache`（用表当缓存 + 过期清理） | `dbcache.DbCache`（Name/Value/CreateTime/ExpiredTime，列名可配） | 已迁移 |
+| `Cache/LazyConsumer`（惰性串行消费者） | `dbcache.LazyConsumer`（空闲不占线程，严格按序） | 已迁移 |
 | `Configuration/FieldExtension`、`FieldOption` | `model.ColumnMeta`（长度/精度/默认值/DataScale/Map/ShowIn 等） | 等价 |
 | `Configuration/TableItem`（反射实体→模型） | 反向方向不需要：Zig 以 `Model.xml` 为唯一源；**正向**由 `codegen.zig`（`XCodeTool` 等价）完成 | 等价 |
-| `Configuration/SqlTemplate`、`ShowInOption`、`ModelSortMode` | — | **未做**（面板/工具层） |
+| `Configuration/SqlTemplate`、`ShowInOption`、`ModelSortMode` | `sqltemplate.zig`（`-- [方言]` 分段、五区三态三写法、基类/派生类优先） | 已迁移 |
 | `DataAccessLayer/DAL*.cs`、`IDbSession`、`DbSession` | `dal.zig`、`session.zig` | 已迁移 |
 | `DataAccessLayer/Common/ConnectionPool` | `pool.zig` | 已迁移 |
 | `DataAccessLayer/InsertBuilder`、`SelectBuilder` | `sqlbuild.zig`、`query.zig`（结构化条件）+ `pagesplit.zig` 的 `Builder` | 已迁移（SelectBuilder 只做了分页需要的子集） |
 | `DataAccessLayer/MSPageSplit` | `pagesplit.zig`（`topNotIn` / `doubleTop` / `maxMin` / `rowNumber` + 选择顺序） | 已迁移 |
 | `DataAccessLayer/WindowFunction` | `window.zig` | 已迁移 |
 | `DataAccessLayer/ReadWriteStrategy` | `readwrite.zig` | 已迁移 |
-| `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL） | 部分（PG / SQL Server 未做） |
+| `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL / PostgreSQL / SQL Server） | 已迁移（PG / SQL Server 的查结构 SQL 尚未在真库实测） |
 | `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds}` 执行层 | 部分：SQL 生成层齐了；执行层只有 4 家驱动（其余无客户端库/无实例） |
-| `DataAccessLayer/DbPackage`（数据包导入导出） | — | **未做** |
+| `DataAccessLayer/DbPackage`（数据包导入导出） | `dbpackage.zig`（表级导出/导入/跨库同步，四种保存模式） | 部分：`.gz` / `zip` 多表归档与 Actor 并行未做 |
 | `DataAccessLayer/XDbConnectionStringBuilder` | `dal.parseConnectionString` | 已迁移 |
 | `Entity/Entity*`、`EntitySession`、`IEntityPersistence` | `entity.zig`、`dbtable.zig`、`interceptor.zig` | 已迁移（按表/对象/脏更新三层） |
 | `Entity/EntityQueue`、`EntitySplit`、`EntityTransaction` | `entity_queue.zig`、`shards.zig`、`session.zig`（嵌套事务 + Scoped） | 已迁移 |
@@ -304,8 +342,8 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Linq/EntityQueryProvider`（表达式树 → SQL） | `query.zig`（结构化 `Where`，无表达式树） | 不适用（Zig 无 LINQ） |
 | `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | — | **未做**（独立子系统，~500KB C#；对应 Rust 生态的 `Pek.RPermissions`） |
 | `Model/WhereExpression`、`OrderExpression`、`FieldExpression`、`InExpression`、`LikeExpression` | `query.zig`（14 种运算符 + 排序/分页） | 已迁移 |
-| `Model/ConcatExpression`、`FormatExpression` | `sqlbuild` 的字符串拼接能力部分覆盖；函数式拼接**未做** | 部分 |
-| `Model/BatchFinder`、`BatchOption` | — | **未做** |
+| `Model/ConcatExpression`、`FormatExpression` | `expression.zig`（`ConcatExpression` / `FormatExpression` / `FieldExpression` / `Expression`） | 已迁移 |
+| `Model/BatchFinder`、`BatchOption` | `batch.zig`（批量 `IN` 预取 + 去重 + 可替换 loader；`BatchOption` 参数载体） | 已迁移 |
 | `Model/Navigation*` | `navigation.zig` | 已迁移 |
 | `Model/IPModule`、`TimeModule`、`TraceModule`、`UserModule` | `interceptor.zig` | 已迁移 |
 | `Services/DbServer`、`DbService`、`DbClient`、`DbController` | `dbservice.zig`、`dbclient.zig`（服务端在 `zzig` HTTP） | 已迁移 |
@@ -316,8 +354,8 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Exceptions/*` | `root.zig` 的 `Error` 错误集 + 具体错误名 | 等价 |
 | `InfluxDB/`、`TDengine/`（时序库专用协议驱动） | — | **未做** |
 | `XCodeTool/`（代码生成模板引擎） | `codegen.zig` + `tools/zcodegen.zig`（`Model.xml` → Zig 实体，带元数据/索引/辅助函数）+ `tools/gencheck.zig` 生成后自检 | 已迁移（Razor 模板引擎不适用：Zig 侧只需生成代码，不需要模板语言） |
-| `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | — | **未做**（日志开关由调用方决定） |
+| `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | `setting.zig`（字段与默认值逐项对齐 + `Key=Value` 读写） | 已迁移（无面板元数据） |
 
 **一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取）已覆盖；
-**剩余最大块是 `Membership` 整套**，其次是 `FieldCache`/`CacheInvalidator`、`DbPackage`、`BatchFinder`、
-`EntityExtension` 的扩展方法集、PG/SQL Server 的反向工程、20+ 小众方言与两个时序库驱动。
+**剩余最大块是 `Membership` 整套**，其次是 `EntityExtension` 的扩展方法集、`InfluxDB` / `TDengine` 两个时序库驱动、
+`DbPackage` 的 zip 多表归档。
