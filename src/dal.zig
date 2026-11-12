@@ -37,6 +37,8 @@ pub const ConnectionOptions = struct {
     user: []const u8 = "",
     password: []const u8 = "",
     database: []const u8 = "",
+    /// SQL Server 命名管道路径（`\\.\pipe\...`）。非空时忽略 server/port——LocalDB 只能走管道。
+    pipe_name: []const u8 = "",
     /// MySQL TLS 档位（`SslMode`）：缺省 `preferred`（服务端支持就加密）
     ssl_mode: mysql.SslMode = .preferred,
     /// 根证书文件（`SslCa`/`CertificateFile`），`verify_ca`/`verify_full` 用；空 = 系统根证书
@@ -61,6 +63,7 @@ pub const ConnectionOptions = struct {
         self.password = "";
         self.database = "";
         self.ssl_ca = "";
+        self.pipe_name = "";
         self.extra = &.{};
     }
 };
@@ -95,7 +98,15 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
                 opts.database = try gpa.dupe(u8, value);
             }
         } else if (std.ascii.eqlIgnoreCase(key, "Server") or std.ascii.eqlIgnoreCase(key, "Host")) {
-            opts.server = try gpa.dupe(u8, value);
+            // ADO.NET 习惯：`Server=np:\\.\pipe\...` 表示走命名管道（LocalDB 专用）
+            if (std.ascii.startsWithIgnoreCase(value, "np:") or std.ascii.startsWithIgnoreCase(value, "\\\\.\\pipe\\")) {
+                opts.pipe_name = try gpa.dupe(u8, value);
+                opts.server = try gpa.dupe(u8, "(pipe)");
+            } else {
+                opts.server = try gpa.dupe(u8, value);
+            }
+        } else if (std.ascii.eqlIgnoreCase(key, "Pipe") or std.ascii.eqlIgnoreCase(key, "PipeName")) {
+            opts.pipe_name = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Port")) {
             opts.port = std.fmt.parseInt(u16, value, 10) catch 3306;
         } else if (std.ascii.eqlIgnoreCase(key, "Uid") or std.ascii.eqlIgnoreCase(key, "User") or
@@ -281,7 +292,8 @@ pub const Dal = struct {
                 if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
                     opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
                 }
-                if (opts_owned.server.len == 0) return error.NoConnection;
+                // 命名管道（LocalDB）不需要 server
+                if (opts_owned.server.len == 0 and opts_owned.pipe_name.len == 0) return error.NoConnection;
                 if (opts_owned.database.len == 0) return error.NoDatabase;
                 // 端口缺省以方言为准（SQL Server 1433）
                 if (opts_owned.port == 3306) opts_owned.port = tds.default_port;
@@ -457,6 +469,7 @@ pub const Dal = struct {
                     .user = opts.user,
                     .password = opts.password,
                     .database = opts.database,
+                    .pipe_name = opts.pipe_name,
                 });
                 var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
                 s.read_only = opts.read_only;
@@ -707,6 +720,7 @@ pub const Dal = struct {
                     .user = self.opts.user,
                     .password = self.opts.password,
                     .database = self.opts.database,
+                    .pipe_name = self.opts.pipe_name,
                 });
                 var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
                 s.read_only = self.opts.read_only;
@@ -1234,6 +1248,27 @@ fn existingColumns(s: *Session, gpa: std.mem.Allocator, kind: DatabaseKind, tabl
             // 注意：MySQL 8 的 information_schema 列名返回大写，因此按列序号取，不依赖列名
             const rows = try s.queryRows(
                 "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+            }
+        },
+        .sqlserver => {
+            const rows = try s.queryRows(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = @p0",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+            }
+        },
+        // PG 系：与 `tableExists` 同一口径（限当前 schema，避免同名表跨 schema 串味）
+        .postgresql, .kingbase, .highgo, .vastbase => {
+            const rows = try s.queryRows(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1",
                 &.{.{ .text = table_name }},
             );
             for (rows) |row| {

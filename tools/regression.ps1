@@ -167,7 +167,49 @@ if (-not (Test-Path $buildZig)) {
         }
     } else {
         Add-Log "[SKIP] 未找到公共库 $zzigDir——跳过 zzig 回归"
-    }}
+    }
+
+    # 真库集成：PG 实例（tools/pg-local.ps1 起的 5433）在跑就带上连接串跑
+    $pgPort = 5433
+    $pgUp = $false
+    try {
+        $tc = New-Object Net.Sockets.TcpClient
+        $tc.Connect('127.0.0.1', $pgPort)
+        $pgUp = $true
+        $tc.Dispose()
+    } catch { $pgUp = $false }
+    if (-not $pgUp) {
+        Add-Log "[SKIP] PostgreSQL 真库用例：127.0.0.1:$pgPort 不可连（先跑 tools/pg-local.ps1 -Action setup）"
+    } elseif ($buildText -match 'pg-conn') {
+        Invoke-External 'zig build integration（PostgreSQL 真库）' $zigCmd.Source @(
+            'build', 'integration',
+            ("-Dpg-conn=Provider=PostgreSQL;Server=127.0.0.1;Port={0};Database=postgres;UserID=postgres;Password=" -f $pgPort),
+            ("-Dpg-conn-scram=Provider=PostgreSQL;Server=127.0.0.1;Port={0};Database=zcode_it;UserID=postgres;Password=zcode_pwd" -f $pgPort)
+        )
+    } else {
+        Add-Log '[SKIP] build.zig 无 pg-conn 选项——跳过 PostgreSQL 真库用例'
+    }
+
+    # 真库集成：MySQL 实例（tools/mysql-local.ps1 起的 3307）在跑就带上连接串跑
+    $myPort = 3307
+    $myUp = $false
+    try {
+        $tc = New-Object Net.Sockets.TcpClient
+        $tc.Connect('127.0.0.1', $myPort)
+        $myUp = $true
+        $tc.Dispose()
+    } catch { $myUp = $false }
+    if (-not $myUp) {
+        Add-Log "[SKIP] MySQL 真库用例：127.0.0.1:$myPort 不可连（先跑 tools/mysql-local.ps1 -Action setup）"
+    } elseif ($buildText -match 'mysql-conn') {
+        Invoke-External 'zig build integration（MySQL 真库）' $zigCmd.Source @(
+            'build', 'integration',
+            ("-Dmysql-conn=Provider=MySQL;Server=127.0.0.1;Port={0};Database=zcode_test;UserID=root;Password=" -f $myPort)
+        )
+    } else {
+        Add-Log '[SKIP] build.zig 无 mysql-conn 选项——跳过 MySQL 真库用例'
+    }
+}
 
 Add-Log ''
 if ($script:failed -eq 0) {

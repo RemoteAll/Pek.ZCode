@@ -871,6 +871,11 @@ test {
     _ = @import("integration_pg.zig");
 }
 
+// PostgreSQL **真库**用例（需 -Dpg-conn；覆盖建表/CRUD/批量插/反向工程/scram）
+test {
+    _ = @import("integration_pg_real.zig");
+}
+
 // 跨库分片 + 分片表自动建表
 test {
     _ = @import("integration_shard.zig");

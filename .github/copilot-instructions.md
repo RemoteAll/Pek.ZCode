@@ -28,7 +28,7 @@
   与 TLS 可叠加（压缩在 TLS 内层）；服务端不支持时明确打印而不是静默当成功。
   **供应商化文件 `zzig/src/db/tls_client.zig`**：std TLS 客户端副本 + 补 `CertificateRequest`（MySQL 8 默认 `ssl_ca` 必发这条，std 不处理会连不上）；
   改它前先看头部注释，std 支持后应整个删掉。
-- 测试：`zig build test`（**单元 137 项全通过**；集成 44 项，其中 MySQL 真库用例需 `-Dmysql-conn`，未给时显式 SKIP）；真库另跑
+- 测试：`zig build test`（**单元 137 项全通过**；集成 56 项，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
 - 性能：`zig build bench`（ReleaseFast）出数字，实测 insert 5.21 µs / 批量 2.46 µs 条 / 主键查 1.80 µs /
   缓存命中 0.01 µs / 分页 11.49 µs / 分表路由 0.11 µs / 拦截器开销 +0.8 µs / 导航批量填充 170 µs。
@@ -37,6 +37,13 @@
   实测点查 **1.64×**、单行插入（同事务）**1.62×**；`setStmtCacheLimit(0)` 可关掉做对比，`stmtCacheStats()` 看命中率。
 
 ## 工具链口径（本机实测）
+
+- **本地真库**（免安装，数据在仓库 `.tools\` 下，已 gitignore）：
+  - MySQL：`tools/mysql-local.ps1`（3307，`G:\Tools\mysql-portable\mysql-8.0.29-winx64`）
+  - PostgreSQL：`tools/pg-local.ps1`（5433，`G:\Tools\pgsql-portable\pgsql`，PG 16.2，来自阿里云 Maven 的 zonky 包）
+  - SQL Server：只有 **LocalDB**（`tools/mssql-local.ps1`）——它**只支持 Windows 认证且不开 TCP**，
+    ZCode 的 TDS 驱动（仅 SQL 账号认证）**连不上**；只能 `sqlcmd` 手工验证。驱动级真库验证需要 SQL Server Express。
+  - `tools/regression.ps1` 会探测 5433/3307，在跑就自动带上真库用例，不在跑就显式 SKIP（不会静默跳过）。
 
 - `zig 0.17.1`（VS Code Zig 扩展托管，`zig.exe` 已在 PATH；0.17.0 已验证同行为）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
 - **依赖公共库 `G:\Code\Zig\zzig`**（path 依赖）：`zzig.xml` + 通用件 `zzig.Decimal` / `zzig.DateTime` /

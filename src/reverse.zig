@@ -461,7 +461,8 @@ fn readPostgres(a: std.mem.Allocator, s: *Session, opts: Options) ![]Table {
 fn pgColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a,
+    try buf.appendSlice(
+        a,
         "SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable, c.is_identity, " ++
             "c.character_maximum_length, c.numeric_precision, c.numeric_scale, COALESCE(c.column_default,''), " ++
             "COALESCE(pgd.description,'') " ++
@@ -506,7 +507,8 @@ fn pgColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column {
     // 主键：填到列上（与 SQLite / MySQL 一致）
     var kbuf: std.ArrayList(u8) = .empty;
     defer kbuf.deinit(a);
-    try kbuf.appendSlice(a,
+    try kbuf.appendSlice(
+        a,
         "SELECT kcu.column_name FROM information_schema.table_constraints tc " ++
             "JOIN information_schema.key_column_usage kcu " ++
             "  ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema " ++
@@ -528,7 +530,8 @@ fn pgColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column {
 fn pgIndexes(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Index {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a,
+    try buf.appendSlice(
+        a,
         "SELECT i.relname, ix.indisunique, ix.indisprimary, a.attname " ++
             "FROM pg_catalog.pg_index ix " ++
             "JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid " ++
@@ -650,7 +653,8 @@ fn readSqlServer(a: std.mem.Allocator, s: *Session, opts: Options) ![]Table {
 fn mssqlColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a,
+    try buf.appendSlice(
+        a,
         "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.CHARACTER_MAXIMUM_LENGTH, " ++
             "c.NUMERIC_PRECISION, c.NUMERIC_SCALE, " ++
             "COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') " ++
@@ -685,7 +689,8 @@ fn mssqlColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column 
     // 主键
     var kbuf: std.ArrayList(u8) = .empty;
     defer kbuf.deinit(a);
-    try kbuf.appendSlice(a,
+    try kbuf.appendSlice(
+        a,
         "SELECT kcu.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc " ++
             "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu " ++
             "  ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME " ++
@@ -706,7 +711,8 @@ fn mssqlColumns(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Column 
 fn mssqlIndexes(a: std.mem.Allocator, s: *Session, table: []const u8) ![]Index {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a,
+    try buf.appendSlice(
+        a,
         "SELECT i.name, i.is_unique, i.is_primary_key, c.name " ++
             "FROM sys.indexes i " ++
             "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " ++

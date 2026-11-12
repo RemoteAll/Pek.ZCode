@@ -233,9 +233,12 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 
 - `setting` / `sqltemplate` / `expression` / `batch` / `dbcache` / `dbpackage` 全部有单元测试（真 SQLite 内存库），
   `zig build test` 退出码 0；
-- `reverse` 的 **PG / SQL Server**：只做了「类型映射」与「SQL 字面量转义」的单元测试，
-  **取结构的 SQL 尚未在真库跑过**（本机无 PG / SQL Server 实例）。按用户口径「先迁移代码，有环境再实测」记录在此，
+- `reverse` 的 **SQL Server**：只做了「类型映射」与「SQL 字面量转义」的单元测试，
+  **取结构的 SQL 尚未在真库跑过**（本机无 SQL Server 实例）。按用户口径「先迁移代码，有环境再实测」记录在此，
   下次有实例时必须补真库用例（`zcodegen --reverse`）。
+- `reverse` 的 **PostgreSQL**：**已在真库验证**（2026-11-12 晚，PG 16.2 本地实例）——
+  `tests/integration_pg_real.zig` 建表后反读回列类型/主键/索引，并验证生成的 `Model.xml` 可再次解析。
+  同一轮修掉了 `syncSchema` 的 `existingColumns()` 缺 PG 分支（原 `else => error.Unsupported` 让第二次同步必失败）。
 
 ## 3. 与 C#/Rust 的行为差异（有意为之）| 差异 | 原因 |
 |---|---|

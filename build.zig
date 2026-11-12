@@ -50,6 +50,9 @@ pub fn build(b: *std.Build) void {
     // PostgreSQL 真库集成用例：`-Dpg-conn="Provider=PostgreSQL;Server=...;Port=5432;Database=...;UserID=...;Password=..."`
     const pg_conn = b.option([]const u8, "pg-conn", "PostgreSQL 连接串（提供时跑真库集成测试）") orelse "";
     build_options.addOption([]const u8, "pg_conn", pg_conn);
+    // 可选：SCRAM 鉴权专用连接（指向一个非 postgres 库，pg_hba 在那里要求 scram-sha-256）
+    const pg_conn_scram = b.option([]const u8, "pg-conn-scram", "PostgreSQL SCRAM 连接串（可选，验证密码鉴权）") orelse "";
+    build_options.addOption([]const u8, "pg_conn_scram", pg_conn_scram);
     itest_mod.addOptions("build_options", build_options);
 
     const itests = b.addTest(.{
