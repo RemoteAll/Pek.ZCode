@@ -281,7 +281,8 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Attributes/`（BindColumn/BindIndex/BindTable/Map/ModelCheckMode/ModelSortMode） | `model.zig`（解析 `Model.xml` 属性）；Zig 无特性（Attribute）机制 | 等价 |
 | `Cache/EntityCache`、`CacheBase` | `cache.Cache(T)`（整表 + 写后失效 + TTL） | 已迁移 |
 | `Cache/` 的单对象缓存（`Meta.SingleCache` 语义） | `cache.SingleCache(T)` | 已迁移 |
-| `Cache/FieldCache`、`Cache/CacheInvalidator`、`Cache/DataCache`、`Cache/DbCache` | — | **未做** |
+| `Cache/FieldCache`（键列→值列整表字典） | `fieldcache.FieldCache`（物理列名工作、写后自动失效、TTL） | 已迁移 |
+| `Cache/CacheInvalidator`、`Cache/DataCache`、`Cache/DbCache` | — | **未做** |
 | `Configuration/FieldExtension`、`FieldOption` | `model.ColumnMeta`（长度/精度/默认值/DataScale/Map/ShowIn 等） | 等价 |
 | `Configuration/TableItem`（反射实体→模型） | 反向方向不需要：Zig 以 `Model.xml` 为唯一源；**正向**由 `codegen.zig`（`XCodeTool` 等价）完成 | 等价 |
 | `Configuration/SqlTemplate`、`ShowInOption`、`ModelSortMode` | — | **未做**（面板/工具层） |

@@ -544,3 +544,59 @@ test "迁移：MySQL 真库 Full 档改列（需 -Dmysql-conn）" {
         try std.testing.expectEqual(@as(usize, 0), r2.columns_altered);
     }
 }
+
+// ───────────────────────── 字段缓存（C# `Cache/FieldCache`） ─────────────────────────
+
+test "字段缓存：Code→Id 整表字典 + 写后自动失效 + TTL" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "fieldcache");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Log");
+    _ = try table.delete(&s, null);
+
+    // 3 行：Code（Title 当业务键）→ Id
+    var ids: [3]i64 = undefined;
+    for (0..3) |k| {
+        const title = try std.fmt.allocPrint(s.resultAllocator(), "code-{d}", .{k});
+        ids[k] = try table.insert(&s, &.{
+            .{ .name = "Title", .value = .{ .text = title } },
+        });
+    }
+
+    var fc = zcode.fieldcache.FieldCache.init(&dal, table, "Title", "Id");
+    defer fc.deinit();
+
+    // 首次访问整表装载；按业务键命中
+    try std.testing.expectEqual(@as(usize, 3), try fc.count(&s));
+    try std.testing.expectEqual(ids[1], (try fc.getId(&s, "code-1")).?);
+    try std.testing.expect((try fc.getId(&s, "code-9")) == null);
+
+    // 通过 TableRef 写入 → 写后通知 → 缓存自动失效 → 下次访问看到新行
+    _ = try table.insert(&s, &.{
+        .{ .name = "Title", .value = .{ .text = "code-new" } },
+    });
+    try std.testing.expectEqual(@as(usize, 4), try fc.count(&s));
+    try std.testing.expect((try fc.getId(&s, "code-new")).? > 0);
+
+    // TTL 到期 → 重载（模拟过期）
+    fc.loaded_at -= 1000;
+    try std.testing.expectEqual(@as(usize, 4), try fc.count(&s));
+
+    // 手动失效 + 反向映射（Id→Title）也能用
+    var rev = zcode.fieldcache.FieldCache.init(&dal, table, "Id", "Title");
+    defer rev.deinit();
+    const title_buf = try std.fmt.allocPrint(a, "{d}", .{ids[2]});
+    defer a.free(title_buf);
+    try std.testing.expectEqualStrings("code-2", (try rev.getText(&s, title_buf)).?);
+
+    fc.invalidate();
+    try std.testing.expectEqual(@as(usize, 4), try fc.count(&s));
+}
