@@ -37,6 +37,10 @@ pub const ScopeKind = datascope.ScopeKind;
 pub const LogProvider = log.LogProvider;
 pub const ManageProvider = provider.ManageProvider;
 pub const LoginError = provider.LoginError;
+/// `UserStore` 的真实 ORM 实现（`User` 表按 `Model.xml` 的连接走，不另拼连接名）
+pub const OrmStore = provider.OrmStore;
+/// 实体字符串深拷贝（会话结果缓冲出了作用域就失效）
+pub const deepCopyAlloc = provider.deepCopyAlloc;
 
 pub const LogActions = log.action;
 

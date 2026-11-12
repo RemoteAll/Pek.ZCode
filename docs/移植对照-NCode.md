@@ -13,7 +13,7 @@
 | 方言语义 | `DH.NCode.*` 各驱动 | `src/dialect.rs` | `src/dialect.zig` | ✅ **19 个可实现方言全覆盖**（`zig build audit-dialects` 19/19 无缺口）；仅 `mongodb` / `influxdb` 非 SQL 库显式 `error.Unsupported` |
 | 条件表达式 | `WhereExpression` | `src/query.rs` | `src/query.zig` | ✅ 14 种运算符 |
 | SQL 组装 | `InsertBuilder` / `SelectBuilder` | `src/sqlbuild.rs` | `src/sqlbuild.zig` | ✅ INSERT/UPDATE/DELETE/SELECT/COUNT + 多行批量 INSERT |
-| 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接 + **SQLite 预处理语句缓存** + 事务（含嵌套计数/Scoped） |
+| 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接 + **SQLite 预处理语句缓存** + 事务（含嵌套计数/Scoped）；✅ **SQL 日志**（`ShowSQL` 开关 / 连接名前缀 / 参数化拼接 / 超长截断 / 慢 SQL 阈值 / `SqlSink` 交给应用层写文件） |
 | SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `zzig`：`db/sqlite.zig`（动态加载 DLL） | ✅ |
 | MySQL 驱动 | `DH.NCode.MySql` | `src/mysql.rs`（`mysql` crate，纯协议） | `zzig`：`db/mysql.zig`（**纯协议**，不加载 libmysqlclient） | ✅ 握手/鉴权/COM_QUERY/预处理二进制协议/**`LOAD DATA LOCAL INFILE` 流式批量装载**/**TLS（`SslMode` 五档）**/**压缩协议（`CLIENT_COMPRESS`）**；可任意叠加（压缩在 TLS 内层） |
 | 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count/batch + **upsertBatch（SaveModes 四模式）** + **updateAccumulate（累加字段）**；**Dal 直执行 SQL**（`exec` / `queryAlloc` / `execOnTable` / `queryOnTableAlloc`，`?` 占位符按方言自动改写） |
@@ -38,7 +38,7 @@
 | 传统 MsSql 分页 | `DataAccessLayer/MSPageSplit` | — | `src/pagesplit.zig` | ✅ `topNotIn` / `doubleTop` / `maxMin` / `rowNumber` 四种算法 + 与 C# 相同的选择顺序 + 首页直取 `TOP`；黄金 SQL 断言，`rowNumber` 分支在真 SQLite 上翻页验证 |
 | 表达式树 | `Model/{Expression,FieldExpression,FormatExpression,ConcatExpression}` | — | `src/expression.zig` | ✅ 文本（`Or` 自动加括号）/ 字段（按方言引用）/ 格式化（`{0}` 列名、`{1}` 右值，参数化与字面量两种口径）/ 逗号拼接（可嵌套） |
 | 批量查找器 | `Model/{BatchFinder,BatchOption}` | — | `src/batch.zig` | ✅ 登记主键去重（跳过 0 / 空串）→ 按 `batch_size` 分批 `IN` 预取、游标只前进、可替换 loader；`BatchOption` 作为批操作参数载体 |
-| 全局设置 | `Setting.cs` / `XCodeSetting` | — | `src/setting.zig` | ✅ 字段与默认值逐项对齐（Debug/ShowSQL/TraceSQLTime/UseParameter/BatchSize/Migration/缓存过期…），支持 `Key=Value` 文本读写与未识别键上报 |
+| 全局设置 | `Setting.cs` / `XCodeSetting` | — | `src/setting.zig` | ✅ 字段与默认值逐项对齐（Debug/ShowSQL/TraceSQLTime/SQLMaxLength/UseParameter/BatchSize/Migration/缓存过期…），支持 `Key=Value` 文本读写与未识别键上报；**唯一差异：`ShowSQL` 默认 `false`**（C# 发布版因 `XCode.Debug=false` 实际也是关的，本仓无 DEBUG/RELEASE 之分，直接落地「默认关、配置开」） |
 | SQL 模版 / 显示选项 | `Configuration/{SqlTemplate,ShowInOption}`、`Attributes/ModelSortMode` | — | `src/sqltemplate.zig` | ✅ `-- [方言]` 分段解析 + 回落默认；`ShowInOption` 三种写法（具名列表+宏 / 管道 5 段 / 5 字符掩码）；`ModelSortMode` 枚举 |
 | 缓存协调与表缓存 | `Cache/{CacheInvalidator,DataCache,DbCache,LazyConsumer}` | — | `src/dbcache.zig` | ✅ 分布式版本号（可插 Provider + 内存实现）联动本地失效；运行数据缓存（表行数 + 字段键值，可落文本）；**表当缓存**（Name/Value/CreateTime/ExpiredTime + 过期清理）；惰性串行消费者（空闲不占线程） |
 | 数据包 | `DataAccessLayer/DbPackage` | — | `src/dbpackage.zig` | ✅ 表级导出/导入/跨库同步（按页抽取，内存只留一页）；四种保存模式；**未做**：`.gz` / `zip` 多表归档（本仓与 zzig 都没有 zip 实现）、Actor 双线程并行 |

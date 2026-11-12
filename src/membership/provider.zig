@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const zzig = @import("zzig");
+const zcode = @import("../root.zig");
 const entities = @import("entities/mod.zig");
 const password = @import("password.zig");
 const log_mod = @import("log.zig");
@@ -99,7 +100,11 @@ pub fn loginCore(
 
     // 5. 库密码为空 → 任意密码可登录，并写回散列
     if (user.Password.len == 0) {
-        user.Password = try password.hashAlloc(a, plain_or_md5);
+        const hashed = try password.hashAlloc(a, plain_or_md5);
+        user.Password = hashed;
+        // 必须走 setter：脏位图才记录 Password，真实 ORM（`entity.update` 只写脏列）才会把它落库。
+        // 直接赋字段只会改内存对象，接上 `OrmStore` 后**密码根本不会写回**（实测踩过）。
+        user.setPassword(hashed);
         wrote_password = true;
     } else {
         // 校验失败一律"用户名或密码不正确"
@@ -107,7 +112,9 @@ pub fn loginCore(
 
         // 6. 旧格式自动升级
         if (password.needsUpgrade(user.Password)) {
-            user.Password = try password.hashAlloc(a, plain_or_md5);
+            const hashed = try password.hashAlloc(a, plain_or_md5);
+            user.Password = hashed;
+            user.setPassword(hashed);
             upgraded = true;
         }
     }
@@ -178,18 +185,199 @@ pub fn changePasswordCore(
     return user;
 }
 
+// ---------------------------------------------------------------------------
+// 真实 ORM 版 store（接 `Dal`；`User` 表按 `Model.xml` 的表级 `ConnName` 选库）
+// ---------------------------------------------------------------------------
+
+/// 把实体里的**字符串切片**深拷贝到 `a`。
+///
+/// `entity.queryRows` 返回的实体，字符串指向会话结果缓冲（`Session.resultAllocator()`），
+/// 会话一 `deinit` 就失效 —— 跨出会话作用域前必须拷走，否则是悬垂指针
+/// （实测会表现为 union 标签错乱 / `panic: incorrect alignment`）。
+pub fn deepCopyAlloc(comptime T: type, a: std.mem.Allocator, src: T) !T {
+    var out = src;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types) |name, FT| {
+        if (FT == []const u8) {
+            @field(out, name) = try a.dupe(u8, @field(src, name));
+        }
+    }
+    return out;
+}
+
+/// `UserStore` 的 ORM 实现：读写一律走 `Dal` / `entity`，
+/// 表在哪个库由 `Model.xml` 决定（`User` 在 `Membership` 库、`Log` 在 `Log` 库这种配置，
+/// 调用方不需要知道，也不允许自己拼连接名）。
+///
+/// 用法：
+/// ```
+/// var store = provider.OrmStore.init(&dal);
+/// const st = store.store();
+/// const r = try provider.loginCore(a, st, name, pwd, now, ip);
+/// try st.save(&r.user); // 只写脏列：登录次数 / 最后登录 / 在线
+/// ```
+pub const OrmStore = struct {
+    dal: *zcode.Dal,
+
+    pub fn init(d: *zcode.Dal) OrmStore {
+        return .{ .dal = d };
+    }
+
+    /// 注入给 `loginCore` / `registerCore` / `changePasswordCore` 的 `UserStore`。
+    /// `OrmStore` 必须活得比 `UserStore` 久（`ctx` 指向它自己）。
+    pub fn store(self: *OrmStore) UserStore {
+        return .{ .ctx = self, .findByNameFn = findByNameFn, .saveFn = saveFn };
+    }
+
+    /// 按账号登录查找（C# `User.FindForLogin`）：
+    /// `Name` → 含 `@` 时 `Mail` → 纯数字且 >0 时 `Mobile` → `Code`。
+    pub fn findForLoginAlloc(self: *OrmStore, a: std.mem.Allocator, account: []const u8) !?entities.User {
+        if (account.len == 0) return null;
+
+        if (try self.findByAlloc(a, "Name", account)) |u| return u;
+
+        if (std.mem.indexOfScalar(u8, account, '@') != null) {
+            if (try self.findByAlloc(a, "Mail", account)) |u| return u;
+        }
+
+        // C# `account.ToLong() > 0`：非数字 / 0 / 负数一律跳过手机号分支
+        const as_int = std.fmt.parseInt(i64, account, 10) catch 0;
+        if (as_int > 0) {
+            if (try self.findByAlloc(a, "Mobile", account)) |u| return u;
+        }
+
+        return try self.findByAlloc(a, "Code", account);
+    }
+
+    /// 按单列等值查一个用户（结果深拷贝到 `a`）。
+    pub fn findByAlloc(self: *OrmStore, a: std.mem.Allocator, column: []const u8, value: []const u8) !?entities.User {
+        var s = try self.dal.openSessionForTable(entities.User.meta.table_name);
+        defer s.deinit();
+
+        var w = zcode.Where.init(a);
+        defer w.deinit();
+        _ = try w.eq(column, .{ .text = value });
+
+        var q = zcode.Query.init(a);
+        defer q.deinit();
+        _ = q.filterWhere(&w).take(1);
+
+        const list = try zcode.entity.queryRows(self.dal, entities.User, &s, &q);
+        if (list.len == 0) return null;
+        return try deepCopyAlloc(entities.User, a, list[0]);
+    }
+
+    /// 按主键查（结果深拷贝到 `a`）。
+    pub fn findByPkAlloc(self: *OrmStore, a: std.mem.Allocator, id: i32) !?entities.User {
+        var s = try self.dal.openSessionForTable(entities.User.meta.table_name);
+        defer s.deinit();
+        const found = try zcode.entity.findByPk(self.dal, entities.User, &s, &.{.{ .int = id }});
+        const u = found orelse return null;
+        return try deepCopyAlloc(entities.User, a, u);
+    }
+
+    /// 落库：自增列为 0 → INSERT；否则按主键**只写脏列**（对应 C# `user.Save()`）。
+    pub fn saveUser(self: *OrmStore, user: *entities.User) !i64 {
+        var s = try self.dal.openSessionForTable(entities.User.meta.table_name);
+        defer s.deinit();
+        return zcode.entity.save(self.dal, user, &s);
+    }
+
+    // ── 函数指针（`UserStore` 要求无捕获，故为命名空间函数）────────────
+
+    fn findByNameFn(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) anyerror!?entities.User {
+        const self: *OrmStore = @ptrCast(@alignCast(ctx));
+        return self.findForLoginAlloc(a, name);
+    }
+
+    fn saveFn(ctx: *anyopaque, user: *entities.User) anyerror!void {
+        const self: *OrmStore = @ptrCast(@alignCast(ctx));
+        _ = try self.saveUser(user);
+    }
+};
+
 /// 当前登录用户持有者（C# `IManageProvider.Current`）。
 pub const ManageProvider = struct {
     current: ?entities.User = null,
     log_provider: log_mod.LogProvider = .{},
+    /// 数据访问（`OrmStore.store()` 或任意注入实现）；为空时只能做纯判定（`*Core`）
+    store: ?UserStore = null,
+
+    pub const ProviderError = error{StoreNotBound};
+
+    /// 绑定数据访问；之后 `login` / `register` / `changePassword` / `logoutPersist` 才可用。
+    pub fn bindStore(self: *ManageProvider, s: UserStore) void {
+        self.store = s;
+    }
+
+    fn needStore(self: *const ManageProvider) ProviderError!UserStore {
+        return self.store orelse ProviderError.StoreNotBound;
+    }
 
     pub fn logout(self: *ManageProvider) void {
+        self.current = null;
+    }
+
+    /// 退出并落库（`Online = false`）。落库失败时**保留** `current`，让调用方能重试。
+    pub fn logoutPersist(self: *ManageProvider) !void {
+        if (self.current) |*u| {
+            if (self.store) |st| {
+                u.setOnline(false);
+                try st.save(u);
+            }
+        }
         self.current = null;
     }
 
     /// 是否已登录
     pub fn isLoggedIn(self: *const ManageProvider) bool {
         return self.current != null;
+    }
+
+    /// 登录：判定（`loginCore`）→ 落库（只写脏列）→ 设为当前用户。
+    pub fn login(
+        self: *ManageProvider,
+        a: std.mem.Allocator,
+        username: []const u8,
+        pwd: []const u8,
+        now: zzig.DateTime,
+        ip: []const u8,
+    ) !LoginOutcome {
+        const st = try self.needStore();
+        var r = try loginCore(a, st, username, pwd, now, ip);
+        try st.save(&r.user);
+        self.current = r.user;
+        return r;
+    }
+
+    /// 注册：判定（`registerCore`）→ 落库（INSERT，自增 ID 回写到返回的实体）。
+    pub fn register(
+        self: *ManageProvider,
+        a: std.mem.Allocator,
+        username: []const u8,
+        plain_password: []const u8,
+        role_id: i32,
+        enable: bool,
+    ) !entities.User {
+        const st = try self.needStore();
+        var u = try registerCore(a, st, username, plain_password, role_id, enable);
+        _ = try st.save(&u);
+        return u;
+    }
+
+    /// 改密：判定（`changePasswordCore`）→ 落库（只写 `Password` 一列）。
+    pub fn changePassword(
+        self: *ManageProvider,
+        a: std.mem.Allocator,
+        username: []const u8,
+        new_password: []const u8,
+        old_password: []const u8,
+    ) !entities.User {
+        const st = try self.needStore();
+        const u = try changePasswordCore(a, st, username, new_password, old_password);
+        var copy = u;
+        try st.save(&copy);
+        return copy;
     }
 };
 

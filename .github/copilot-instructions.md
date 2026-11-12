@@ -1,6 +1,6 @@
 # Pek.ZCode · 项目指令
 
-> 全项目通用规则见用户级《跨项目接续协议》（本机 `%APPDATA%\Code\User\prompts\跨项目接续协议.instructions.md`，模板在 `tools/continuity/templates/`，当前版本 **2026.11.10.2**）。
+> 全项目通用规则见用户级《跨项目接续协议》（本机 `%APPDATA%\Code\User\prompts\跨项目接续协议.instructions.md`，模板在 `tools/continuity/templates/`，当前版本 **2026.11.11.1**）。
 > **开工先读（存在则读，按序）**：`.github/copilot-instructions.md` → `docs/项目接续指南.md` → `docs/用户档案.md` → `docs/项目记忆.md` → `docs/决策记录.md` 最新节。
 > **机器自愈（有则快跑）**：`tools/continuity/install-global-instruction.ps1`（幂等：缺失补装 / 过旧更新 / 一致不动；VS Code 打开本项目时 `.vscode/tasks.json` 也会自动跑）。
 
@@ -28,7 +28,7 @@
   与 TLS 可叠加（压缩在 TLS 内层）；服务端不支持时明确打印而不是静默当成功。
   **供应商化文件 `zzig/src/db/tls_client.zig`**：std TLS 客户端副本 + 补 `CertificateRequest`（MySQL 8 默认 `ssl_ca` 必发这条，std 不处理会连不上）；
   改它前先看头部注释，std 支持后应整个删掉。
-- 测试：`zig build test`（**单元 140 项全通过**；集成 56 项，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
+- 测试：`zig build test`（**单元 176 项全通过**；集成 72 项，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
 - 方言覆盖：`zig build audit-dialects`（**19/19 可实现方言无缺口**；不连库，纯 SQL 生成层），已进 `tools/regression.ps1`。
   改 `src/dialect.zig` 的 `else` 分支后必跑（`else =>` 默认分支是静默错误高发区）。

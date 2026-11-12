@@ -911,4 +911,6 @@ test {
     _ = @import("integration_stat_extract.zig");
     _ = @import("integration_batch_async.zig");
     _ = @import("integration_shard_batch.zig");
+    _ = @import("integration_sql_log.zig");
+    _ = @import("integration_membership_orm.zig");
 }

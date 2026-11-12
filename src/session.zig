@@ -17,8 +17,104 @@ const postgres = @import("zzig").postgres;
 const tds = @import("zzig").tds;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
+const setting = @import("setting.zig");
+const clock = @import("clock.zig");
 
 pub const Row = sqlite.Row; // == zzig.db.Row，两个驱动共用同一行结构
+
+// ── SQL 日志接收器 ──────────────────────────────────────────────
+//
+// 口径对齐 C# `DbSession.WriteSQL`：是否输出由 `ShowSQL` 决定，写到 `SQLPath` 目录或当前日志。
+// 本库**不自己造文件日志**（轮转/目录/追加策略各项目已有），而是把拼好的文本交给接收器：
+//   - `writeFn` 为空 → 写 stderr（开发期最省事）；
+//   - 应用启动时 `setSqlSink` 一次，接到自己的日志（写文件、上报、面板「SQL 列表」都可以）。
+// `SQLPath` 的语义因此由应用层实现（把接收到的文本写到该目录）。
+
+pub const SqlSink = struct {
+    ctx: ?*anyopaque = null,
+    writeFn: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
+};
+
+var sql_sink: SqlSink = .{};
+
+/// 设置 SQL 日志接收器（应用启动时调一次）。
+pub fn setSqlSink(sink: SqlSink) void {
+    sql_sink = sink;
+}
+
+/// 取当前接收器（用例里保存/恢复用）。
+pub fn sqlSinkSnapshot() SqlSink {
+    return sql_sink;
+}
+
+fn writeSqlLog(text: []const u8) void {
+    if (sql_sink.writeFn) |f| {
+        f(sql_sink.ctx, text);
+        return;
+    }
+    std.debug.print("{s}\n", .{text});
+}
+
+/// 追加 `text`，超过 `max` 时截断：INSERT 前后各留一半（C# `GetSql` 同口径），其余截尾部。
+fn appendTruncated(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, text: []const u8, max: usize) !void {
+    if (max == 0 or text.len <= max) {
+        try b.appendSlice(a, text);
+        return;
+    }
+    // 上限小到没法「前后各半」时直接截断，别产出比原文还长的“截断文本”
+    if (max < 16) {
+        try b.appendSlice(a, text[0..max]);
+        return;
+    }
+    if (text.len >= 6 and std.ascii.eqlIgnoreCase(text[0..6], "insert")) {
+        const half = max / 2;
+        try b.appendSlice(a, text[0..half]);
+        try b.appendSlice(a, "......");
+        try b.appendSlice(a, text[text.len - half ..]);
+    } else {
+        try b.appendSlice(a, text[0..max]);
+        try b.appendSlice(a, "...");
+    }
+}
+
+/// 渲染一个绑定参数（超长文本按 `budget` 截断并标出原长度）。
+fn appendParamValue(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: Value, budget: usize) !void {
+    switch (v) {
+        .null => try b.appendSlice(a, "null"),
+        .boolean => |x| try b.appendSlice(a, if (x) "true" else "false"),
+        .int => |x| {
+            var nb: [32]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nb, "{d}", .{x}) catch "?");
+        },
+        .float => |x| {
+            var nb: [40]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nb, "{d}", .{x}) catch "?");
+        },
+        .decimal => |x| {
+            var nb: [64]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nb, "{}", .{x}) catch "?");
+        },
+        .datetime => |x| {
+            var nb: [64]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nb, "{}", .{x}) catch "?");
+        },
+        .text => |t| {
+            if (budget > 0 and t.len > budget) {
+                var nb: [32]u8 = undefined;
+                try b.appendSlice(a, std.fmt.bufPrint(&nb, "[{d}]", .{t.len}) catch "");
+                try b.appendSlice(a, t[0..budget]);
+                try b.appendSlice(a, "...");
+            } else {
+                try b.appendSlice(a, t);
+            }
+        },
+        .blob => |t| {
+            var nb: [32]u8 = undefined;
+            try b.appendSlice(a, std.fmt.bufPrint(&nb, "[{d}]0x{x}", .{ t.len, t[0..@min(t.len, 8)] }) catch "[blob]");
+            if (t.len > 8) try b.appendSlice(a, "...");
+        },
+    }
+}
 
 /// 深拷贝行集：行结构、列名、以及 `text` / `blob` 的字节都重新分配。
 ///
@@ -110,6 +206,17 @@ pub const Session = struct {
     /// 事务嵌套计数（0 = 不在事务中；1 = 最外层，真正持有 BEGIN）
     tx_depth: u32 = 0,
 
+    // ---- SQL 日志（对应 C# `DbSession.ShowSQL` / `GetSql` / `WriteSQL`）----
+    /// SQL 输出开关：`null` = 跟随全局 `Setting.current().show_sql`
+    /// （配置文件 `Config/XCode.config:ShowSQL=true` 打开）
+    show_sql: ?bool = null,
+    /// 输出日志时 SQL 最大长度（0 = 跟随全局 `sql_max_length`；<0 = 不截断）
+    sql_max_length: i32 = 0,
+    /// 慢 SQL 阈值毫秒（<0 = 跟随全局 `trace_sql_time`；0 = 不跟踪）
+    trace_sql_time: i32 = -1,
+    /// 日志前缀里的连接名（由 `Dal` 填，**只借用不拥有**）
+    conn_name: []const u8 = "",
+
     /// SQLite 预处理语句缓存（同一 SQL 文本复用，省去每次 prepare/finalize）
     stmt_cache: std.ArrayListUnmanaged(CachedStmt) = .empty,
     /// 缓存上限（超过后新 SQL 不再入缓存，直接即时 prepare）
@@ -189,8 +296,103 @@ pub const Session = struct {
         _ = self.arena.reset(.retain_capacity);
     }
 
+    // ── SQL 输出开关（对应 C# `IDbSession.ShowSQL` / `SetShowSql`）──────
+
+    /// 本会话是否输出 SQL：会话级显式设置优先，否则看全局 `Setting.show_sql`
+    /// （配置文件 `Config/XCode.config:ShowSQL=true`）。
+    pub fn shouldShowSql(self: *const Session) bool {
+        if (self.show_sql) |v| return v;
+        return setting.current().show_sql;
+    }
+
+    /// 覆盖本会话的 SQL 输出开关（作用域用法见 `showSqlScoped`）。
+    pub fn setShowSql(self: *Session, value: bool) void {
+        self.show_sql = value;
+    }
+
+    /// 恢复“跟随全局配置”。
+    pub fn followGlobalShowSql(self: *Session) void {
+        self.show_sql = null;
+    }
+
+    /// 作用域内临时开关（对应 C# `SetShowSql` 返回的 `IDisposable`）：
+    /// ```
+    /// var scoped = s.showSqlScoped(false);
+    /// defer scoped.restore(s);
+    /// ```
+    pub const ShowSqlScope = struct { previous: ?bool = null };
+    pub fn showSqlScoped(self: *Session, value: bool) ShowSqlScope {
+        const sc = ShowSqlScope{ .previous = self.show_sql };
+        self.show_sql = value;
+        return sc;
+    }
+    pub fn restoreShowSql(self: *Session, sc: ShowSqlScope) void {
+        self.show_sql = sc.previous;
+    }
+
+    /// 是否需要计时（要么要输出 SQL，要么开了慢 SQL 跟踪）。
+    /// **两个都关时完全不取时间戳**，不给热路径增加开销。
+    fn sqlTimingNeeded(self: *const Session) bool {
+        if (self.shouldShowSql()) return true;
+        const cfg = setting.current();
+        const trace_ms: i32 = if (self.trace_sql_time >= 0) self.trace_sql_time else cfg.trace_sql_time;
+        return trace_ms > 0;
+    }
+
+    /// 输出一条 SQL 日志（口径对齐 C# `DbSession.GetSql` / `WriteSQL`）：
+    /// - 前缀 `[连接名]`，参数拼成 ` [0=值, 1=值]`（C# 用参数名，本仓只有位置参数，用序号）；
+    /// - 超过 `sql_max_length` 截断（INSERT 前后各留一半，其余截尾部）；
+    /// - **慢 SQL**（`>= trace_sql_time` 毫秒）即使 `ShowSQL=false` 也输出，并附 `(N ms)`；
+    /// - `SQLPath` 由应用层的 `SqlSink` 实现（本库不自己造文件日志）。
+    fn logSql(self: *Session, sql: []const u8, params: []const Value, elapsed_ms: u64) void {
+        if (sql.len == 0) return;
+
+        const cfg = setting.current();
+        const trace_ms: i32 = if (self.trace_sql_time >= 0) self.trace_sql_time else cfg.trace_sql_time;
+        const slow = trace_ms > 0 and elapsed_ms >= @as(u64, @intCast(trace_ms));
+        if (!self.shouldShowSql() and !slow) return;
+
+        const max_len: i32 = if (self.sql_max_length != 0) self.sql_max_length else cfg.sql_max_length;
+        const a = self.gpa;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(a);
+
+        buf.append(a, '[') catch return;
+        buf.appendSlice(a, if (self.conn_name.len > 0) self.conn_name else "-") catch return;
+        buf.appendSlice(a, "] ") catch return;
+
+        // 先按长度截断 SQL 本体，再拼参数——避免超长 SQL + 参数把日志撑爆
+        appendTruncated(&buf, a, sql, if (max_len > 0) @intCast(max_len) else 0) catch return;
+
+        if (params.len > 0) {
+            buf.appendSlice(a, " [") catch return;
+            for (params, 0..) |v, i| {
+                if (i > 0) buf.appendSlice(a, ", ") catch return;
+                var nb: [24]u8 = undefined;
+                buf.appendSlice(a, std.fmt.bufPrint(&nb, "{d}=", .{i}) catch "") catch return;
+                appendParamValue(&buf, a, v, 64) catch return;
+            }
+            buf.append(a, ']') catch return;
+        }
+
+        if (slow) {
+            var tb: [40]u8 = undefined;
+            buf.appendSlice(a, std.fmt.bufPrint(&tb, "  ({d} ms)", .{elapsed_ms}) catch "") catch return;
+        }
+
+        writeSqlLog(buf.items);
+    }
+
     /// 执行增删改（写会话才允许；只读副本在调用点即失败）。
     pub fn execute(self: *Session, sql: []const u8, params: []const Value) !usize {
+        if (!self.sqlTimingNeeded()) return self.executeInner(sql, params);
+        const t0 = clock.nowNs();
+        const n = try self.executeInner(sql, params);
+        self.logSql(sql, params, clock.nsToMs(clock.nowNs() - t0));
+        return n;
+    }
+
+    fn executeInner(self: *Session, sql: []const u8, params: []const Value) !usize {
         if (self.read_only) return error.ReadOnly;
         switch (self.driver) {
             .sqlite => |*db| {
@@ -248,6 +450,14 @@ pub const Session = struct {
 
     /// 查询（返回行集，含列名）。
     pub fn queryRows(self: *Session, sql: []const u8, params: []const Value) ![]const Row {
+        if (!self.sqlTimingNeeded()) return self.queryRowsInner(sql, params);
+        const t0 = clock.nowNs();
+        const rows = try self.queryRowsInner(sql, params);
+        self.logSql(sql, params, clock.nsToMs(clock.nowNs() - t0));
+        return rows;
+    }
+
+    fn queryRowsInner(self: *Session, sql: []const u8, params: []const Value) ![]const Row {
         switch (self.driver) {
             .sqlite => |*db| {
                 const arena = self.arena.allocator();

@@ -28,7 +28,8 @@ pub const ConnectionOptions = struct {
     provider: DatabaseKind = .sqlite,
     data_source: []const u8 = "",
     migration: ?Migration = null,
-    show_sql: bool = false,
+    /// 连接串 `ShowSQL=True/False`：`null` = 未指定，跟随全局 `Setting.show_sql`
+    show_sql: ?bool = null,
     read_only: bool = false,
     pooling: ?bool = null,
     /// MySQL 专属（`Provider=MySQL` 时才用）：服务器 / 端口 / 账号 / 库名
@@ -433,6 +434,7 @@ pub const Dal = struct {
                 const db = try sqlite.Db.open(lib_ptr, opts.data_source);
                 var s = Session.init(self.gpa, .sqlite, db);
                 s.read_only = opts.read_only;
+                s.show_sql = opts.show_sql;
                 return s;
             },
             .mysql => {
@@ -448,6 +450,7 @@ pub const Dal = struct {
                 });
                 var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
                 s.read_only = opts.read_only;
+                s.show_sql = opts.show_sql;
                 return s;
             },
             .postgresql => {
@@ -460,6 +463,7 @@ pub const Dal = struct {
                 });
                 var s = Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
                 s.read_only = opts.read_only;
+                s.show_sql = opts.show_sql;
                 return s;
             },
             .sqlserver => {
@@ -473,6 +477,7 @@ pub const Dal = struct {
                 });
                 var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
                 s.read_only = opts.read_only;
+                s.show_sql = opts.show_sql;
                 return s;
             },
             else => return error.Unsupported,
@@ -628,7 +633,9 @@ pub const Dal = struct {
             std.debug.print("[zcode] 连接 {s} 未挂载，无法开会话\n", .{name});
             return error.UnknownConnection;
         };
-        return self.openSessionWith(&self.connections.items[idx].opts);
+        var s = try self.openSessionWith(&self.connections.items[idx].opts);
+        s.conn_name = self.connections.items[idx].name;
+        return s;
     }
 
     /// 分片表自动建表：表不存在时按基础表结构建表（含索引）。
@@ -805,7 +812,16 @@ pub const Dal = struct {
     }
 
     /// 打开一个写会话；`Readonly=true` 时打开只读会话（写入在调用点报错）。
+    ///
+    /// 会话会带上 SQL 日志配置：连接名（日志前缀）+ 连接串 `ShowSQL`（`null` 则跟随全局设置）。
     pub fn openSession(self: *Dal) !Session {
+        var s = try self.openSessionRaw();
+        s.show_sql = self.opts.show_sql;
+        s.conn_name = self.connName();
+        return s;
+    }
+
+    fn openSessionRaw(self: *Dal) !Session {
         switch (self.opts.provider) {
             .sqlite => {
                 const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
@@ -1664,7 +1680,7 @@ test "连接串解析" {
 
     try std.testing.expectEqual(DatabaseKind.sqlite, opts.provider);
     try std.testing.expectEqualStrings("..\\Data\\DG.db", opts.data_source);
-    try std.testing.expect(opts.show_sql);
+    try std.testing.expectEqual(true, opts.show_sql.?);
     try std.testing.expectEqual(Migration.on, opts.migration.?);
     try std.testing.expectEqual(false, opts.pooling.?);
     try std.testing.expectEqual(@as(usize, 1), opts.extra.len);

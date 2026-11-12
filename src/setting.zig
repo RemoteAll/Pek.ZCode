@@ -93,8 +93,13 @@ pub const Setting = struct {
     // ---- 诊断 ----
     /// 是否启用调试（默认启用）
     debug: bool = true,
-    /// 是否输出 SQL 语句（默认启用）
-    show_sql: bool = true,
+    /// 是否输出 SQL 语句（**默认关**，配置写 `ShowSQL=true` 才开）
+    ///
+    /// 与 C# `XCodeSetting.ShowSQL = true` 的差异说明：C# 侧 `DbSession.ShowSQL` 的真实默认值
+    /// 取自 `XCode.Debug`（`#if DEBUG`，发布版为 false），所以**发布版默认不输出 SQL**。
+    /// 本仓没有 DEBUG/RELEASE 之分，直接以「默认关、显式开」对齐发布版行为，
+    /// 避免默认把每条 SQL 写进日志（既刷屏又浪费 IO）。
+    show_sql: bool = false,
     /// SQL 输出单独目录（空 = 跟着当前日志走）
     sql_path: []const u8 = "",
     /// SQL 执行时间超过该阈值（毫秒）就写日志，默认 1000
@@ -326,10 +331,10 @@ pub fn resetToDefaults() void {
 
 const testing = std.testing;
 
-test "默认值与 C# XCodeSetting 一致" {
+test "默认值（SQL 输出默认为关，对齐 C# 发布版行为）" {
     const s = Setting{};
     try testing.expect(s.debug);
-    try testing.expect(s.show_sql);
+    try testing.expect(!s.show_sql);
     try testing.expect(s.trace_sql_time == 1000);
     try testing.expect(s.sql_max_length == 4096);
     try testing.expect(!s.use_parameter);
@@ -408,7 +413,7 @@ test "全局实例：快照与恢复" {
     defer restore(old);
 
     resetToDefaults();
-    try testing.expect(!current().show_sql == false);
+    try testing.expect(!current().show_sql);
 
     var s = Setting{};
     s.show_sql = false;
