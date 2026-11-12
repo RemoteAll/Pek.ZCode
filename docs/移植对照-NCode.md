@@ -31,6 +31,10 @@
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
 | 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**`Db/Query` 两种载荷**：默认 JSON 行列；**`?format=packet` 返回 C# `DbTable` v3 二进制**（`src/dbtable_packet.zig`，字节级对齐真实 C# 运行时，C# 侧 `new DbTable().Read(pk)` 直接可读） |
+| 累加字段（`Additional`） | `BindColumnAttribute.Additional` / `Meta.Factory.AdditionalFields` | `dirty.rs` + 累加更新 | `src/model.zig` + `src/sqlbuild.zig` + `src/dbtable.zig` | ✅ `Model.xml` 的 `Additional="True"` 解析/回写；`AccumulateField` 三模式（`add` / `max` / `min`）生成**单条 SQL 原子累加**（`col = col + ?`、`CASE WHEN`），不做「读-改-写」；`TableRef.accumulate` 写后带失效通知 |
+| 统计 | `Statistics/{StatModel,StatHelper,StatField,StatLevels}` | `src/stat.rs` | `src/stat.zig` | ✅ 层级（全局/年/月/日/小时/分钟/季度，整数值与 C# 一致）与时间截断逐分支对齐；`Repository` = `find` / `getOrAdd`（没有就插，并发冲突再查）/ `accumulate`（sum·count·max·min）/ `addValues`；`avg` 明确报 `error.Unsupported`（不静默算错） |
+| 数据抽取 | `Transform/{IdExtracter,TimeExtracter,PagingExtracter,ExtractSetting}` | `src/transform.rs` | `src/extract.zig` | ✅ 三个抽取器都是「一次一批」迭代 + `total` 计数 + `done` 终止：Id 主键步进 / 时间窗切片（空窗加大步进）/ 分页兜底；`Setting` 含起止时间、偏移秒、步进、批大小 |
+| 窗口函数 | `DataAccessLayer/WindowFunction` | — | `src/window.zig` | ✅ `ROW_NUMBER` / `RANK` / `DENSE_RANK` / 聚合窗口 `FUNC(col) OVER(...)`；缺省别名与 C# 一致（`RowNum` / `Rank` / `DenseRank` / `{func}_{column}`） |
 | 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
 
 ## 2. 逐项语义对齐（已实现部分）
@@ -122,6 +126,44 @@
 
 **空结果集**：`Session` 不暴露列元数据，0 行时拿不到列名 → 返回 0 列 0 行的合法包（不塞假列名）。
 
+### 2.6 累加字段 / 统计 / 数据抽取（`src/{model,sqlbuild,dbtable,stat,extract}.zig`）
+
+**累加字段（`Additional`）**
+
+- `Model.xml` 的 `Column Additional="True"` ⇄ C# `BindColumnAttribute.Additional`；解析、`toXmlAlloc` 回写、
+  `TableMeta.additionalFields()` 都对齐。
+- 更新时不覆盖而是在列自身基础上算：`sqlbuild.AccumulateField` 三模式，都只用标准 SQL（五族方言通用）：
+
+  | 模式 | 生成片段 | 用途 |
+  |---|---|---|
+  | `add` | `"c" = "c" + ?` | 求和 / 计数（`count` 固定 `+1`） |
+  | `max` | `"c" = CASE WHEN "c" IS NULL OR "c" < ? THEN ? ELSE "c" END` | 峰值 |
+  | `min` | `"c" = CASE WHEN "c" IS NULL OR "c" > ? THEN ? ELSE "c" END` | 谷值 |
+
+  **必须走 SQL 原子累加**：`读到 5 → 内存里加 3 → 写回 8` 在并发下会丢增量（两个写入者都写 8 而不是 8/11）。
+- `TableRef.accumulate()` 写完同样触发缓存失效（与 `update` 一致）。
+
+**统计（`Statistics`）**
+
+- `Levels` 整数值与 C# 完全一致（`All=0 / Year=1 / Month=2 / Day=3 / Hour=4 / Minute=5 / Quarter=11`），可直接读 C# 落库值。
+- 时间截断逐分支对齐 `StatModel.GetDate`：年→`1-1`、月→`1` 日、日→`00:00`、小时→`:00`、分钟→秒归零、
+  `All`→`0001-01-01`、`Quarter`→**不截断**（C# 也没写这个分支，保持一致）。
+- `StatModel.init` 保留原时间；**`StatModel.at` 才按层级截断**——统计表主键是「层级 + 区间起点」，
+  写库前不截断会让同一小时的两条数据落成两行。
+- `Repository`：`find`（层级+时间）/ `getOrAdd`（没有就插；插入失败再查一次，并发下按已存在处理）/
+  `accumulate`（顺带刷 `UpdateTime`）/ `addValues`（= getOrAdd + accumulate）。
+
+**数据抽取（`Transform`）**
+
+| 抽取器 | 每批查询 | 适用 |
+|---|---|---|
+| `IdExtractor` | `WHERE id > 上批末尾 ORDER BY id LIMIT n` | 自增 / 雪花 Id |
+| `TimeExtractor` | 时间窗 `[start, end)` + 每批后重开窗口 | 有时间索引列 |
+| `PagingExtractor` | `LIMIT n OFFSET m` | 无递增列时兜底（越翻越慢） |
+
+- 三者都维护 `total`（累计行数）与 `done`（终止）；断点续跑用 `row`（Id/分页）或 `start`（时间）。
+- `TimeExtractor` 的空窗处理：**起点推进到窗口末尾**并加倍步进（60s → 1 天封顶），保证单调前进。
+
 ## 3. 与 C#/Rust 的行为差异（有意为之）
 | 差异 | 原因 |
 |---|---|
@@ -132,6 +174,13 @@
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
 | `Db/Query` 默认回 JSON 行列（二进制需 `?format=packet`） | Rust 版也是 JSON；二进制模式是为 C# `DbTable.Read` 互通而加，两者并存不改变旧行为。C# 侧 `DbController.Query` 只有二进制一种形态（它的 `ToPacket` 自己标着“暂时有问题”），所以“跟 C# 一模一样”就只能二选一：默认 JSON 保持与 Rust 一致，需要 C# 互通时客户端显式要 packet |
 | Oracle 执行驱动未做 | 无 `oci.dll` / `libclntsh`、也无实例：写了也无法验证，违反“实测优先” |
+| `TimeExtractor` 空窗时把起点推进到窗口末尾 | C# 版空窗只加倍步进、`StartTime` 不动，步进封顶到 1 天后就对同一段空区间**反复查询（原地死循环）**；这里必须能终止 |
+| `stat` 的 `avg` 直接报 `error.Unsupported` | C# 的均值由业务层「先读再算」；本库不提供假的原子实现，要求调用方自己维护 `Sum` + `Count` |
+| `StatModel.init` 不截断、`StatModel.at` 截断 | 与 C# 一致（C# 是 `Fill`/`Split` 才截断）；分开两个构造器让“要不要截断”显式化，避免静默改变时间值 |
+| 窗口函数别名按方言引用 | C# 原样拼别名；SQLite 会把未引用别名当标识符且大小写折叠，故 Zig 侧引起来（函数名与 OVER 子句仍逐字一致） |
+| `MSPageSplit`（SQL Server 2000/2005 的 TOP + NOT IN / 双 TOP / ROW_NUMBER 分页）未移植 | 本库的 SQL Server 分页走 `OFFSET..FETCH`（SQL Server 2012+）；老版本分页属遗留算法，且需要整套 `SelectBuilder` 克隆/子查询设施，收益低于成本 |
+| `Membership`（用户/角色/部门/菜单/租户/日志/参数/地区 + DataScope）、`Linq/EntityQueryProvider`、`XCodeTool` 的模板引擎未移植 | 前者是独立子系统（对应 Rust 生态里的 `Pek.RPermissions`，本库定位是 ORM 核心）；LINQ 表达式树在 Zig 无对应语法，条件用 `Where` 结构化拼装；模板引擎由 `codegen.zig`（Model.xml → Zig 实体）承担 |
+| 20+ 种小众方言（Access/ClickHouse/TDengine/DuckDB/Hana/Firebird/DB2/达梦/IRIS/MongoDB/NovaDb…）未实现 | 枚举与连接串可识别，但类型映射/DDL 明确 `error.Unsupported`，不生成“看起来能跑”的错误 SQL |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）
 

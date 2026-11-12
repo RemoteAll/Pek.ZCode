@@ -900,3 +900,8 @@ test {
 test {
     _ = @import("integration_tsql.zig");
 }
+
+// 统计累加 + 数据抽取器（真 SQLite）
+test {
+    _ = @import("integration_stat_extract.zig");
+}

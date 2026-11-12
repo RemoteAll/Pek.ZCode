@@ -94,6 +94,12 @@ pub const dbservice = @import("dbservice.zig");
 pub const dbclient = @import("dbclient.zig");
 /// C# `DbTable` v3 二进制编解码（`Db/Query` 的跨语言互通）
 pub const dbtable_packet = @import("dbtable_packet.zig");
+/// 统计模型与累加（层级截断 / 原子累加 / 找不到就插）
+pub const stat = @import("stat.zig");
+/// 数据抽取器（自增 Id / 时间窗 / 分页，大表搬迁与同步）
+pub const extract = @import("extract.zig");
+/// 窗口函数 SQL 片段（ROW_NUMBER / RANK / DENSE_RANK / 聚合窗口）
+pub const window = @import("window.zig");
 pub const Error = error{
     Model,
     Xml,
@@ -133,4 +139,7 @@ test {
     _ = @import("dbservice.zig");
     _ = @import("dbclient.zig");
     _ = @import("dbtable_packet.zig");
+    _ = @import("stat.zig");
+    _ = @import("extract.zig");
+    _ = @import("window.zig");
 }

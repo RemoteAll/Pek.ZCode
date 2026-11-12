@@ -123,6 +123,25 @@ pub const TableRef = struct {
         return affected;
     }
 
+    /// 累加更新（对应 C# 累加字段 `Additional`）：`SET col = col + ?`。
+    ///
+    /// 与 `update` 的区别：`update` 把列置为给定值（覆盖），`accumulate` 在列自身基础上累加。
+    /// 统计类字段必须走这里——覆盖写会丢并发增量。
+    pub fn accumulate(self: *const TableRef, s: *Session, fields: []const sqlbuild.AccumulateField, filter: ?*const Where) !usize {
+        return self.accumulateWith(s, fields, filter);
+    }
+
+    /// 累加更新（显式模式：`add` / `max` / `min`）。
+    pub fn accumulateWith(self: *const TableRef, s: *Session, fields: []const sqlbuild.AccumulateField, filter: ?*const Where) !usize {
+        if (fields.len == 0) return 0;
+        try self.ensureWritable();
+        const sql = try sqlbuild.updateAccumulate(self.gpa, self.kind, self.table, self.table_name, fields, filter);
+        defer sql.deinit(self.gpa);
+        const affected = try s.execute(sql.text, sql.params);
+        if (affected > 0) self.notifyWrite();
+        return affected;
+    }
+
     /// 删除（同样：`filter` 为空即清空全表，慎用）。
     pub fn delete(self: *const TableRef, s: *Session, filter: ?*const Where) !usize {
         try self.ensureWritable();

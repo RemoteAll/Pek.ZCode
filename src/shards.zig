@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Value = @import("zzig").db.Value;
+const Buf = @import("zzig").Buf;
 const query = @import("query.zig");
 const Where = query.Where;
 const clock = @import("clock.zig");
@@ -419,13 +420,12 @@ pub fn appendDatePattern(gpa: std.mem.Allocator, out: *std.ArrayList(u8), patter
 }
 
 /// 零填充输出非负整数（**不用** `{d:0>4}`：Zig 0.17 的格式说明会带上多余符号位）。
+/// 实现已下沉到 `zzig.Buf.addZeroPadded`，这里保留薄转调，避免仓库内两份。
 fn appendZeroPadded(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype, width: usize) !void {
-    var num_buf: [24]u8 = undefined;
-    const text = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch return error.Model;
-    var pad = width;
-    if (text.len < width) pad = width - text.len else pad = 0;
-    while (pad > 0) : (pad -= 1) try out.append(gpa, '0');
-    try out.appendSlice(gpa, text);
+    var buf = Buf.init(gpa);
+    defer buf.deinit();
+    try buf.addZeroPadded(value, width);
+    try out.appendSlice(gpa, buf.slice());
 }
 
 // ───────────────────────────── 测试 ─────────────────────────────

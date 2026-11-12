@@ -186,6 +186,87 @@ pub fn update(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
+/// 累加模式（对应 C# 累加字段 `Additional` 的三种口径）。
+pub const Accumulate = enum {
+    /// `col = col + ?`（求和 / 计数）
+    add,
+    /// `col = CASE WHEN col IS NULL OR col < ? THEN ? ELSE col END`（求最大值）
+    max,
+    /// `col = CASE WHEN col IS NULL OR col > ? THEN ? ELSE col END`（求最小值）
+    min,
+};
+
+/// 一条累加字段：列名 + 增量 + 模式。
+pub const AccumulateField = struct {
+    name: []const u8,
+    value: Value,
+    mode: Accumulate = .add,
+};
+
+/// 组装累加 UPDATE：SQL 侧原子累加，避免「读-改-写」的并发丢更新。
+///
+/// 与 `update` 的差别只在 SET 子句：这里不把列置为参数值，而是在列自身基础上累加。
+/// 三种模式都只用标准 SQL（`+` 与 `CASE WHEN`），SQLite / MySQL / SQL Server / PostgreSQL / Oracle 通用。
+pub fn updateAccumulate(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    fields: []const AccumulateField,
+    filter: ?*const Where,
+) !Sql {
+    if (fields.len == 0) return error.Model;
+
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+
+    try b.add("UPDATE ");
+    try kind.pushQuoted(&b, table_name);
+    try b.add(" SET ");
+    for (fields, 0..) |field, index| {
+        if (index > 0) try b.add(", ");
+        const quoted = try kind.quoteAlloc(gpa, try columnName(table, field.name));
+        defer gpa.free(quoted);
+        try b.add(quoted);
+        switch (field.mode) {
+            .add => {
+                try b.add(" = ");
+                try b.add(quoted);
+                try b.add(" + ");
+                try kind.pushPlaceholder(&b, params.items.len);
+                try params.append(gpa, field.value);
+            },
+            .max, .min => {
+                try b.add(" = CASE WHEN ");
+                try b.add(quoted);
+                try b.add(" IS NULL OR ");
+                try b.add(quoted);
+                try b.add(if (field.mode == .max) " < " else " > ");
+                try kind.pushPlaceholder(&b, params.items.len);
+                try params.append(gpa, field.value);
+                try b.add(" THEN ");
+                try kind.pushPlaceholder(&b, params.items.len);
+                try params.append(gpa, field.value);
+                try b.add(" ELSE ");
+                try b.add(quoted);
+                try b.add(" END");
+            },
+        }
+    }
+    if (filter) |f| {
+        if (!f.isEmpty()) {
+            try b.add(" WHERE ");
+            try f.renderInto(gpa, kind, &params, &b);
+        }
+    }
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
 /// 组装 DELETE。
 pub fn delete(
     gpa: std.mem.Allocator,

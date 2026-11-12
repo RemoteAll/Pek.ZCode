@@ -152,6 +152,9 @@ pub const ColumnMeta = struct {
     primary_key: bool = false,
     master: bool = false,
     nullable: bool = false,
+    /// 累加字段（C# `BindColumnAttribute.Additional`）：更新时按 `col = col + 值` 累加，
+    /// 不做整体覆盖；统计类字段靠它避免「读-改-写」丢更新。
+    additional: bool = false,
     default_value: ?[]const u8 = null,
     description: []const u8 = "",
     enum_type: ?[]const u8 = null,
@@ -243,6 +246,16 @@ pub const TableMeta = struct {
             if (c.identity) return c;
         }
         return null;
+    }
+
+    /// 累加字段列表（对应 C# `Meta.Factory.AdditionalFields`）。
+    pub fn additionalFields(self: *const TableMeta, gpa: std.mem.Allocator) ![]const *const ColumnMeta {
+        var list: std.ArrayList(*const ColumnMeta) = .empty;
+        errdefer list.deinit(gpa);
+        for (self.columns) |*c| {
+            if (c.additional) try list.append(gpa, c);
+        }
+        return list.toOwnedSlice(gpa);
     }
 
     /// 整表按 MySQL utf8mb4 估算的行内字节数。
@@ -444,6 +457,7 @@ pub const EntityModel = struct {
                 if (c.primary_key) try writeAttr(&b, "PrimaryKey", "True");
                 if (c.master) try writeAttr(&b, "Master", "True");
                 if (c.nullable) try writeAttr(&b, "Nullable", "True");
+                if (c.additional) try writeAttr(&b, "Additional", "True");
                 try writeAttr(&b, "DefaultValue", c.default_value);
                 try writeAttr(&b, "Type", c.enum_type);
                 try writeAttr(&b, "DataScale", c.data_scale);
@@ -563,6 +577,7 @@ fn parseColumn(a: std.mem.Allocator, e: *const zzig.xml.Dom.Element, table_name:
         .primary_key = attrBool(e, "PrimaryKey"),
         .master = attrBool(e, "Master"),
         .nullable = attrBool(e, "Nullable"),
+        .additional = attrBool(e, "Additional"),
         .default_value = attrString(e, "DefaultValue"),
         .description = attrString(e, "Description") orelse "",
         .enum_type = attrString(e, "Type"),
@@ -606,7 +621,7 @@ const column_known_attrs = [_][]const u8{
     "Precision",   "Scale",        "Identity", "PrimaryKey", "Master",
     "Nullable",    "DefaultValue", "Type",     "DataScale",  "Map",
     "ShowIn",      "Model",        "Category", "ItemType",   "UsingCache",
-    "Description",
+    "Additional",  "Description",
 };
 
 /// 收集未识别属性（跳过 `xmlns*` 与带前缀的属性）。
