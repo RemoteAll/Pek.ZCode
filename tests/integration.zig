@@ -895,3 +895,8 @@ test {
 test {
     _ = @import("integration_dbservice.zig");
 }
+
+// SQL Server 接线（连接串 + 假 TDS 服务端上的建表链路；协议层见 zzig 回环用例）
+test {
+    _ = @import("integration_tsql.zig");
+}

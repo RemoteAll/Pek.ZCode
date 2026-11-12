@@ -17,7 +17,7 @@
 | SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `zzig`：`db/sqlite.zig`（动态加载 DLL） | ✅ |
 | MySQL 驱动 | `DH.NCode.MySql` | `src/mysql.rs`（`mysql` crate，纯协议） | `zzig`：`db/mysql.zig`（**纯协议**，不加载 libmysqlclient） | ✅ 握手/鉴权/COM_QUERY/预处理二进制协议/**`LOAD DATA LOCAL INFILE` 流式批量装载**/**TLS（`SslMode` 五档）**/**压缩协议（`CLIENT_COMPRESS`）**；可任意叠加（压缩在 TLS 内层） |
 | 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count/batch |
-| 连接与迁移 | `DAL` / `Migration` | `src/dal.rs` | `src/dal.zig` | ✅ 增量建表/补列/建索引；**`Full` 档删列删索引**；表级档位只能收紧；幂等 |
+| 连接与迁移 | `DAL` / `Migration` | `src/dal.rs` | `src/dal.zig` | ✅ 增量建表/补列/建索引；**`Full` 档删列删索引 + 改列类型/长度**（SQLite 走整表重建）；表级档位只能收紧；幂等 |
 | 对象实体 + 脏更新 | `Entity` | `src/entity.rs` / `dirty.rs` | `src/entity.zig` | ✅ insert/update(脏列)/save/saveBatch/delete/find/query |
 | 整表/单对象缓存 | `Meta.Cache` | `src/cache.rs` | `src/cache.zig` | ✅ 整表 `Cache(T)` + `SingleCache(T)`，写后自动失效 |
 | 批量写 / 队列 | `EntityExtension` / `EntityDeferredQueue` | `src/batch.rs` / `entity_queue.rs` | `src/entity_queue.zig` | ✅ 多行 INSERT 分批 + 延迟写队列（按条数/时间触发，失败保留队列） |
@@ -31,7 +31,7 @@
 | 代码生成 | `XCodeTool` | `codegen.rs` | `src/codegen.zig` + `tools/zcodegen.zig` | ✅ `Model.xml` → Zig 实体 |
 | 备份 | `DAL_Backup` | `backup.rs` | `src/backup.zig` | ✅ SQLite 原生快照（`VACUUM INTO`）+ SQL 脚本（结构+数据，SQLite/MySQL） |
 | 远程服务 | `DbServer` / `DbService` | `db_service.rs` | `src/dbservice.zig` + `src/dbclient.zig`（服务端在 `zzig/src/http/server.zig`） | ✅ HTTP/1.1 + JSON 信封；Login / Query / Execute / InsertAndGetIdentity / QueryCount / GetTables / Begin·Commit·Rollback（事务带令牌路由 + 空闲自动回滚）/ 令牌·库白名单；客户端 401→`Unauthorized`、404→`Unsupported` 降级。**差异**：`Db/Query` 返回 JSON 行列，C# 的 `DbTable` v3 二进制未实现（跨语言调 Query 不互通，其余路由互通） |
-| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；SQL Server（TDS）与 Oracle（OCI/TNS）**未做** |
+| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
 
 ## 2. 逐项语义对齐（已实现部分）
 
@@ -77,9 +77,22 @@
 ### 2.4 结构同步（`Dal.syncSchema`）
 
 - 迁移档位：连接串 `Migration=` 优先，其次模型 `<Option><Migration>`，缺省 `On`。
-  `Off` 不做任何 DDL；`ReadOnly` 只生成不执行；`On`/`Full` 执行增量（本轮两者行为相同，`Full` 的删除/改列未实现）。
-- 动作：缺表 → 建表（含索引）；已存在 → `PRAGMA table_info` 对比补列；索引按名字幂等比对后补建。
-- **幂等**：二次同步 `tables_created / columns_added / indexes_created` 均为 0（集成测试固化）。
+  `Off` 不做任何 DDL；`ReadOnly` 只生成不执行；`On` 只创建；`Full` 额外**删列、删索引、改列类型/长度**。
+- 动作：缺表 → 建表（含索引）；已存在 → 读现有列（SQLite `PRAGMA table_info`，MySQL/SQL Server/PostgreSQL
+  `information_schema.columns`）对比补列；索引按名字幂等比对后补建。
+- **改列（`Full` 档）**：
+  - MySQL / SQL Server / Oracle / PostgreSQL 系 → `ALTER TABLE ... MODIFY/ALTER COLUMN`；
+    **MySQL/Oracle/SQL Server 的 `MODIFY` 是整列定义替换**，所以语句里必须带上 `NOT NULL`/`NULL`
+    （MySQL/Oracle 还要带 `DEFAULT`、`COMMENT`），否则约束会被悄悄弄丢（MySQL 8.0.29 真库实测过）。
+  - SQLite 没有 `ALTER COLUMN` → **整表重建**：`RENAME TO {表}_zcode_old` → 按模型建表 → 复制共同列 →
+    `DROP` 旧表 → 重建索引（索引名库内全局唯一，必须等旧表删掉才能建同名索引）。
+    只复制**两边都有的列**（Full 档允许丢列）；自增主键值原样搬过去。
+  - **类型比对口径**：基础名归并同义词（`integer`→`int`、`character varying`→`varchar`、`numeric`→`decimal`…），
+    括号参数**只在两边都写了才比** —— MySQL 的 `bit(1)` / `tinyint(1)` 显示宽度不该触发反复 ALTER。
+  - **可空性不自动改**：模型要 NOT NULL 而库里可空时只打日志（存量 NULL 会让约束失败）。
+  - SQLite 重建的已知代价：库里的**视图/触发器**会被 `RENAME` 改指向临时表，重建后需人工复查
+    （因此只在 `Full` 档触发）。
+- **幂等**：二次同步 `tables_created / columns_added / columns_altered / indexes_created` 均为 0（集成测试固化）。
 
 ## 3. 与 C#/Rust 的行为差异（有意为之）
 
@@ -90,6 +103,8 @@
 | 同步实现，无连接池/异步门面 | 第一轮只做「能正确跑通」的核心链路；池化与异步在后续轮次 |
 | SQLite 通过 DLL 动态加载 | 不链 libc / UCRT（`-lc` 在 Win7 起不来）；也便于替换 SQLite 版本 |
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
+| `Db/Query` 回 JSON 行列而非 C# 的 `DbTable` v3 二进制 | C# 侧 `DbController.Query` 自己写着「`ToPacket` 暂时有问题」；该格式是 NewLife `Binary` 序列化器的私有编码（`EncodeInt=7bit` 等），没有官方字节级规范，无 dotnet 环境就无法做「对齐验证」。按“不能猜”的规矩**不写不可验证的编解码**，其余路由（Login/Execute/…）仍是 JSON 信封可互通 |
+| Oracle 执行驱动未做 | 无 `oci.dll` / `libclntsh`、也无实例：写了也无法验证，违反“实测优先” |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）
 
@@ -106,11 +121,12 @@
 | 结果集行 | `src/db/row.zig` | `zzig.db.Row` | 各驱动共用的行结构（按列名/序号取值） |
 | SQLite 驱动 | `src/db/sqlite.zig` | `zzig.db.sqlite`（别名 `zzig.sqlite`） | 任何需要嵌入式 SQLite 的 Zig 项目 |
 | MySQL 驱动（绿色） | `src/db/mysql.zig` | `zzig.db.mysql`（别名 `zzig.mysql`） | 纯协议访问 MySQL，不加载 libmysqlclient |
+| PostgreSQL 驱动 | `src/db/postgres.zig` | `zzig.db.postgres`（别名 `zzig.postgres`） | 纯协议访问 PostgreSQL（含金仓/瀚高/海量） |
+| SQL Server 驱动 | `src/db/tds.zig` | `zzig.db.tds`（别名 `zzig.tds`） | 纯协议 TDS 7.4，不加载 ODBC/sqlncli |
 | 临时文件名 / 静默删除 | `src/file/file.zig` | `zzig.File.UniqueTempName` / `DeleteQuiet` | 测试临时库、导出中间文件 |
 
 ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcode.DateTime` / `zcode.Value` /
 `zcode.buf` / `zcode.sqlite` / `zcode.mysql` / `zcode.File`。
-
 **不下沉**（带 XCode 语义，属于本库）：`types`（CLR 类型名）、`model`、`dialect`、`query`、`sqlbuild`、
 `session`、`dbtable`、`dal`。
 
@@ -130,3 +146,6 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
    时读到已失效的栈内容（实测 `"12.3400"` 变成 `"400"`）。
 7. **连接串解析出的路径必须复制**：`Data Source` 直接借用入参切片，`Dal` 生命周期长于调用方的临时字符串
    （实测释放后变成 `UUUU...` 垃圾文件名）。
+8. **数组重复写法 `[_]u8{0} ** N` 在 0.17.1 直接报错**：`error: binary operator '*' has whitespace on one side,
+   but not the other`（解析成两个 `*`）。用 `@memset(&buf, 0)` 或把初值逐个写出来（本轮 TDS 驱动与测试都踩到）。
+9. **`std.posix.getenv` 已不存在**（0.17 的 std 里没有），测试要开关就走文件级变量，别读环境变量。

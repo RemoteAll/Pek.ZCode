@@ -549,13 +549,21 @@ pub const DatabaseKind = enum {
         return b.toOwnedSlice();
     }
 
-    /// 修改列类型（仅 Full 档；SQLite 不支持直接改列类型）。
+    /// 修改列类型（仅 Full 档；SQLite 不支持直接改列类型，返回 null 由上层整表重建）。
+    ///
+    /// **MySQL / SQL Server / Oracle 的 `MODIFY` / `ALTER COLUMN` 是「整列定义替换」**：
+    /// 漏写 `NOT NULL` 会把非空约束悄悄去掉，漏写 `DEFAULT` 会丢默认值
+    /// （本轮在 MySQL 8.0.29 真库上实测：只写类型 → 列变成 `DEFAULT NULL`）。
+    /// 所以这里必须把可空性（和 MySQL/Oracle 的默认值、注释）一并带上。
     pub fn alterColumnAlloc(self: DatabaseKind, gpa: std.mem.Allocator, table: *const TableMeta, col: ColumnMeta) !?[]u8 {
         if (!self.isImplemented()) return error.Unsupported;
         if (self == .sqlite) return null;
 
         const ftype = try self.fieldTypeAlloc(gpa, col);
         defer gpa.free(ftype);
+
+        const default_part = try columnDefaultSql(gpa, self, col);
+        defer if (default_part) |d| gpa.free(d);
 
         var b = Buf.init(gpa);
         defer b.deinit();
@@ -566,6 +574,13 @@ pub const DatabaseKind = enum {
                 try b.add(" Modify Column ");
                 try self.pushQuoted(&b, table.effectiveColumnName(@constCast(&col)));
                 try b.fmt(" {s}", .{ftype});
+                if (col.nullable) try b.add(" NULL") else try b.add(" NOT NULL");
+                if (default_part) |d| try b.fmt(" DEFAULT {s}", .{d});
+                if (col.description.len > 0) {
+                    try b.add(" COMMENT '");
+                    try pushEscapedMysql(&b, col.description);
+                    try b.add("'");
+                }
             },
             .sqlserver => {
                 try b.add("Alter Table ");
@@ -573,9 +588,11 @@ pub const DatabaseKind = enum {
                 try b.add(" Alter Column ");
                 try self.pushQuoted(&b, table.effectiveColumnName(@constCast(&col)));
                 try b.fmt(" {s}", .{ftype});
-                if (!col.nullable) try b.add(" NOT NULL");
+                // SQL Server 的 ALTER COLUMN 不接受 DEFAULT（要另用 ADD CONSTRAINT）
+                if (col.nullable) try b.add(" NULL") else try b.add(" NOT NULL");
             },
             .postgresql, .kingbase, .highgo, .vastbase => {
+                // PG 的 `ALTER COLUMN TYPE` 只改类型，可空性是独立属性（不在这里动）
                 try b.add("ALTER TABLE ");
                 try self.pushQuoted(&b, table.effectiveTableName());
                 try b.add(" ALTER COLUMN ");
@@ -588,6 +605,8 @@ pub const DatabaseKind = enum {
                 try b.add(" Modify ");
                 try self.pushQuoted(&b, table.effectiveColumnName(@constCast(&col)));
                 try b.fmt(" {s}", .{ftype});
+                if (default_part) |d| try b.fmt(" DEFAULT {s}", .{d});
+                if (col.nullable) try b.add(" NULL") else try b.add(" NOT NULL");
             },
             else => return null,
         }

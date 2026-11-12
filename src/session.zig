@@ -14,6 +14,7 @@ const std = @import("std");
 const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
 const postgres = @import("zzig").postgres;
+const tds = @import("zzig").tds;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
@@ -42,11 +43,12 @@ pub const IsolationLevel = enum {
     }
 };
 
-/// 会话底层驱动（SQLite / MySQL / PostgreSQL；其它方言在 Dal 层已报 `error.Unsupported`）。
+/// 会话底层驱动（SQLite / MySQL / PostgreSQL / SQL Server；其它方言在 Dal 层已报 `error.Unsupported`）。
 pub const Driver = union(enum) {
     sqlite: sqlite.Db,
     mysql: mysql.Conn,
     postgres: postgres.Conn,
+    sqlserver: tds.Conn,
 };
 
 pub const Session = struct {
@@ -89,6 +91,7 @@ pub const Session = struct {
             .sqlite => |*db| db.close(),
             .mysql => |*conn| conn.deinit(),
             .postgres => |*conn| conn.deinit(),
+            .sqlserver => |*conn| conn.deinit(),
         }
     }
 
@@ -183,6 +186,13 @@ pub const Session = struct {
                 };
                 return @intCast(n);
             },
+            .sqlserver => |*conn| {
+                const n = conn.exec(sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -248,6 +258,17 @@ pub const Session = struct {
                     .ok => &.{},
                 };
             },
+            .sqlserver => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    // TDS 侧行结构与本仓 `Row` 相同（都是 zzig.db.Row）
+                    .rows => |rows| rows.rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -265,6 +286,8 @@ pub const Session = struct {
             .mysql => |*conn| conn.lastInsertId(),
             // PostgreSQL 无自增回写（需 `RETURNING`），恒为 0
             .postgres => |*conn| conn.lastInsertId(),
+            // SQL Server：插入后自动取 `SCOPE_IDENTITY()`
+            .sqlserver => |*conn| conn.lastInsertId(),
         };
     }
 
@@ -273,6 +296,7 @@ pub const Session = struct {
             .sqlite => |*db| db.lastError(),
             .mysql => |*conn| conn.lastError(),
             .postgres => |*conn| conn.lastError(),
+            .sqlserver => |*conn| conn.lastError(),
         };
     }
 
@@ -283,6 +307,7 @@ pub const Session = struct {
             .sqlite => |*db| db.prepare(self.gpa, sql),
             .mysql => error.Unsupported,
             .postgres => error.Unsupported,
+            .sqlserver => error.Unsupported,
         };
     }
 
@@ -298,7 +323,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres => error.Unsupported,
+            .sqlite, .postgres, .sqlserver => error.Unsupported,
         };
     }
 
@@ -348,6 +373,19 @@ pub const Session = struct {
                     _ = try self.execute("BEGIN", &.{});
                 }
             },
+            .sqlserver => {
+                if (level != .default) {
+                    // SQL Server 的快照隔离用 `SNAPSHOT`（库级需先 `ALLOW_SNAPSHOT_ISOLATION ON`）
+                    const text = if (level == .snapshot) "SNAPSHOT" else level.sqlText() orelse {
+                        std.debug.print("[zcode] 事务：SQL Server 不支持隔离级别 {s}\n", .{@tagName(level)});
+                        return error.Unsupported;
+                    };
+                    const sql = try std.fmt.allocPrint(self.gpa, "SET TRANSACTION ISOLATION LEVEL {s}", .{text});
+                    defer self.gpa.free(sql);
+                    _ = try self.execute(sql, &.{});
+                }
+                _ = try self.execute("BEGIN TRANSACTION", &.{});
+            },
             else => return error.Unsupported,
         }
         return self.tx_depth;
@@ -362,7 +400,7 @@ pub const Session = struct {
 
         if (self.tx_depth == 0) {
             switch (self.kind) {
-                .sqlite, .mysql, .postgresql => _ = try self.execute("COMMIT", &.{}),
+                .sqlite, .mysql, .postgresql, .sqlserver => _ = try self.execute("COMMIT", &.{}),
                 else => return error.Unsupported,
             }
         }
@@ -381,7 +419,7 @@ pub const Session = struct {
         if (self.tx_depth > 0) return self.tx_depth;
 
         switch (self.kind) {
-            .sqlite, .mysql, .postgresql => {
+            .sqlite, .mysql, .postgresql, .sqlserver => {
                 _ = self.execute("ROLLBACK", &.{}) catch |e| {
                     if (ignore_exception) {
                         std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });

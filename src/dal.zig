@@ -14,6 +14,7 @@ const DatabaseKind = dialect.DatabaseKind;
 const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
 const postgres = @import("zzig").postgres;
+const tds = @import("zzig").tds;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -157,16 +158,19 @@ pub const SchemaReport = struct {
     columns_dropped: usize = 0,
     /// 仅 `Migration=Full`：删除模型里已不存在的索引
     indexes_dropped: usize = 0,
+    /// 仅 `Migration=Full`：改了类型/长度的列（SQLite 走整表重建）
+    columns_altered: usize = 0,
     /// 生成但未执行（`Migration=ReadOnly`）
     executed: bool = true,
 
     pub fn describeAlloc(self: SchemaReport, gpa: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(
             gpa,
-            "结构同步：建表 {d} / 补列 {d} / 建索引 {d} / 删列 {d} / 删索引 {d} / 跳过 {d}{s}",
+            "结构同步：建表 {d} / 补列 {d} / 改列 {d} / 建索引 {d} / 删列 {d} / 删索引 {d} / 跳过 {d}{s}",
             .{
-                self.tables_created,  self.columns_added,   self.indexes_created,
-                self.columns_dropped, self.indexes_dropped, self.tables_skipped,
+                self.tables_created,  self.columns_added,   self.columns_altered,
+                self.indexes_created, self.columns_dropped, self.indexes_dropped,
+                self.tables_skipped,
                 if (self.executed) "" else "（只读：未执行）",
             },
         );
@@ -266,6 +270,21 @@ pub const Dal = struct {
                 if (opts_owned.database.len == 0) return error.NoDatabase;
                 // 端口缺省以方言为准（PG 5432），不能沿用 MySQL 的 3306
                 if (opts_owned.port == 3306) opts_owned.port = postgres.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
+            .sqlserver => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                if (opts_owned.database.len == 0) return error.NoDatabase;
+                // 端口缺省以方言为准（SQL Server 1433）
+                if (opts_owned.port == 3306) opts_owned.port = tds.default_port;
                 return Dal{
                     .gpa = gpa,
                     .model = m,
@@ -431,6 +450,18 @@ pub const Dal = struct {
                 s.read_only = opts.read_only;
                 return s;
             },
+            .sqlserver => {
+                const conn = try tds.Conn.open(self.gpa, .{
+                    .host = opts.server,
+                    .port = opts.port,
+                    .user = opts.user,
+                    .password = opts.password,
+                    .database = opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
+                s.read_only = opts.read_only;
+                return s;
+            },
             else => return error.Unsupported,
         }
     }
@@ -454,7 +485,7 @@ pub const Dal = struct {
     pub fn supportsPooling(self: *const Dal) bool {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
-            .mysql, .postgresql => true,
+            .mysql, .postgresql, .sqlserver => true,
             else => false,
         };
     }
@@ -669,6 +700,18 @@ pub const Dal = struct {
                 s.read_only = self.opts.read_only;
                 return s;
             },
+            .sqlserver => {
+                const conn = try tds.Conn.open(self.gpa, .{
+                    .host = self.opts.server,
+                    .port = self.opts.port,
+                    .user = self.opts.user,
+                    .password = self.opts.password,
+                    .database = self.opts.database,
+                });
+                var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
+                s.read_only = self.opts.read_only;
+                return s;
+            },
             else => return error.Unsupported,
         }
     }
@@ -788,6 +831,7 @@ pub const Dal = struct {
             // 顺序：**先删索引再删列**——否则引用该列的索引会让 DROP COLUMN 报
             //「error in index ... after drop column: no such column」
             if (!migration.onlyCreate()) {
+                try self.alterChangedColumns(s, t, execute_ddl, &report);
                 try self.dropExtraIndexes(s, t, execute_ddl, &report);
                 try self.dropExtraColumns(s, t, existing, execute_ddl, &report);
             }
@@ -857,6 +901,13 @@ pub const Dal = struct {
                     defer self.gpa.free(quoted_idx);
                     break :blk try std.fmt.allocPrint(self.gpa, "ALTER TABLE {s} DROP INDEX {s}", .{ quoted_table, quoted_idx });
                 },
+                .sqlserver => blk: {
+                    const quoted_table = try self.opts.provider.quoteAlloc(self.gpa, t.effectiveTableName());
+                    defer self.gpa.free(quoted_table);
+                    const quoted_idx = try self.opts.provider.quoteAlloc(self.gpa, idx_name);
+                    defer self.gpa.free(quoted_idx);
+                    break :blk try std.fmt.allocPrint(self.gpa, "DROP INDEX {s} ON {s}", .{ quoted_idx, quoted_table });
+                },
                 else => return error.Unsupported,
             };
             defer self.gpa.free(sql);
@@ -869,6 +920,171 @@ pub const Dal = struct {
             }
             report.indexes_dropped += 1;
         }
+    }
+
+    /// `Migration=Full` 档：把库里类型/长度与模型不一致的列改过来。
+    ///
+    /// - MySQL / SQL Server / Oracle / PostgreSQL 系：`ALTER TABLE ... MODIFY/ALTER COLUMN`
+    /// - SQLite：没有 `ALTER COLUMN`，只能**整表重建**（见 `rebuildSqliteTable`）
+    /// - **可空性不自动改**（存量 NULL 会让约束失败），只打日志提醒
+    fn alterChangedColumns(self: *Dal, s: *Session, t: *const model.TableMeta, execute_ddl: bool, report: *SchemaReport) !void {
+        const infos = existingColumnInfos(s, self.gpa, self.opts.provider, t.effectiveTableName()) catch |e| {
+            std.debug.print(
+                "[sync_schema] 读取 {s} 的现有列类型失败（{s}），本轮跳过改列比对\n",
+                .{ t.name, @errorName(e) },
+            );
+            return;
+        };
+        defer freeExistingColumns(self.gpa, infos);
+
+        var sqlite_needs_rebuild = false;
+        var changed: usize = 0;
+
+        for (t.columns) |col| {
+            const col_name = t.effectiveColumnName(@constCast(&col));
+            const db_col = findExistingColumn(infos, col_name) orelse continue;
+            // 自增列的类型由数据库自己维护（如 SQLite 的 integer PRIMARY KEY），不强改
+            if (col.identity) continue;
+
+            const model_type = try self.opts.provider.fieldTypeAlloc(self.gpa, col);
+            defer self.gpa.free(model_type);
+            if (typesEquivalent(model_type, db_col.type_text)) {
+                if (!col.nullable and db_col.nullable) {
+                    std.debug.print(
+                        "[sync_schema] 注意：{s}.{s} 模型要求 NOT NULL，库里可空（驱动 {s}，现有类型 {s}）；" ++
+                            "可空性不自动改（存量 NULL 会让约束失败）\n",
+                        .{ t.name, col_name, @tagName(self.opts.provider), db_col.type_text },
+                    );
+                }
+                continue;
+            }
+
+            if (self.opts.provider == .sqlite) {
+                sqlite_needs_rebuild = true;
+                changed += 1;
+                continue;
+            }
+
+            const alter_sql = (try self.opts.provider.alterColumnAlloc(self.gpa, t, col)) orelse continue;
+            defer self.gpa.free(alter_sql);
+            if (execute_ddl) {
+                _ = s.execute(alter_sql, &.{}) catch |e| {
+                    std.debug.print("[sync_schema] 改列失败：{s}.{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, col_name, alter_sql, s.lastError() });
+                    return e;
+                };
+            }
+            changed += 1;
+        }
+
+        if (sqlite_needs_rebuild) {
+            if (execute_ddl) {
+                try self.rebuildSqliteTable(s, t);
+            } else {
+                std.debug.print(
+                    "[sync_schema] 只读档：{s} 有 {d} 列需要改类型（SQLite 需整表重建），未执行\n",
+                    .{ t.name, changed },
+                );
+            }
+        }
+        report.columns_altered += changed;
+    }
+
+    /// SQLite 改列 = 整表重建（SQLite 没有 `ALTER COLUMN`）。
+    ///
+    /// 在事务内：`ALTER TABLE t RENAME TO t_zcode_old` → 按模型 `CREATE TABLE t`（含索引）
+    /// → `INSERT INTO t (共同列) SELECT (共同列) FROM t_zcode_old` → `DROP TABLE t_zcode_old`。
+    ///
+    /// 约定：只复制**两边都有的列**（Full 档允许丢列）；自增主键值原样搬过去。
+    /// **仅在 `Migration=Full` 时才会走到这里**——库里若有视图/触发器引用该表，
+    /// SQLite 重命名会把它们改指向临时表，重建后需要人工复查。
+    fn rebuildSqliteTable(self: *Dal, s: *Session, t: *const model.TableMeta) !void {
+        const table_name = t.effectiveTableName();
+        const quoted_table = try self.opts.provider.quoteAlloc(self.gpa, table_name);
+        defer self.gpa.free(quoted_table);
+
+        const old_name = try std.fmt.allocPrint(self.gpa, "{s}_zcode_old", .{table_name});
+        defer self.gpa.free(old_name);
+        const quoted_old = try self.opts.provider.quoteAlloc(self.gpa, old_name);
+        defer self.gpa.free(quoted_old);
+
+        std.debug.print("[sync_schema] SQLite 改列：整表重建 {s}（临时表 {s}）\n", .{ table_name, old_name });
+
+        // 上一次重建残留的临时表先清掉，否则 RENAME 会撞名
+        if (try tableExists(s, .sqlite, old_name)) {
+            const drop_leftover = try std.fmt.allocPrint(self.gpa, "DROP TABLE {s}", .{quoted_old});
+            defer self.gpa.free(drop_leftover);
+            std.debug.print("[sync_schema] 发现遗留临时表 {s}，先删除\n", .{old_name});
+            _ = try s.execute(drop_leftover, &.{});
+        }
+
+        const infos = try existingColumnInfos(s, self.gpa, .sqlite, table_name);
+        defer freeExistingColumns(self.gpa, infos);
+
+        // 共同列（按模型列顺序拼，两边都有的才复制）
+        var cols: std.ArrayList(u8) = .empty;
+        defer cols.deinit(self.gpa);
+        for (t.columns) |col| {
+            const col_name = t.effectiveColumnName(@constCast(&col));
+            if (findExistingColumn(infos, col_name) == null) continue;
+            const quoted_col = try self.opts.provider.quoteAlloc(self.gpa, col_name);
+            defer self.gpa.free(quoted_col);
+            if (cols.items.len > 0) try cols.appendSlice(self.gpa, ", ");
+            try cols.appendSlice(self.gpa, quoted_col);
+        }
+
+        const began = !s.inTransaction();
+        if (began) _ = try s.beginTransaction(.default);
+        errdefer if (began) {
+            _ = s.rollback(true) catch 0;
+        };
+
+        const rename_sql = try std.fmt.allocPrint(self.gpa, "ALTER TABLE {s} RENAME TO {s}", .{ quoted_table, quoted_old });
+        defer self.gpa.free(rename_sql);
+        _ = s.execute(rename_sql, &.{}) catch |e| {
+            std.debug.print("[sync_schema] 重建重命名失败：{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, rename_sql, s.lastError() });
+            return e;
+        };
+
+        const stmts = try self.opts.provider.createTableAlloc(self.gpa, t);
+        defer {
+            for (stmts) |stmt| self.gpa.free(stmt);
+            self.gpa.free(stmts);
+        }
+
+        // 顺序很关键：**先只建表**，把数据搬过去、删掉旧表（索引随旧表一起消失），再建索引。
+        // SQLite 的索引名是「库内全局唯一」的：旧表还在时建同名索引会
+        // 直接报 `index ix_xxx already exists`（本轮实测）。
+        _ = s.execute(stmts[0], &.{}) catch |e| {
+            std.debug.print("[sync_schema] 重建建表失败：{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, stmts[0], s.lastError() });
+            return e;
+        };
+
+        if (cols.items.len > 0) {
+            const copy_sql = try std.fmt.allocPrint(
+                self.gpa,
+                "INSERT INTO {s} ({s}) SELECT {s} FROM {s}",
+                .{ quoted_table, cols.items, cols.items, quoted_old },
+            );
+            defer self.gpa.free(copy_sql);
+            _ = s.execute(copy_sql, &.{}) catch |e| {
+                std.debug.print("[sync_schema] 重建复制数据失败：{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, copy_sql, s.lastError() });
+                return e;
+            };
+        }
+
+        const drop_sql = try std.fmt.allocPrint(self.gpa, "DROP TABLE {s}", .{quoted_old});
+        defer self.gpa.free(drop_sql);
+        _ = try s.execute(drop_sql, &.{});
+
+        // 旧表已删（连同它的索引），现在才能建同名索引
+        for (stmts[1..]) |stmt| {
+            _ = s.execute(stmt, &.{}) catch |e| {
+                std.debug.print("[sync_schema] 重建建索引失败：{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, stmt, s.lastError() });
+                return e;
+            };
+        }
+
+        if (began) _ = try s.commit();
     }
 
     /// 该表在模型里是否声明了同名索引（按生成后的索引名比对）。
@@ -922,6 +1138,28 @@ fn existingIndexes(s: *Session, gpa: std.mem.Allocator, kind: DatabaseKind, tabl
                 }
             }
         },
+        .sqlserver => {
+            // `sys.indexes` 只看用户索引（`is_primary_key = 0` / `is_unique_constraint = 0`）
+            const rows = try s.queryRows(
+                "SELECT i.name FROM sys.indexes i WHERE i.object_id = OBJECT_ID(@p0) AND i.name IS NOT NULL " ++
+                    "AND i.is_primary_key = 0 AND i.is_unique_constraint = 0",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+            }
+        },
+        .postgresql, .kingbase, .highgo, .vastbase => {
+            const rows = try s.queryRows(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len == 0) continue;
+                if (row.values[0].asText()) |text| try list.append(gpa, try gpa.dupe(u8, text));
+            }
+        },
         else => return error.Unsupported,
     }
     return list.toOwnedSlice(gpa);
@@ -937,6 +1175,14 @@ fn tableExists(s: *Session, kind: DatabaseKind, name: []const u8) !bool {
             "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1",
             &.{.{ .text = name }},
         ),
+        .sqlserver => try s.queryRows(
+            "SELECT TOP 1 1 FROM information_schema.tables WHERE table_name = @p0",
+            &.{.{ .text = name }},
+        ),
+        .postgresql, .kingbase, .highgo, .vastbase => try s.queryRows(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1 LIMIT 1",
+            &.{.{ .text = name }},
+        ),
         else => return error.Unsupported,
     };
     return rows.len > 0;
@@ -950,6 +1196,14 @@ fn indexExists(s: *Session, kind: DatabaseKind, name: []const u8) !bool {
         ),
         .mysql => try s.queryRows(
             "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND index_name = ? LIMIT 1",
+            &.{.{ .text = name }},
+        ),
+        .sqlserver => try s.queryRows(
+            "SELECT TOP 1 1 FROM sys.indexes WHERE name = @p0",
+            &.{.{ .text = name }},
+        ),
+        .postgresql, .kingbase, .highgo, .vastbase => try s.queryRows(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = $1 LIMIT 1",
             &.{.{ .text = name }},
         ),
         else => return error.Unsupported,
@@ -1002,6 +1256,209 @@ fn containsIgnoreCase(haystack: []const []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(h, needle)) return true;
     }
     return false;
+}
+
+// ── 改列比对：现有列类型探测 ────────────────────────────────────────────────
+
+/// 现有列的类型信息（`Migration=Full` 的改列比对用）。
+const ExistingColumn = struct {
+    name: []const u8,
+    type_text: []const u8,
+    nullable: bool,
+};
+
+fn freeExistingColumns(gpa: std.mem.Allocator, cols: []ExistingColumn) void {
+    for (cols) |c| {
+        gpa.free(c.name);
+        gpa.free(c.type_text);
+    }
+    gpa.free(cols);
+}
+
+fn findExistingColumn(cols: []const ExistingColumn, name: []const u8) ?ExistingColumn {
+    for (cols) |c| {
+        if (std.ascii.eqlIgnoreCase(c.name, name)) return c;
+    }
+    return null;
+}
+
+/// 读取现有列的类型文本（各类库的来源不同，但都归成「基础名(参数)」形态）。
+fn existingColumnInfos(s: *Session, gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const u8) ![]ExistingColumn {
+    var list: std.ArrayList(ExistingColumn) = .empty;
+    errdefer {
+        for (list.items) |c| {
+            gpa.free(c.name);
+            gpa.free(c.type_text);
+        }
+        list.deinit(gpa);
+    }
+
+    switch (kind) {
+        .sqlite => {
+            const quoted = try DatabaseKind.sqlite.quoteAlloc(gpa, table_name);
+            defer gpa.free(quoted);
+            const sql = try std.fmt.allocPrint(gpa, "PRAGMA table_info({s})", .{quoted});
+            defer gpa.free(sql);
+            const rows = try s.queryRows(sql, &.{});
+            for (rows) |row| {
+                const name = row.get("name") orelse continue;
+                const type_text = row.get("type") orelse continue;
+                const notnull = row.get("notnull") orelse continue;
+                try list.append(gpa, .{
+                    .name = try gpa.dupe(u8, name.asText() orelse ""),
+                    .type_text = try gpa.dupe(u8, type_text.asText() orelse ""),
+                    .nullable = (notnull.asI64() orelse 0) == 0,
+                });
+            }
+        },
+        .mysql => {
+            // MySQL 8 的 information_schema 列名返回大写 → 按序号取
+            const rows = try s.queryRows(
+                "SELECT column_name, column_type, is_nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len < 3) continue;
+                const name = row.values[0].asText() orelse continue;
+                const type_text = row.values[1].asText() orelse continue;
+                const nullable = if (row.values[2].asText()) |v| std.ascii.eqlIgnoreCase(v, "YES") else false;
+                try list.append(gpa, .{
+                    .name = try gpa.dupe(u8, name),
+                    .type_text = try gpa.dupe(u8, type_text),
+                    .nullable = nullable,
+                });
+            }
+        },
+        .sqlserver => {
+            const rows = try s.queryRows(
+                "SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable " ++
+                    "FROM information_schema.columns WHERE table_name = @p0",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len < 6) continue;
+                const name = row.values[0].asText() orelse continue;
+                const data_type = row.values[1].asText() orelse continue;
+                const nullable = if (row.values[5].asText()) |v| std.ascii.eqlIgnoreCase(v, "YES") else false;
+                try list.append(gpa, .{
+                    .name = try gpa.dupe(u8, name),
+                    .type_text = try composeTypeText(gpa, data_type, row.values[2].asI64(), row.values[3].asI64(), row.values[4].asI64()),
+                    .nullable = nullable,
+                });
+            }
+        },
+        .postgresql, .kingbase, .highgo, .vastbase => {
+            const rows = try s.queryRows(
+                "SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, is_nullable " ++
+                    "FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1",
+                &.{.{ .text = table_name }},
+            );
+            for (rows) |row| {
+                if (row.values.len < 6) continue;
+                const name = row.values[0].asText() orelse continue;
+                const data_type = row.values[1].asText() orelse continue;
+                const nullable = if (row.values[5].asText()) |v| std.ascii.eqlIgnoreCase(v, "YES") else false;
+                try list.append(gpa, .{
+                    .name = try gpa.dupe(u8, name),
+                    .type_text = try composeTypeText(gpa, data_type, row.values[2].asI64(), row.values[3].asI64(), row.values[4].asI64()),
+                    .nullable = nullable,
+                });
+            }
+        },
+        else => return error.Unsupported,
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// 把 information_schema 的 `data_type` + 长度/精度拼回「基础名(参数)」。
+/// `character_maximum_length < 0` 是 SQL Server 的 `(max)`；`precision/scale` 只对数值型用。
+fn composeTypeText(
+    gpa: std.mem.Allocator,
+    data_type: []const u8,
+    char_len: ?i64,
+    precision: ?i64,
+    scale: ?i64,
+) ![]u8 {
+    if (char_len) |cl| {
+        if (cl < 0) return std.fmt.allocPrint(gpa, "{s}(max)", .{data_type});
+        return std.fmt.allocPrint(gpa, "{s}({d})", .{ data_type, cl });
+    }
+    if (precision) |p| {
+        if (scale) |sc| return std.fmt.allocPrint(gpa, "{s}({d},{d})", .{ data_type, p, sc });
+        return std.fmt.allocPrint(gpa, "{s}({d})", .{ data_type, p });
+    }
+    return gpa.dupe(u8, data_type);
+}
+
+/// 归一到「类名 + 括号参数」用于比较：小写、压空白、括号内不留空格。
+fn normalizeTypeInto(buf: []u8, text: []const u8) []const u8 {
+    var out: usize = 0;
+    var in_paren = false;
+    var last_space = false;
+    for (std.mem.trim(u8, text, " \t\r\n")) |ch| {
+        var c = ch;
+        if (c == '(') in_paren = true;
+        if (c == ')') in_paren = false;
+        if (c == ' ' or c == '\t') {
+            if (in_paren) continue;
+            if (last_space) continue;
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        if (c >= 'A' and c <= 'Z') c = c + 32;
+        if (out >= buf.len) break;
+        buf[out] = c;
+        out += 1;
+    }
+    return buf[0..out];
+}
+
+/// 拆成「基础名」与「括号参数」（参数含括号本身）。
+fn splitType(text: []const u8) struct { base: []const u8, args: []const u8 } {
+    if (std.mem.indexOfScalar(u8, text, '(')) |i| {
+        return .{ .base = std.mem.trim(u8, text[0..i], " "), .args = text[i..] };
+    }
+    return .{ .base = text, .args = "" };
+}
+
+/// 不同库对同一类型的叫法归并（PostgreSQL 的 `integer` / `character varying` 尤其明显）。
+fn canonicalBaseType(base: []const u8) []const u8 {
+    const pairs = [_][2][]const u8{
+        .{ "integer", "int" },
+        .{ "int4", "int" },
+        .{ "int8", "bigint" },
+        .{ "int2", "smallint" },
+        .{ "character varying", "varchar" },
+        .{ "varchar2", "varchar" },
+        .{ "nvarchar2", "nvarchar" },
+        .{ "character", "char" },
+        .{ "timestamp without time zone", "timestamp" },
+        .{ "numeric", "decimal" },
+        .{ "number", "decimal" },
+        .{ "bool", "boolean" },
+        .{ "float8", "double precision" },
+        .{ "float4", "real" },
+    };
+    for (pairs) |p| {
+        if (std.ascii.eqlIgnoreCase(base, p[0])) return p[1];
+    }
+    return base;
+}
+
+/// 类型文本是否等价。
+///
+/// 规则：**基础名（归并同义词后）必须相同**；参数只在**两边都写了**的时候才比 ——
+/// MySQL 的 `bit(1)` / `int(11)` 这类显示宽度、`tinyint` 与 `tinyint(1)` 的口径差异
+/// 都不该被当成「类型变了」而反复 ALTER（反复 ALTER 是真实的生产事故源）。
+fn typesEquivalent(model_type: []const u8, db_type: []const u8) bool {
+    var mbuf: [128]u8 = undefined;
+    var dbuf: [128]u8 = undefined;
+    const m = splitType(normalizeTypeInto(&mbuf, model_type));
+    const d = splitType(normalizeTypeInto(&dbuf, db_type));
+    if (!std.ascii.eqlIgnoreCase(canonicalBaseType(m.base), canonicalBaseType(d.base))) return false;
+    if (m.args.len == 0 or d.args.len == 0) return true;
+    return std.mem.eql(u8, m.args, d.args);
 }
 
 test "连接串解析" {
@@ -1096,4 +1553,159 @@ test "Migration=Off 不做任何 DDL" {
     const r = try dal.syncSchema(&s);
     try std.testing.expectEqual(@as(usize, 1), r.tables_skipped);
     try std.testing.expect(!r.executed);
+}
+
+test "类型等价判定：同义词归并、参数只在两边都写时比较" {
+    // 完全一致
+    try std.testing.expect(typesEquivalent("nvarchar(50)", "NVARCHAR(50)"));
+    try std.testing.expect(typesEquivalent("decimal(18,2)", "DECIMAL(18, 2)"));
+    // 一边没写参数 → 等价（MySQL 的显示宽度不该触发 ALTER）
+    try std.testing.expect(typesEquivalent("bit", "bit(1)"));
+    try std.testing.expect(typesEquivalent("tinyint", "tinyint(1)"));
+    // 同义词归并（PostgreSQL 的 information_schema 叫法与 DDL 不同）
+    try std.testing.expect(typesEquivalent("varchar(50)", "character varying(50)"));
+    try std.testing.expect(typesEquivalent("int", "integer"));
+    try std.testing.expect(typesEquivalent("decimal(18,2)", "numeric(18,2)"));
+    try std.testing.expect(typesEquivalent("timestamp", "timestamp without time zone"));
+    try std.testing.expect(typesEquivalent("double precision", "float8"));
+    // 真的变了
+    try std.testing.expect(!typesEquivalent("nvarchar(20)", "nvarchar(50)"));
+    try std.testing.expect(!typesEquivalent("nvarchar(50)", "text"));
+    try std.testing.expect(!typesEquivalent("int", "bigint"));
+    try std.testing.expect(!typesEquivalent("decimal(18,2)", "decimal(18,4)"));
+}
+
+test "Migration=Full：SQLite 改列类型走整表重建，数据与索引保留" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "alter");
+    defer a.free(db_path);
+    defer @import("zzig").File.DeleteQuiet(db_path);
+
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite;Migration=Full", .{db_path});
+    defer a.free(conn);
+
+    // 先用「Code 只有 20 长」的模型建表并写入一行
+    {
+        const xml =
+            \\<EntityModel><Tables><Table Name="AlterT">
+            \\  <Columns>
+            \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            \\    <Column Name="Code" DataType="String" Length="20" />
+            \\  </Columns>
+            \\  <Indexes><Index Columns="Code" /></Indexes>
+            \\</Table></Tables></EntityModel>
+        ;
+        const m1 = try EntityModel.parse(a, xml);
+        var dal1 = try Dal.initWithModel(a, conn, m1);
+        defer dal1.deinit();
+        var s1 = try dal1.openSession();
+        defer s1.deinit();
+        const r1 = try dal1.syncSchema(&s1);
+        try std.testing.expectEqual(@as(usize, 1), r1.tables_created);
+
+        const t1 = try dal1.table("AlterT");
+        _ = try t1.insert(&s1, &[_]@import("sqlbuild.zig").Field{
+            .{ .name = "Code", .value = .{ .text = "keep-me" } },
+        });
+    }
+
+    // 再用「Code 变成 50 长」的模型同步：Full 档应改列
+    {
+        const xml =
+            \\<EntityModel><Tables><Table Name="AlterT">
+            \\  <Columns>
+            \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+            \\    <Column Name="Code" DataType="String" Length="50" />
+            \\  </Columns>
+            \\  <Indexes><Index Columns="Code" /></Indexes>
+            \\</Table></Tables></EntityModel>
+        ;
+        const m2 = try EntityModel.parse(a, xml);
+        var dal2 = try Dal.initWithModel(a, conn, m2);
+        defer dal2.deinit();
+        var s2 = try dal2.openSession();
+        defer s2.deinit();
+
+        const r2 = try dal2.syncSchema(&s2);
+        try std.testing.expectEqual(@as(usize, 1), r2.columns_altered);
+        try std.testing.expectEqual(@as(usize, 0), r2.tables_created);
+
+        // 列类型已经变成 nvarchar(50)，且 NOT NULL 约束在重建后被保留
+        const infos = try existingColumnInfos(&s2, a, .sqlite, "AlterT");
+        defer freeExistingColumns(a, infos);
+        const code = findExistingColumn(infos, "Code").?;
+        try std.testing.expectEqualStrings("nvarchar(50)", code.type_text);
+        try std.testing.expect(!code.nullable);
+
+        // 数据没丢，索引也重建了
+        const t2 = try dal2.table("AlterT");
+        try std.testing.expectEqual(@as(i64, 1), try t2.count(&s2, null));
+        const rows = try s2.queryRows("SELECT Code FROM AlterT", &.{});
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("keep-me", rows[0].values[0].text);
+
+        const idx = try existingIndexes(&s2, a, .sqlite, "AlterT");
+        defer freeColumnNames(a, idx);
+        try std.testing.expectEqual(@as(usize, 1), idx.len);
+        try std.testing.expectEqualStrings("ix_AlterT_Code", idx[0]);
+
+        // 临时表已清理干净
+        try std.testing.expect(!try tableExists(&s2, .sqlite, "AlterT_zcode_old"));
+
+        // 再同步一次：幂等（不该反复重建）
+        const r3 = try dal2.syncSchema(&s2);
+        try std.testing.expectEqual(@as(usize, 0), r3.columns_altered);
+    }
+}
+
+test "Migration=On 不改列类型（只创建语义）" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "ononly");
+    defer a.free(db_path);
+    defer @import("zzig").File.DeleteQuiet(db_path);
+
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite;Migration=On", .{db_path});
+    defer a.free(conn);
+
+    {
+        const xml =
+            \\<EntityModel><Tables><Table Name="OnT">
+            \\  <Columns>
+            \\    <Column Name="Id" DataType="Int32" PrimaryKey="True" />
+            \\    <Column Name="Code" DataType="String" Length="20" />
+            \\  </Columns>
+            \\</Table></Tables></EntityModel>
+        ;
+        const m1 = try EntityModel.parse(a, xml);
+        var dal1 = try Dal.initWithModel(a, conn, m1);
+        defer dal1.deinit();
+        var s1 = try dal1.openSession();
+        defer s1.deinit();
+        _ = try dal1.syncSchema(&s1);
+    }
+
+    {
+        const xml =
+            \\<EntityModel><Tables><Table Name="OnT">
+            \\  <Columns>
+            \\    <Column Name="Id" DataType="Int32" PrimaryKey="True" />
+            \\    <Column Name="Code" DataType="String" Length="50" />
+            \\  </Columns>
+            \\</Table></Tables></EntityModel>
+        ;
+        const m2 = try EntityModel.parse(a, xml);
+        var dal2 = try Dal.initWithModel(a, conn, m2);
+        defer dal2.deinit();
+        var s2 = try dal2.openSession();
+        defer s2.deinit();
+        const r = try dal2.syncSchema(&s2);
+        try std.testing.expectEqual(@as(usize, 0), r.columns_altered);
+
+        const infos = try existingColumnInfos(&s2, a, .sqlite, "OnT");
+        defer freeExistingColumns(a, infos);
+        // 仍是建表时的 20 长（On 档不动结构）
+        try std.testing.expectEqualStrings("nvarchar(20)", findExistingColumn(infos, "Code").?.type_text);
+    }
 }

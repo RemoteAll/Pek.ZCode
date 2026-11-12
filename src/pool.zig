@@ -234,6 +234,7 @@ fn isUsable(s: *const Session) bool {
         .sqlite => |db| db.handle != null,
         .mysql => |conn| !conn.closed,
         .postgres => |conn| !conn.closed,
+        .sqlserver => |conn| !conn.closed,
     };
 }
 

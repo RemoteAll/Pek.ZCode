@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const zcode = @import("zcode");
+const build_options = @import("build_options");
 
 const model_xml =
     \\<?xml version="1.0" encoding="utf-8"?>
@@ -399,4 +400,147 @@ test "迁移：表级档位只能收紧（表级 Off 时不建表）" {
 
     const rows = try s.queryRows("SELECT name FROM sqlite_master WHERE type='table' AND name='Skip_Table'", &.{});
     try std.testing.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "迁移：Full 档改列类型/长度（SQLite 真库，整表重建）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "alter");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite;Migration=Full", .{path});
+    defer a.free(conn);
+
+    const xml20 =
+        \\<EntityModel><Tables><Table Name="AlterProbe" TableName="alter_probe">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Code" DataType="String" Length="20" />
+        \\  </Columns>
+        \\  <Indexes><Index Columns="Code" /></Indexes>
+        \\</Table></Tables></EntityModel>
+    ;
+    const xml50 =
+        \\<EntityModel><Tables><Table Name="AlterProbe" TableName="alter_probe">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Code" DataType="String" Length="50" />
+        \\  </Columns>
+        \\  <Indexes><Index Columns="Code" /></Indexes>
+        \\</Table></Tables></EntityModel>
+    ;
+
+    // ① 先用 20 长建表并写一行
+    {
+        const m = try zcode.EntityModel.parse(a, xml20);
+        var dal = try zcode.Dal.initWithModel(a, conn, m);
+        defer dal.deinit();
+        var s = try dal.openSession();
+        defer s.deinit();
+        const r = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 1), r.tables_created);
+        const t = try dal.table("AlterProbe");
+        _ = try t.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = "keep" } },
+        });
+    }
+
+    // ② 换成 50 长再同步：改列计数为 1，数据与索引都还在
+    {
+        const m = try zcode.EntityModel.parse(a, xml50);
+        var dal = try zcode.Dal.initWithModel(a, conn, m);
+        defer dal.deinit();
+        var s = try dal.openSession();
+        defer s.deinit();
+
+        const r = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 1), r.columns_altered);
+
+        const t = try dal.table("AlterProbe");
+        try std.testing.expectEqual(@as(i64, 1), try t.count(&s, null));
+
+        // ③ 再同步一次：幂等（不重复重建）
+        const r2 = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 0), r2.columns_altered);
+    }
+}
+
+test "迁移：MySQL 真库 Full 档改列（需 -Dmysql-conn）" {
+    const conn_str = build_options.mysql_conn;
+    if (conn_str.len == 0) {
+        std.debug.print("[SKIP] 未提供 -Dmysql-conn，跳过 MySQL 改列真库用例\n", .{});
+        return;
+    }
+
+    const a = std.testing.allocator;
+    const xml_before =
+        \\<EntityModel><Tables><Table Name="AlterProbe" TableName="zcode_alter_probe">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Code" DataType="String" Length="20" />
+        \\    <Column Name="Amount" DataType="Decimal" Precision="18" Scale="2" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    const xml_after =
+        \\<EntityModel><Tables><Table Name="AlterProbe" TableName="zcode_alter_probe">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Code" DataType="String" Length="50" />
+        \\    <Column Name="Amount" DataType="Decimal" Precision="18" Scale="4" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+
+    const full_conn = try std.fmt.allocPrint(a, "{s};Migration=Full", .{conn_str});
+    defer a.free(full_conn);
+
+    // ① 建表 + 写一行（20 长 / scale 2）
+    {
+        const m = try zcode.EntityModel.parse(a, xml_before);
+        var dal = try zcode.Dal.initWithModel(a, full_conn, m);
+        defer dal.deinit();
+        var s = try dal.openSession();
+        defer s.deinit();
+        _ = s.execute("DROP TABLE IF EXISTS `zcode_alter_probe`", &.{}) catch {};
+        const r = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 1), r.tables_created);
+        const t = try dal.table("AlterProbe");
+        _ = try t.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = "keep" } },
+            .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("12.34") } },
+        });
+    }
+    // 清理交给下一次运行（用例开头有 `DROP TABLE IF EXISTS`）
+
+    // ② 换模型（50 长 / scale 4）再同步：两列都改，数据保留
+    {
+        const m = try zcode.EntityModel.parse(a, xml_after);
+        var dal = try zcode.Dal.initWithModel(a, full_conn, m);
+        defer dal.deinit();
+        var s = try dal.openSession();
+        defer s.deinit();
+
+        const r = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 2), r.columns_altered);
+
+        const rows = try s.queryRows(
+            "SELECT column_type, is_nullable FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'zcode_alter_probe' AND column_name IN ('Code','Amount') ORDER BY column_name",
+            &.{},
+        );
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expectEqualStrings("decimal(18,4)", rows[0].values[0].text);
+        try std.testing.expectEqualStrings("varchar(50)", rows[1].values[0].text);
+        // MySQL 的 `MODIFY COLUMN` 是**整列定义替换**：漏写 NOT NULL 会把约束悄悄去掉
+        // （本轮真库实测过这个坑），这里守住它
+        try std.testing.expectEqualStrings("NO", rows[0].values[1].text);
+        try std.testing.expectEqualStrings("NO", rows[1].values[1].text);
+
+        const t = try dal.table("AlterProbe");
+        try std.testing.expectEqual(@as(i64, 1), try t.count(&s, null));
+
+        // ③ 幂等：再同步不改
+        const r2 = try dal.syncSchema(&s);
+        try std.testing.expectEqual(@as(usize, 0), r2.columns_altered);
+    }
 }
