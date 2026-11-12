@@ -92,32 +92,32 @@ pub fn loginCore(
     var user = (store.findByName(a, account) catch return LoginError.StoreFailed) orelse return LoginError.UserNotFound;
 
     // 3. 禁用
-    if (!user.@"Enable") return LoginError.Disabled;
+    if (!user.Enable) return LoginError.Disabled;
 
     var upgraded = false;
     var wrote_password = false;
 
     // 5. 库密码为空 → 任意密码可登录，并写回散列
-    if (user.@"Password".len == 0) {
-        user.@"Password" = try password.hashAlloc(a, plain_or_md5);
+    if (user.Password.len == 0) {
+        user.Password = try password.hashAlloc(a, plain_or_md5);
         wrote_password = true;
     } else {
         // 校验失败一律"用户名或密码不正确"
-        if (!password.verify(plain_or_md5, user.@"Password")) return LoginError.BadPassword;
+        if (!password.verify(plain_or_md5, user.Password)) return LoginError.BadPassword;
 
         // 6. 旧格式自动升级
-        if (password.needsUpgrade(user.@"Password")) {
-            user.@"Password" = try password.hashAlloc(a, plain_or_md5);
+        if (password.needsUpgrade(user.Password)) {
+            user.Password = try password.hashAlloc(a, plain_or_md5);
             upgraded = true;
         }
     }
 
     // 7. 登录信息
-    user.@"Logins" += 1;
-    user.@"LastLogin" = now;
-    user.@"LastLoginIP" = ip;
-    user.@"Online" = true;
-    user.setLogins(user.@"Logins");
+    user.Logins += 1;
+    user.LastLogin = now;
+    user.LastLoginIP = ip;
+    user.Online = true;
+    user.setLogins(user.Logins);
     user.setLastLogin(now);
     user.setLastLoginIP(ip);
     user.setOnline(true);
@@ -144,12 +144,12 @@ pub fn registerCore(
     if (try store.findByName(a, account) != null) return RegisterError.AlreadyExists;
 
     var user = entities.User{};
-    user.@"Name" = account;
-    user.@"Password" = try password.hashAlloc(a, plain_password);
-    user.@"Enable" = enable; // C# 默认 false（待审核）
-    user.@"RoleID" = role_id;
-    user.@"RoleIds" = "";
-    user.@"RegisterTime" = zzig.DateTime.nowLocal();
+    user.Name = account;
+    user.Password = try password.hashAlloc(a, plain_password);
+    user.Enable = enable; // C# 默认 false（待审核）
+    user.RoleID = role_id;
+    user.RoleIds = "";
+    user.RegisterTime = zzig.DateTime.nowLocal();
     return user;
 }
 
@@ -167,14 +167,14 @@ pub fn changePasswordCore(
     const account = std.mem.trim(u8, username, " \t\r\n");
 
     var user = (store.findByName(a, account) catch return LoginError.StoreFailed) orelse return LoginError.UserNotFound;
-    if (!user.@"Enable") return LoginError.Disabled;
+    if (!user.Enable) return LoginError.Disabled;
 
-    if (old_password.len > 0 and user.@"Password".len > 0) {
-        if (!password.verify(old_password, user.@"Password")) return LoginError.BadPassword;
+    if (old_password.len > 0 and user.Password.len > 0) {
+        if (!password.verify(old_password, user.Password)) return LoginError.BadPassword;
     }
 
-    user.@"Password" = try password.hashAlloc(a, new_password);
-    user.setPassword(user.@"Password");
+    user.Password = try password.hashAlloc(a, new_password);
+    user.setPassword(user.Password);
     return user;
 }
 
@@ -218,7 +218,7 @@ const FakeStore = struct {
         _ = a;
         const self: *FakeStore = @ptrCast(@alignCast(ctx));
         for (self.users.items) |u| {
-            if (std.ascii.eqlIgnoreCase(u.@"Name", name)) return u;
+            if (std.ascii.eqlIgnoreCase(u.Name, name)) return u;
         }
         return null;
     }
@@ -227,7 +227,7 @@ const FakeStore = struct {
         const self: *FakeStore = @ptrCast(@alignCast(ctx));
         self.saves += 1;
         for (self.users.items, 0..) |*u, i| {
-            if (u.@"ID" == user.@"ID") {
+            if (u.ID == user.ID) {
                 self.users.items[i] = user.*;
                 return;
             }
@@ -248,10 +248,10 @@ test "LoginCore：用户名空 / 不存在 / 禁用 / 密码错" {
     defer fake.deinit();
 
     var u = entities.User{};
-    u.@"ID" = 2;
-    u.@"Name" = "alice";
-    u.@"Enable" = true;
-    u.@"Password" = try password.hashAlloc(a, "p@ss");
+    u.ID = 2;
+    u.Name = "alice";
+    u.Enable = true;
+    u.Password = try password.hashAlloc(a, "p@ss");
     try fake.add(u);
 
     const now = zzig.DateTime.fromUnixSeconds(1_700_000_000);
@@ -260,9 +260,9 @@ test "LoginCore：用户名空 / 不存在 / 禁用 / 密码错" {
     try std.testing.expectError(LoginError.BadPassword, loginCore(a, fake.store(), "alice", "wrong", now, "1.2.3.4"));
 
     var disabled = entities.User{};
-    disabled.@"Name" = "carol";
-    disabled.@"Enable" = false;
-    disabled.@"Password" = try password.hashAlloc(a, "x");
+    disabled.Name = "carol";
+    disabled.Enable = false;
+    disabled.Password = try password.hashAlloc(a, "x");
     try fake.add(disabled);
     try std.testing.expectError(LoginError.Disabled, loginCore(a, fake.store(), "carol", "x", now, "1.2.3.4"));
 }
@@ -275,25 +275,25 @@ test "LoginCore：成功登录会累加次数并写最后登录信息" {
     defer fake.deinit();
 
     var u = entities.User{};
-    u.@"ID" = 3;
-    u.@"Name" = "dave";
-    u.@"Enable" = true;
-    u.@"Logins" = 5;
-    u.@"Password" = try password.hashAlloc(a, "secret");
+    u.ID = 3;
+    u.Name = "dave";
+    u.Enable = true;
+    u.Logins = 5;
+    u.Password = try password.hashAlloc(a, "secret");
     try fake.add(u);
 
     const now = zzig.DateTime.fromUnixSeconds(1_700_000_000);
     const r = try loginCore(a, fake.store(), "  dave  ", "secret", now, "9.9.9.9");
-    try std.testing.expectEqual(@as(i32, 6), r.user.@"Logins");
-    try std.testing.expect(r.user.@"Online");
-    try std.testing.expectEqualStrings("9.9.9.9", r.user.@"LastLoginIP");
+    try std.testing.expectEqual(@as(i32, 6), r.user.Logins);
+    try std.testing.expect(r.user.Online);
+    try std.testing.expectEqualStrings("9.9.9.9", r.user.LastLoginIP);
     try std.testing.expect(!r.upgraded);
 
     // 前端 MD5 传输也应能登录
     var md5: [32]u8 = undefined;
     password.md5HexLower(&md5, "secret");
     const r2 = try loginCore(a, fake.store(), "dave", &md5, now, "");
-    try std.testing.expectEqual(@as(i32, 6), r2.user.@"Logins");
+    try std.testing.expectEqual(@as(i32, 6), r2.user.Logins);
 }
 
 test "LoginCore：库密码为空 → 任意密码可登录并写回散列（C# 兼容行为）" {
@@ -304,17 +304,17 @@ test "LoginCore：库密码为空 → 任意密码可登录并写回散列（C# 
     defer fake.deinit();
 
     var u = entities.User{};
-    u.@"ID" = 4;
-    u.@"Name" = "empty";
-    u.@"Enable" = true;
-    u.@"Password" = "";
+    u.ID = 4;
+    u.Name = "empty";
+    u.Enable = true;
+    u.Password = "";
     try fake.add(u);
 
     const now = zzig.DateTime.fromUnixSeconds(1_700_000_000);
     const r = try loginCore(a, fake.store(), "empty", "whatever", now, "");
     try std.testing.expect(r.wrote_password);
-    try std.testing.expect(std.mem.startsWith(u8, r.user.@"Password", "$md5+sha1$"));
-    try std.testing.expect(password.verify("whatever", r.user.@"Password"));
+    try std.testing.expect(std.mem.startsWith(u8, r.user.Password, "$md5+sha1$"));
+    try std.testing.expect(password.verify("whatever", r.user.Password));
 }
 
 test "LoginCore：旧格式（裸 MD5）登录后自动升级" {
@@ -328,16 +328,16 @@ test "LoginCore：旧格式（裸 MD5）登录后自动升级" {
     password.md5HexUpper(&md5, "legacy");
 
     var u = entities.User{};
-    u.@"ID" = 5;
-    u.@"Name" = "old";
-    u.@"Enable" = true;
-    u.@"Password" = &md5;
+    u.ID = 5;
+    u.Name = "old";
+    u.Enable = true;
+    u.Password = &md5;
     try fake.add(u);
 
     const now = zzig.DateTime.fromUnixSeconds(1_700_000_000);
     const r = try loginCore(a, fake.store(), "old", "legacy", now, "");
     try std.testing.expect(r.upgraded);
-    try std.testing.expect(std.mem.startsWith(u8, r.user.@"Password", "$md5+sha1$"));
+    try std.testing.expect(std.mem.startsWith(u8, r.user.Password, "$md5+sha1$"));
 }
 
 test "Register：已存在则拒绝；否则口令散列且默认待审核" {
@@ -348,17 +348,17 @@ test "Register：已存在则拒绝；否则口令散列且默认待审核" {
     defer fake.deinit();
 
     var u = entities.User{};
-    u.@"Name" = "taken";
+    u.Name = "taken";
     try fake.add(u);
 
     try std.testing.expectError(RegisterError.AlreadyExists, registerCore(a, fake.store(), "TAKEN", "x", 0, false));
     try std.testing.expectError(RegisterError.EmptyUsername, registerCore(a, fake.store(), "  ", "x", 0, false));
 
     const created = try registerCore(a, fake.store(), " newbie ", "pw", 3, false);
-    try std.testing.expectEqualStrings("newbie", created.@"Name");
-    try std.testing.expect(!created.@"Enable");
-    try std.testing.expectEqual(@as(i32, 3), created.@"RoleID");
-    try std.testing.expect(password.verify("pw", created.@"Password"));
+    try std.testing.expectEqualStrings("newbie", created.Name);
+    try std.testing.expect(!created.Enable);
+    try std.testing.expectEqual(@as(i32, 3), created.RoleID);
+    try std.testing.expect(password.verify("pw", created.Password));
 }
 
 test "ChangePassword：旧密码为空则跳过校验；旧密码错则拒绝" {
@@ -369,21 +369,21 @@ test "ChangePassword：旧密码为空则跳过校验；旧密码错则拒绝" {
     defer fake.deinit();
 
     var u = entities.User{};
-    u.@"ID" = 6;
-    u.@"Name" = "eve";
-    u.@"Enable" = true;
-    u.@"Password" = try password.hashAlloc(a, "old-pw");
+    u.ID = 6;
+    u.Name = "eve";
+    u.Enable = true;
+    u.Password = try password.hashAlloc(a, "old-pw");
     try fake.add(u);
 
     try std.testing.expectError(LoginError.BadPassword, changePasswordCore(a, fake.store(), "eve", "new-pw", "bad"));
 
     // 旧密码留空 → 直接改（C# 同）
     const changed = try changePasswordCore(a, fake.store(), "eve", "new-pw", "");
-    try std.testing.expect(password.verify("new-pw", changed.@"Password"));
+    try std.testing.expect(password.verify("new-pw", changed.Password));
 
     // 旧密码正确
     const changed2 = try changePasswordCore(a, fake.store(), "eve", "newer", "old-pw");
-    try std.testing.expect(password.verify("newer", changed2.@"Password"));
+    try std.testing.expect(password.verify("newer", changed2.Password));
 
     try std.testing.expectError(LoginError.UserNotFound, changePasswordCore(a, fake.store(), "ghost", "x", ""));
 }

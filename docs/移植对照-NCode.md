@@ -16,11 +16,11 @@
 | 会话 | `IDbSession` | `src/session.rs` | `src/session.zig` | ✅ 同步单连接 + **SQLite 预处理语句缓存** + 事务（含嵌套计数/Scoped） |
 | SQLite 驱动 | `DH.NCode.SQLite` | `src/sqlite.rs`（rusqlite） | `zzig`：`db/sqlite.zig`（动态加载 DLL） | ✅ |
 | MySQL 驱动 | `DH.NCode.MySql` | `src/mysql.rs`（`mysql` crate，纯协议） | `zzig`：`db/mysql.zig`（**纯协议**，不加载 libmysqlclient） | ✅ 握手/鉴权/COM_QUERY/预处理二进制协议/**`LOAD DATA LOCAL INFILE` 流式批量装载**/**TLS（`SslMode` 五档）**/**压缩协议（`CLIENT_COMPRESS`）**；可任意叠加（压缩在 TLS 内层） |
-| 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count/batch |
+| 表级 CRUD | `EntitySession` | `src/dbtable.rs` | `src/dbtable.zig` | ✅ insert/update/delete/find_by_pk/query/count/batch + **upsertBatch（SaveModes 四模式）** + **updateAccumulate（累加字段）**；**Dal 直执行 SQL**（`exec` / `queryAlloc` / `execOnTable` / `queryOnTableAlloc`，`?` 占位符按方言自动改写） |
 | 连接与迁移 | `DAL` / `Migration` | `src/dal.rs` | `src/dal.zig` | ✅ 增量建表/补列/建索引；**`Full` 档删列删索引 + 改列类型/长度**（SQLite 走整表重建）；表级档位只能收紧；幂等 |
 | 对象实体 + 脏更新 | `Entity` | `src/entity.rs` / `dirty.rs` | `src/entity.zig` | ✅ insert/update(脏列)/save/saveBatch/delete/find/query |
 | 整表/单对象缓存 | `Meta.Cache` | `src/cache.rs` | `src/cache.zig` | ✅ 整表 `Cache(T)` + `SingleCache(T)`，写后自动失效 |
-| 批量写 / 队列 | `EntityExtension` / `EntityDeferredQueue` | `src/batch.rs` / `entity_queue.rs` | `src/entity_queue.zig` | ✅ 多行 INSERT 分批 + 延迟写队列（按条数/时间触发，失败保留队列） |
+| 批量写 / 队列 | `EntityExtension` / `EntityDeferredQueue` | `src/batch.rs` / `entity_queue.rs` | `src/entity_queue.zig` | ✅ `SaveModes` 四种模式（insert/upsert/insert_ignore/replace，多行 INSERT + 方言 `ON CONFLICT`/`ON DUPLICATE KEY`/`OR REPLACE`，不支持 SQL 级 upsert 的方言退化为同事务逐行先改后插）；延迟桶（`addDelayed`）+ 定时器后台凑批（`start/stop`）；**`Entity.saveAsync(msDelay)` 语义**：入全局凑批队列（非一线程一调用），新增合并多行 INSERT、已存在逐条脏列更新；**分表分库凑批**：按「连接 + 分片物理表」归组，同分片才合并、不同分片各自一批 |
 | 分表 / 分库 | `EntitySplit` / `Shards` / `TimeShardPolicy` | `src/shards.rs` | `src/shards.zig` | ✅ 时间分表（`{0}_{1:yyyyMM}`）/ 连接模板 / 区间扫描 / 条件推导 / 雪花 Id；✅ **跨库分片**（`attachConnection` + `sessionForConn`）与**分片表自动建表**（`ensureShardTable`） |
 | 读写分离 | `ReadWriteStrategy` / `DAL.Reads` | `src/readwrite.rs` | `src/readwrite.zig` + `Dal.readSessionFor` | ✅ 忽略表 / 全局切主库 / 轮询从库（从库会话强制只读） |
 | 连接池 | ADO.NET 连接池 | `src/pool.rs` | `src/pool.zig` + `Dal.makePool` | ✅ 上限 / 空闲回收 / 预热 / 统计；`:memory:` 自动不建议池化 |

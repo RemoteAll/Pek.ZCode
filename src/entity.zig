@@ -24,8 +24,12 @@ const std = @import("std");
 const model = @import("model.zig");
 const TableMeta = model.TableMeta;
 const DataType = model.DataType;
+const SaveModes = @import("setting.zig").SaveModes;
 const Value = @import("zzig").db.Value;
 const sqlbuild = @import("sqlbuild.zig");
+/// 凑批队列（`SaveAsync` 走它，对齐 C# `Entity.SaveAsync` → `EntityQueue.Add`）
+const entity_queue = @import("entity_queue.zig");
+const clock = @import("clock.zig");
 const query = @import("query.zig");
 const Where = query.Where;
 const Query = query.Query;
@@ -155,7 +159,12 @@ pub fn update(dal: *Dal, e: anytype, s: *Session) !usize {
             _ = try w.eq(effectiveName(t, f.name), e.columnValue(i));
             pk_count += 1;
         } else if (isDirty(e.dirty, i)) {
-            try sets.append(gpa, .{ .name = effectiveName(t, f.name), .value = e.columnValue(i) });
+            // `Column@Additional` → 累加（`col = col + ?`），不是整值覆盖
+            try sets.append(gpa, .{
+                .name = effectiveName(t, f.name),
+                .value = e.columnValue(i),
+                .accumulate = f.additional,
+            });
         }
     }
     if (pk_count == 0) return error.NoPrimaryKey;
@@ -212,6 +221,17 @@ pub const SaveBatchReport = struct {
 ///
 /// 注意：批量插入**不回写每个实体的自增 ID**（只有最后一条可由 `lastInsertId` 得到）。
 pub fn saveBatch(dal: *Dal, comptime T: type, entities: []const *T, s: *Session) !SaveBatchReport {
+    return saveBatchWith(dal, T, entities, s, .insert);
+}
+
+/// 批量保存（可指定 `SaveModes`）：
+/// - `insert`：多行 `INSERT`（原来 `saveBatch` 的行为）
+/// - `upsert` / `insert_ignore` / `replace`：交给表级 `upsertBatch`，按方言生成
+///   `ON CONFLICT` / `ON DUPLICATE KEY` / `OR REPLACE` 等（SQL Server 等退化为同事务逐行先改后插）
+///
+/// 已存在实体（主键非 0）仍走脏列逐条 `update`——这是 C# `IList.Update()` 的语义：
+/// 只写脏列，不整行覆盖。
+pub fn saveBatchWith(dal: *Dal, comptime T: type, entities: []const *T, s: *Session, mode: SaveModes) !SaveBatchReport {
     const meta = T.meta;
     const t = try tableOf(dal, meta);
     try assertWritable(t);
@@ -250,9 +270,86 @@ pub fn saveBatch(dal: *Dal, comptime T: type, entities: []const *T, s: *Session)
 
     if (new_rows.items.len > 0) {
         const ref = try dal.table(meta.table_name);
-        report.inserted = try ref.insertBatch(s, new_rows.items);
+        report.inserted = try ref.upsertBatch(s, new_rows.items, mode);
     }
     return report;
+}
+
+/// 异步保存（对齐 C# `Entity.SaveAsync(msDelay)`）：**入凑批队列**，不是一调一线程。
+///
+/// - `ms_delay == 0` → 近实时桶，下一次队列 tick（默认 1000ms）就写；
+/// - `ms_delay > 0`  → 延迟桶，到点才写；
+/// - 队列按表**合并成多行 INSERT**（新增）+ 逐条脏列更新（已存在）。
+///
+/// 实体被**拷贝**到堆上，调用后可以立即修改/释放原对象。
+/// 会话由队列按 `Model.xml` 的表归属连接新开，不共用调用方的 `Session`。
+/// 进程退出前调 `entity_queue.stopGlobal()`（并确保在 `Dal` 释放前）把剩余项写完。
+pub fn saveAsync(gpa: std.mem.Allocator, dal: *Dal, e: anytype, ms_delay: u64) !void {
+    return saveAsyncInner(gpa, dal, e, ms_delay, null);
+}
+
+/// 带分片键的异步保存：入队时带上分片键，`flush` 时才能**按分片目标归组**，
+/// 同分片合并成一条多行 INSERT（分表分库的性能关键）。
+/// 分片键只支持 `datetime` / `int`（时间分片就是时间列）。
+pub fn saveAsyncSharded(gpa: std.mem.Allocator, dal: *Dal, e: anytype, ms_delay: u64, shard_value: Value) !void {
+    return saveAsyncInner(gpa, dal, e, ms_delay, shard_value);
+}
+
+fn saveAsyncInner(gpa: std.mem.Allocator, dal: *Dal, e: anytype, ms_delay: u64, shard_value: ?Value) !void {
+    const T = @TypeOf(e.*);
+    const copy = try gpa.create(T);
+    copy.* = e.*;
+
+    // 新实体（主键空/0）：给一个“建行字段”回调，让队列能合并成多行 INSERT
+    const is_new = blk: {
+        var n: usize = 0;
+        inline for (T.meta.fields, 0..) |f, i| {
+            if (f.primary_key and !e.columnValue(i).isNull()) {
+                const v = e.columnValue(i);
+                if (!(v == .int and v.int == 0)) n += 1;
+            }
+        }
+        break :blk n == 0;
+    };
+
+    const q = try entity_queue.globalFor(gpa, dal);
+    try q.enqueue(.{
+        .ctx = copy,
+        .base_table = T.meta.table_name,
+        .conn = try dal.tableConnName(T.meta.table_name),
+        .table_name = T.meta.table_name,
+        .shard_value = shard_value,
+        .due_ms = clock.nowMs() + @as(i64, @intCast(ms_delay)),
+        .fieldsFn = if (is_new) struct {
+            fn build(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]sqlbuild.Field {
+                const p: *T = @ptrCast(@alignCast(ctx));
+                var field_count: usize = 0;
+                inline for (T.meta.fields) |f| {
+                    if (!f.identity) field_count += 1;
+                }
+                const out = try a.alloc(sqlbuild.Field, field_count);
+                var i: usize = 0;
+                inline for (T.meta.fields, 0..) |f, idx| {
+                    if (f.identity) continue;
+                    out[i] = .{ .name = f.name, .value = p.columnValue(idx) };
+                    i += 1;
+                }
+                return out;
+            }
+        }.build else null,
+        .saveFn = struct {
+            fn saveOne(ctx: *anyopaque, dal2: *Dal, s: *Session) anyerror!void {
+                const p: *T = @ptrCast(@alignCast(ctx));
+                _ = save(dal2, p, s) catch |err| return err;
+            }
+        }.saveOne,
+        .destroyFn = struct {
+            fn destroy(ctx: *anyopaque, a: std.mem.Allocator) void {
+                const p: *T = @ptrCast(@alignCast(ctx));
+                a.destroy(p);
+            }
+        }.destroy,
+    });
 }
 
 fn countPkValues(meta: EntityMeta, e: anytype) usize {

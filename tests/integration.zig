@@ -909,4 +909,6 @@ test {
 // 统计累加 + 数据抽取器（真 SQLite）
 test {
     _ = @import("integration_stat_extract.zig");
+    _ = @import("integration_batch_async.zig");
+    _ = @import("integration_shard_batch.zig");
 }

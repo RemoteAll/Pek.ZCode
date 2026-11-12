@@ -1,0 +1,16 @@
+﻿gencheck.exe : [zcode] 杩炴帴 Log 鏈寕杞斤紝鏃犳硶寮€浼氳瘽
+所在位置 行:1 字符: 195
++ ... riteTime)"; & $exe.FullName --model tests/fixtures/dh-ncode-model.xml ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([zcode] 杩炴帴 Log 鏈寕杞斤紝鏃犳硶寮€浼氳瘽:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[sync_schema] 琛?Log 褰掑睘杩炴帴 Log锛屼絾璇ヨ繛鎺ユ湭鎸傝浇锛堟嫆缁濋潤榛樺缓鍒颁富搴擄級銆?  璇峰厛鐢?attachConnection("Log", 杩炴帴涓? 鎸備笂锛屾垨纭 Model.xml 鐨勮〃绾?ConnName 鏄惁姝ｇ‘銆?error: UnknownConnection
+G:\Code\Zig\Pek.ZCode\src\dal.zig:629:13: 0x7ff7322573bb in sessionForConn (gencheck_zcu.obj)
+            return error.UnknownConnection;
+            ^
+G:\Code\Zig\Pek.ZCode\src\dal.zig:861:21: 0x7ff732291950 in syncSchema (gencheck_zcu.obj)
+                    return e;
+                    ^
+G:\Code\Zig\Pek.ZCode\tools\gencheck.zig:54:20: 0x7ff7322ae231 in main (gencheck_zcu.obj)
+    // 鐪熷疄涓氬姟閲岃繖閲屽簲鎸傚悇鑷殑杩炴帴涓层€?                   ^

@@ -131,8 +131,8 @@ pub fn isIconEmpty(icon: []const u8) bool {
 pub fn sortChildren(comptime T: type, items: []T) void {
     std.mem.sort(T, items, {}, struct {
         fn lt(_: void, x: T, y: T) bool {
-            if (x.@"Sort" != y.@"Sort") return x.@"Sort" > y.@"Sort";
-            return x.@"ID" < y.@"ID";
+            if (x.Sort != y.Sort) return x.Sort > y.Sort;
+            return x.ID < y.ID;
         }
     }.lt);
 }
@@ -263,16 +263,16 @@ test "菜单：空图标与子菜单排序（Sort 降序、ID 升序）" {
     try std.testing.expect(isIconEmpty("&#xe63f;"));
     try std.testing.expect(!isIconEmpty("&#xe600;"));
 
-    const Row = struct { @"ID": i32, @"Sort": i32 };
+    const Row = struct { ID: i32, Sort: i32 };
     var list = [_]Row{
-        .{ .@"ID" = 3, .@"Sort" = 10 },
-        .{ .@"ID" = 1, .@"Sort" = 20 },
-        .{ .@"ID" = 2, .@"Sort" = 10 },
+        .{ .ID = 3, .Sort = 10 },
+        .{ .ID = 1, .Sort = 20 },
+        .{ .ID = 2, .Sort = 10 },
     };
     sortChildren(Row, &list);
-    try std.testing.expectEqual(@as(i32, 1), list[0].@"ID"); // Sort 20
-    try std.testing.expectEqual(@as(i32, 2), list[1].@"ID"); // Sort 10, ID 小
-    try std.testing.expectEqual(@as(i32, 3), list[2].@"ID");
+    try std.testing.expectEqual(@as(i32, 1), list[0].ID); // Sort 20
+    try std.testing.expectEqual(@as(i32, 2), list[1].ID); // Sort 10, ID 小
+    try std.testing.expectEqual(@as(i32, 3), list[2].ID);
 }
 
 test "租户关系角色归一化" {

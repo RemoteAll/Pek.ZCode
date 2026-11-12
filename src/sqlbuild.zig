@@ -34,6 +34,8 @@ pub const Sql = struct {
 pub const Field = struct {
     name: []const u8,
     value: Value,
+    /// 累加列（`Model.xml` 的 `Column@Additional`）：生成 `col = col + ?` 而不是 `col = ?`
+    accumulate: bool = false,
 };
 
 fn columnName(table: *const TableMeta, field: []const u8) ![]const u8 {
@@ -172,6 +174,11 @@ pub fn update(
         if (index > 0) try b.add(", ");
         try kind.pushQuoted(&b, try columnName(table, field.name));
         try b.add(" = ");
+        if (field.accumulate) {
+            // 累加列：`col = col + ?`（对应 C# `Column@Additional`）
+            try kind.pushQuoted(&b, try columnName(table, field.name));
+            try b.add(" + ");
+        }
         try kind.pushPlaceholder(&b, params.items.len);
         try params.append(gpa, field.value);
     }

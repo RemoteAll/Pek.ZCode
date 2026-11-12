@@ -176,6 +176,96 @@ pub const DatabaseKind = enum {
         return b.toOwnedSlice();
     }
 
+    /// 把「用 `?` 写的 SQL」改写成目标方言的占位符（对应 C# `DAL` 直接执行 SQL 时的方言适配）。
+    ///
+    /// 为什么需要：`?` 只有 SQLite / MySQL / H2 等认；PostgreSQL 用 `$1`、SQL Server 用 `@p0`、
+    /// Oracle / 达梦用 `:1`。业务里手写的 SQL 一律写成 `?`，由这一层按连接方言改写，
+    /// 这样同一段 SQL 在四种库上都能带参执行，不用调用方记端口径。
+    ///
+    /// 只改**真正的占位符**：`'...'` 字符串、`"..."` 标识符、`--` 行注释、`/* */` 块注释里的
+    /// `?` 一律原样保留（否则 `Where Note Like '%?%'` 这种 SQL 会被改坏）。
+    /// `?` 的编号按出现顺序从 1 开始（`$1` / `:1`）或从 0 开始（`@p0`），与 `pushPlaceholder` 同口径。
+    pub fn rewritePlaceholdersAlloc(self: DatabaseKind, gpa: std.mem.Allocator, sql: []const u8) ![]u8 {
+        // 这三种方言本来就认 `?`，不必改写
+        if (self == .sqlite or self == .mysql or self == .hana or self == .iris or self == .tdengine or
+            self == .db2 or self == .firebird or self == .access or self == .duckdb or self == .clickhouse or self == .nova)
+        {
+            return gpa.dupe(u8, sql);
+        }
+
+        var b = Buf.init(gpa);
+        defer b.deinit();
+
+        var i: usize = 0;
+        var index: usize = 0;
+        while (i < sql.len) {
+            const c = sql[i];
+            switch (c) {
+                '\'' => {
+                    // 字符串字面量：''' 用 '' 转义
+                    const start = i;
+                    i += 1;
+                    while (i < sql.len) {
+                        if (sql[i] == 39) {
+                            if (i + 1 < sql.len and sql[i + 1] == '\'') {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    try b.add(sql[start..@min(i, sql.len)]);
+                },
+                '"' => {
+                    const start = i;
+                    i += 1;
+                    while (i < sql.len) {
+                        if (sql[i] == '"') {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    try b.add(sql[start..@min(i, sql.len)]);
+                },
+                '-' => {
+                    if (i + 1 < sql.len and sql[i + 1] == '-') {
+                        const start = i;
+                        while (i < sql.len and sql[i] != '\n') i += 1;
+                        try b.add(sql[start..i]);
+                    } else {
+                        try b.addByte(c);
+                        i += 1;
+                    }
+                },
+                '/' => {
+                    if (i + 1 < sql.len and sql[i + 1] == '*') {
+                        const start = i;
+                        i += 2;
+                        while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+                        i = @min(i + 2, sql.len);
+                        try b.add(sql[start..i]);
+                    } else {
+                        try b.addByte(c);
+                        i += 1;
+                    }
+                },
+                '?' => {
+                    try self.pushPlaceholder(&b, index);
+                    index += 1;
+                    i += 1;
+                },
+                else => {
+                    try b.addByte(c);
+                    i += 1;
+                },
+            }
+        }
+        return b.toOwnedSlice();
+    }
+
     /// 字段类型映射（CLR 类型 → 数据库字段类型）。
     pub fn fieldTypeAlloc(self: DatabaseKind, gpa: std.mem.Allocator, col: ColumnMeta) ![]u8 {
         if (!self.isImplemented()) return error.Unsupported;
@@ -1402,4 +1492,40 @@ test "Access / SqlCe 只有 TOP 分页：首页可用、带 offset 明确报错�
     const page = try ps.pageSplitAlloc(a, spec, 5, 5, false);
     defer a.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "Top") != null);
+}
+
+test "直接执行 SQL：`?` 按方言改写成 $n / @pN / :n，字符串与注释里的 ? 不动" {
+    const a = std.testing.allocator;
+    const sql = "Select * From T Where A = ? And B = ? And Note Like '%?%' -- tail ?\n";
+
+    // SQLite / MySQL 本来就用 ?
+    const lite = try DatabaseKind.sqlite.rewritePlaceholdersAlloc(a, sql);
+    defer a.free(lite);
+    try std.testing.expectEqualStrings(sql, lite);
+
+    // PostgreSQL：$1 / $2
+    const pg = try DatabaseKind.postgresql.rewritePlaceholdersAlloc(a, sql);
+    defer a.free(pg);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "A = $1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "B = $2") != null);
+    // 字符串字面量与行注释里的 ? 必须原样保留
+    try std.testing.expect(std.mem.indexOf(u8, pg, "'%?%'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pg, "-- tail ?") != null);
+
+    // SQL Server：@p0 / @p1
+    const tds = try DatabaseKind.sqlserver.rewritePlaceholdersAlloc(a, sql);
+    defer a.free(tds);
+    try std.testing.expect(std.mem.indexOf(u8, tds, "A = @p0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tds, "B = @p1") != null);
+
+    // Oracle：:1 / :2
+    const ora = try DatabaseKind.oracle.rewritePlaceholdersAlloc(a, sql);
+    defer a.free(ora);
+    try std.testing.expect(std.mem.indexOf(u8, ora, "A = :1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ora, "B = :2") != null);
+
+    // 块注释
+    const block = try DatabaseKind.postgresql.rewritePlaceholdersAlloc(a, "Select /* ? */ 1 Where A = ?");
+    defer a.free(block);
+    try std.testing.expectEqualStrings("Select /* ? */ 1 Where A = $1", block);
 }

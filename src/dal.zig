@@ -538,8 +538,15 @@ pub const Dal = struct {
     }
 
     pub fn shardPolicyFor(self: *Dal, table_name: []const u8) ?*shards.TimePolicy {
+        // 注册时可能用**实体名**（`Log`）也可能用**物理表名**（`DH_Log`），
+        // 查找时两者都认（与 `EntityModel.table` 同口径），否则调用方传哪个都会有一半查不到。
+        const meta = self.model.table(table_name);
         for (self.shard_routes.items) |*route| {
             if (std.ascii.eqlIgnoreCase(route.table_name, table_name)) return &route.policy;
+            if (meta) |t| {
+                if (std.ascii.eqlIgnoreCase(route.table_name, t.name)) return &route.policy;
+                if (std.ascii.eqlIgnoreCase(route.table_name, t.effectiveTableName())) return &route.policy;
+            }
         }
         return null;
     }
@@ -664,6 +671,128 @@ pub const Dal = struct {
         return self.model.options.connName() orelse "";
     }
 
+    /// 某张表**实际归属**的连接名：表级 `ConnName` 优先、模型级兜底。
+    ///
+    /// 两级都没配时返回主连接名（`connName()`，可能为空串）。
+    /// 这是业务代码唯一可以问“这张表在哪个库”的入口——**不要在调用方另拼连接名**。
+    pub fn tableConnName(self: *const Dal, table_name: []const u8) ![]const u8 {
+        const t = self.model.table(table_name) orelse return error.TableNotFound;
+        return self.model.tableConn(t) orelse self.connName();
+    }
+
+    /// 按表归属的连接开会话（`Log` 表在 `Log` 库、其余在 `Membership` 库这种场景）。
+    ///
+    /// 跨库表要求先用 `attachConnection` 挂上该连接；没挂会报 `error.UnknownConnection`，
+    /// **不会**静默回到主库。
+    pub fn openSessionForTable(self: *Dal, table_name: []const u8) !Session {
+        const conn = try self.tableConnName(table_name);
+        return self.sessionForConn(conn);
+    }
+
+    // ── 直接执行 SQL（对应 C# `DAL.Execute(sql)` 的直执行入口）──────────────
+    //
+    // 口径：**SQL 里一律用 `?` 写占位符**，本层按连接方言自动改写
+    // （PG `$1`、SQL Server `@p0`、Oracle/达梦 `:1`，SQLite/MySQL 保持不变），
+    // 字符串/标识符/注释里的 `?` 不会被误改。参数一律走绑定，不做字符串拼接。
+
+    /// 直接执行一条 SQL（主连接），返回影响行数。
+    pub fn exec(self: *Dal, sql: []const u8, params: []const @import("zzig").db.Value) !usize {
+        var s = try self.openSession();
+        defer s.deinit();
+        const rewritten = try self.opts.provider.rewritePlaceholdersAlloc(self.gpa, sql);
+        defer self.gpa.free(rewritten);
+        return s.execute(rewritten, params);
+    }
+
+    /// 直接查询（主连接）。返回的行集指向会话内存，**本函数返回副本**，调用方用 `gpa` 释放。
+    pub fn queryAlloc(self: *Dal, gpa: std.mem.Allocator, sql: []const u8, params: []const @import("zzig").db.Value) ![]@import("session.zig").Row {
+        var s = try self.openSession();
+        defer s.deinit();
+        const rewritten = try self.opts.provider.rewritePlaceholdersAlloc(self.gpa, sql);
+        defer self.gpa.free(rewritten);
+        const rows = try s.queryRows(rewritten, params);
+        // 行指向会话内存，必须**深拷贝**后再返回（只 dupe(Row) 会留悬垂字符串）
+        return @import("session.zig").dupRowsAlloc(gpa, rows);
+    }
+
+    /// 按**表归属的连接**直接执行（分库时指向该表所在的库；对应 C# 里按 `Meta.Session` 走）。
+    pub fn execOnTable(self: *Dal, table_name: []const u8, sql: []const u8, params: []const @import("zzig").db.Value) !usize {
+        var s = try self.openSessionForTable(table_name);
+        defer s.deinit();
+        const rewritten = try self.opts.provider.rewritePlaceholdersAlloc(self.gpa, sql);
+        defer self.gpa.free(rewritten);
+        return s.execute(rewritten, params);
+    }
+
+    /// 按**表归属的连接**直接查询（返回副本，调用方释放）。
+    pub fn queryOnTableAlloc(self: *Dal, gpa: std.mem.Allocator, table_name: []const u8, sql: []const u8, params: []const @import("zzig").db.Value) ![]@import("session.zig").Row {
+        var s = try self.openSessionForTable(table_name);
+        defer s.deinit();
+        const rewritten = try self.opts.provider.rewritePlaceholdersAlloc(self.gpa, sql);
+        defer self.gpa.free(rewritten);
+        const rows = try s.queryRows(rewritten, params);
+        return @import("session.zig").dupRowsAlloc(gpa, rows);
+    }
+
+    /// 在**已有会话**上直接执行 SQL（方言改写 + 绑定）。
+    ///
+    /// 事务内必须用这个：`exec` / `execOnTable` 会**新开会话**，那等于另一个连接/事务，
+    /// 写进去的数据不会随调用方的事务回滚。
+    pub fn execIn(self: *Dal, s: *Session, sql: []const u8, params: []const @import("zzig").db.Value) !usize {
+        const rewritten = try self.opts.provider.rewritePlaceholdersAlloc(self.gpa, sql);
+        defer self.gpa.free(rewritten);
+        return s.execute(rewritten, params);
+    }
+
+    // ── 多表事务 ────────────────────────────────────────────────
+    //
+    // 口径：**一个事务只能落在一个连接上**。同库多表完全没问题（同一会话、同一事务），
+    // 跨库多表**没有分布式事务**——这里选择「明确报错」而不是：
+    //   - 静默拆成两个独立事务（一半成功一半失败，最难查）；
+    //   - 假装"自动分库"（两阶段提交需要协调者，本库没有，也不该偷偷做）。
+
+    /// 校验一组表是否同属一个连接；不同则打印可定位的诊断并返回 `error.CrossDatabaseTransaction`。
+    ///
+    /// 返回归属的连接名（表都没配 `ConnName` 时返回主连接名，可能是空串）。
+    pub fn connectionOfTables(self: *Dal, table_names: []const []const u8) ![]const u8 {
+        if (table_names.len == 0) return self.connName();
+
+        var first: []const u8 = "";
+        var first_table: []const u8 = "";
+        for (table_names, 0..) |tn, i| {
+            const conn = try self.tableConnName(tn);
+            if (i == 0) {
+                first = conn;
+                first_table = tn;
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(conn, first)) continue;
+            std.debug.print(
+                "[zcode] 跨库事务被拒绝：表 {s} 归属连接 {s}，表 {s} 归属连接 {s}。\n" ++
+                    "  一个事务只能在一个连接上执行；跨库写入需要业务补偿（Outbox / 两阶段），本库不做隐式拆分。\n",
+                .{ first_table, first, tn, conn },
+            );
+            return error.CrossDatabaseTransaction;
+        }
+        return first;
+    }
+
+    /// 为「一组表」在**已有会话**上开启事务（同库多表）。
+    ///
+    /// - 表分属不同连接 → `error.CrossDatabaseTransaction`（附诊断，不静默拆库）；
+    /// - 调用方必须保证 `s` 就是该连接的会话（先用 `sessionForConn(conn)` 开）。
+    ///
+    /// 用法：
+    /// ```zig
+    /// var s = try dal.beginForTables("User", "Role");  // 见下方便捷函数
+    /// ```
+    /// 注意：**不要**把 `Session` 按值返回给调用方——它内含 arena，复制会导致
+    /// 两个副本共享同一份缓冲链，`deinit` 时崩溃。所以这里只接受 `*Session`。
+    pub fn beginTransactionForTables(self: *Dal, s: *Session, table_names: []const []const u8) !void {
+        _ = try self.connectionOfTables(table_names);
+        _ = try s.beginTransaction(.default);
+    }
+
     // ── 写入拦截器 ──────────────────────────────────────────────
 
     /// 挂上写入拦截器链（不接管所有权）。此后 `table()` 取到的表句柄都会应用它。
@@ -755,8 +884,12 @@ pub const Dal = struct {
     /// 1. 表不存在 → 建表（含索引）
     /// 2. 表存在 → `PRAGMA table_info` 对比，缺列则 `ALTER TABLE ... ADD COLUMN`
     /// 3. 索引不存在 → `CREATE INDEX`
-    pub fn syncSchema(self: *Dal, s: *Session) !SchemaReport {
+    pub fn syncSchema(self: *Dal, s_main: *Session) !SchemaReport {
         var report = SchemaReport{};
+
+        // 跨库表的会话由本函数按 Model.xml 的连接规则自行打开并关闭（不借用调用方的会话）。
+        var owned: ?Session = null;
+        defer if (owned) |*o| o.deinit();
 
         const global = self.effectiveMigration();
         if (global == .off) {
@@ -767,6 +900,31 @@ pub const Dal = struct {
         report.executed = global.canExecute();
 
         for (self.model.tables) |*t| {
+            // ── 连接路由：**表级 `ConnName` 优先、模型级兜底**（唯一规则在 `EntityModel.tableConn`）——
+            // 不在这里重新拼连接名，也不允许“没挂连接就建到主库”这种静默降级。
+            const conn = self.model.tableConn(t);
+            const on_main = conn == null or std.ascii.eqlIgnoreCase(conn.?, self.connName());
+
+            if (owned) |*o| {
+                o.deinit();
+                owned = null;
+            }
+            var cur: *Session = s_main;
+            if (!on_main) {
+                const cs = self.sessionForConn(conn.?) catch |e| {
+                    std.debug.print(
+                        "[sync_schema] 表 {s} 归属连接 {s}，但该连接未挂载（拒绝静默建到主库）。\n" ++
+                            "  请先用 attachConnection(\"{s}\", 连接串) 挂上，或确认 Model.xml 的表级 ConnName 是否正确。\n",
+                        .{ t.name, conn.?, conn.? },
+                    );
+                    return e;
+                };
+                owned = cs;
+                cur = &owned.?;
+            }
+            // 循环体内沿用原变量名：后续所有 DDL 都作用在“本表自己的连接”上
+            const s = cur;
+
             // 表级档位只能更保守（C# `ResolveMigration` 的 min 语义）
             const migration = global.tighten(t.migration);
             if (migration == .off) {

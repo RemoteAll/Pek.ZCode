@@ -20,6 +20,56 @@ const DatabaseKind = @import("dialect.zig").DatabaseKind;
 
 pub const Row = sqlite.Row; // == zzig.db.Row，两个驱动共用同一行结构
 
+/// 深拷贝行集：行结构、列名、以及 `text` / `blob` 的字节都重新分配。
+///
+/// 为什么必须深拷贝：`Session.queryRows` 返回的行**指向会话内存**，会话 `deinit` 后全部失效。
+/// 想把结果带出会话作用域（如 `Dal.queryAlloc` 直查询），必须整份复制，不能只 `dupe(Row)`——
+/// 那样只复制了行结构，字符串仍是悬垂指针（读到已释放内存会得到乱数据，甚至触发 union 标签错乱）。
+pub fn dupRowsAlloc(gpa: std.mem.Allocator, rows: []const Row) ![]Row {
+    const out = try gpa.alloc(Row, rows.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |r| freeRow(gpa, r);
+        gpa.free(out);
+    }
+
+    for (rows, 0..) |row, i| {
+        const names = try gpa.alloc([]const u8, row.names.len);
+        for (row.names, 0..) |n, k| names[k] = try gpa.dupe(u8, n);
+
+        const values = try gpa.alloc(Value, row.values.len);
+        for (row.values, 0..) |v, k| {
+            values[k] = switch (v) {
+                .text => |t| .{ .text = try gpa.dupe(u8, t) },
+                .blob => |b| .{ .blob = try gpa.dupe(u8, b) },
+                else => v,
+            };
+        }
+        out[i] = .{ .names = names, .values = values };
+        filled = i + 1;
+    }
+    return out;
+}
+
+/// 释放 `dupRowsAlloc` 产出的行集。
+pub fn freeRows(gpa: std.mem.Allocator, rows: []const Row) void {
+    for (rows) |r| freeRow(gpa, r);
+    gpa.free(rows);
+}
+
+fn freeRow(gpa: std.mem.Allocator, row: Row) void {
+    for (row.names) |n| gpa.free(n);
+    gpa.free(row.names);
+    for (row.values) |v| {
+        switch (v) {
+            .text => |t| gpa.free(t),
+            .blob => |b| gpa.free(b),
+            else => {},
+        }
+    }
+    gpa.free(row.values);
+}
+
 /// 事务隔离级别（对应 `System.Data.IsolationLevel`）。
 /// `default` = 用数据库默认级别（SQLite 无从设置，MySQL 默认 REPEATABLE READ）。
 pub const IsolationLevel = enum {

@@ -47,6 +47,38 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
     defer dal.deinit();
+
+    // 模型里声明的**其它连接**（表级 ConnName 覆盖模型级）必须显式挂上，
+    // 否则 `syncSchema` 会拒绝把那些表静默建到主库（这是有意的守卫）。
+    // 冒烟工具只有一个 SQLite 文件，所以把每个连接名都挂到同一个文件上；
+    // 真实业务里这里应挂各自的连接串。
+    {
+        var attached: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (attached.items) |n| gpa.free(n);
+            attached.deinit(gpa);
+        }
+        for (dal.model.tables) |*t| {
+            const cn = dal.model.tableConn(t) orelse continue;
+            if (cn.len == 0) continue;
+            if (std.ascii.eqlIgnoreCase(cn, dal.connName())) continue;
+            var seen = false;
+            for (attached.items) |n| {
+                if (std.ascii.eqlIgnoreCase(n, cn)) seen = true;
+            }
+            if (seen) continue;
+            dal.attachConnection(cn, conn) catch |e| {
+                std.debug.print("[gencheck] 挂载连接 {s} 失败：{s}\n", .{ cn, @errorName(e) });
+                continue;
+            };
+            const owned = try gpa.dupe(u8, cn);
+            try attached.append(gpa, owned);
+        }
+        if (attached.items.len > 0) {
+            std.debug.print("gencheck：按模型挂载了 {d} 个附加连接（同一 SQLite 文件）\n", .{attached.items.len});
+        }
+    }
+
     var s = try dal.openSession();
     defer s.deinit();
 

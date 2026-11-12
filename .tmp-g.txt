@@ -1,0 +1,11 @@
+﻿zig : info: to list available steps: zig build -l
+所在位置 行:1 字符: 64
++ ... ; $ErrorActionPreference='Continue'; zig build gen-check 2>&1 | Out-F ...
++                                          ~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (info: to list a...s: zig build -l:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error: no such step: gen-check
+error: the following build command exited with code 1:
+C:\Users\qcjxb\AppData\Local\zig\o\e4099869a96975dfccdb577de7993fcd\maker.exe build --zig-lib=C:\Users\qcjxb\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.17.1\lib --zig=C:\
+Users\qcjxb\AppData\Roaming\Code\User\globalStorage\ziglang.vscode-zig\zig\x86_64-windows-0.17.1\zig.exe --global-cache=C:\Users\qcjxb\AppData\Local\zig --seed=0xdfb0bb5b gen-check

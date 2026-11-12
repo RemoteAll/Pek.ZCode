@@ -1,0 +1,89 @@
+﻿zcode-integration.exe : 1/66 integration.test.绔埌绔細寤鸿〃 鈫?CRUD 鈫?鍒嗛〉 鈫?鑱氬悎...OK
+所在位置 行:1 字符: 335
++ ... me -Descending | Select-Object -First 1; & $exe.FullName 2>&1 | Out-F ...
++                                              ~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (1/66 integratio...?鍒嗛〉 鈫?鑱氬悎...OK:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2/66 integration.test.浜屾 sync_schema 骞傜瓑锛屼笖鏂板鍒楄嚜鍔ㄨˉ榻?..OK
+3/66 integration.test.瀵硅薄瀹炰綋锛氳剰瀛楁鏇存柊鍙啓鍙樺寲鍒楋紝鏃犲彉鍖栦笉鍙?SQL...OK
+4/66 integration.test.鎵归噺鍐欙細澶氳鎻掑叆 / 涓婚敭鎵归噺鍒犻櫎 / 瀹炰綋鎵归噺淇濆瓨...OK
+5/66 integration.test.鏁磋〃缂撳瓨锛氬懡涓?/ 鍐欏悗鑷姩澶辨晥 / TTL 杩囨湡閲嶈浇...OK
+6/66 integration.test.鍗曞璞＄紦瀛橈細鍛戒腑 / TTL 杩囨湡鍥炲簱 / 鍐欏悗鑷姩澶辨晥...OK
+7/66 integration.test.鐢熶骇妯″瀷鍥炲綊锛欴H.NCode 鍐呯疆 Model.xml 鍙В鏋愬苟鐢熸垚 SQLite 寤鸿〃 SQL...OK
+8/66 integration.test.MySQL 杩炴帴涓茶В鏋愶細Server/Port/Database/Uid/Pwd锛堜笉杩炲簱锛?..OK
+9/66 integration.test.MySQL 鐪熷簱锛氬缓琛?鈫?CRUD 鈫?鍒嗛〉锛堥渶 -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩?MySQL 鐪熷簱闆嗘垚娴嬭瘯
+OK
+10/66 integration.test.浜嬪姟锛氭彁浜?/ 鍥炴粴 / 宓屽璁℃暟锛堝榻?C# Transaction 璇箟锛?..OK
+11/66 integration.test.浜嬪姟锛歋coped 鏈彁浜よ嚜鍔ㄥ洖婊氾紙瀵瑰簲 EntityTransaction 鐨?Dispose 璇箟锛?..OK
+12/66 integration.test.MySQL 鐪熷簱锛欱IT 鍒楀瓧鑺傚簭锛堥渶 -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩?BIT 瀛楄妭搴忕敤渚?OK
+13/66 integration.test.鍙嶅悜宸ョ▼锛歋QLite 寤鸿〃 鈫?鍙嶆煡 鈫?Model.xml 鍙啀瑙ｆ瀽...OK
+14/66 integration.test.MySQL 鐪熷簱锛氬弽鍚戝伐绋?鈫?Model.xml锛堥渶 -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩囧弽鍚戝伐绋嬬敤渚?OK
+15/66 integration.test_0...OK
+16/66 integration.test_1...OK
+17/66 integration.test_2...OK
+18/66 integration.test_3...OK
+19/66 integration.test_4...OK
+20/66 integration.test_5...OK
+21/66 integration.test_6...OK
+22/66 integration.test_7...OK
+23/66 integration.test_8...OK
+24/66 integration.test_9...OK
+25/66 integration_stat_extract.test.缁熻锛氱疮鍔犲瓧娈垫寜 SQL 鍘熷瓙绱姞锛坰um / count / max / min锛?..[zcode] 缁熻瀛楁 Total 浣跨敤 avg 绱姞锛氬崟鏉?SQL 鏃犳硶鍘熷瓙绠楀潎鍊硷紝璇锋敼鐢?Sum + Count 涓や釜瀛楁
+OK
+26/66 integration_stat_extract.test.鎶藉彇锛欼dExtractor 鎸変富閿杩涳紝鎵瑰ぇ灏忎笌鎬绘暟姝ｇ‘...OK
+27/66 integration_stat_extract.test.鎶藉彇锛歅agingExtractor 鍒嗛〉鍏滃簳锛屾壒澶у皬涓庢€绘暟姝ｇ‘...OK
+28/66 integration_stat_extract.test.鎶藉彇锛歍imeExtractor 鎸夋椂闂寸獥鎺ㄨ繘锛屽叏閮ㄨ鍙栦竴娆′笖鑳界粓姝?..OK
+29/66 integration_stat_extract.test.鎶藉彇锛氭椂闂寸┖妗ｄ笉浼氭寰幆锛圕# 浼氬師鍦版墦杞紝杩欓噷鏄庣‘鏀跺伐锛?..OK
+30/66 integration_stat_extract.test.鍒嗛〉锛歁SPageSplit 鐨?rowNumber 绠楁硶鍦ㄧ湡搴撲笂缈婚〉姝ｇ‘...OK
+31/66 integration_batch_async.test.鎵归噺鍐欙細insert / upsert / insert_ignore / replace 鍥涚妯″紡鐪熺殑钀藉簱...OK
+32/66 integration_batch_async.test.鎵归噺鍐欙細upsert 鍦ㄦ棤涓婚敭琛ㄤ笂鏄庣‘鎶ラ敊锛屼笉闈欓粯闄嶇骇...[zcode] upsertBatch锛氳〃 BH_Npk 娌℃湁涓婚敭锛屾棤娉曞仛 Upsert
+OK
+33/66 integration_batch_async.test.寤惰繜闃熷垪锛氬悗鍙扮嚎绋嬭嚜鍔ㄥ噾鎵瑰啓搴擄紙start/stop锛?..OK
+34/66 integration_batch_async.test.寤惰繜闃熷垪锛氭湭鍒版湡涓嶅啓锛屽埌鏈熸墠鍐?..OK
+35/66 integration_batch_async.test.寮傛淇濆瓨锛堝噾鎵癸級锛歴aveAsync 鍏ラ槦锛屽悗鍙版寜琛ㄥ悎骞舵垚澶氳 INSERT...OK
+36/66 integration_batch_async.test.绱姞瀛楁锛氬疄浣撲繚瀛樿蛋 col = col + ?锛屼袱娆＄疮鍔犲緱鍒?3...OK
+37/66 integration_batch_async.test.Dal 鐩存墽琛?SQL锛歚?` 鍗犱綅绗﹁嚜鍔ㄩ€傞厤鏂硅█锛屽弬鏁拌蛋缁戝畾...OK
+38/66 integration_batch_async.test.澶氳〃浜嬪姟锛氬悓搴撲袱寮犺〃鍦ㄥ悓涓€浜嬪姟鍐呮彁浜や笌鍥炴粴...OK
+39/66 integration_batch_async.test.璺ㄥ簱澶氳〃浜嬪姟锛氭槑纭姤閿欙紙涓嶉潤榛樻媶鎴愪袱涓簨鍔★紝涔熶笉鍋囪鑷姩鍒嗗簱锛?..[zcode] 璺ㄥ簱浜嬪姟琚嫆缁濓細琛?A 褰掑睘杩炴帴 DH锛岃〃 L 褰掑睘杩炴帴 Log銆?  涓€涓簨鍔″彧鑳藉湪涓€涓繛鎺ヤ笂鎵ц锛涜法搴撳啓鍏ラ渶瑕佷笟鍔¤ˉ鍋匡紙Outbox / 涓ら樁娈碉級锛屾湰搴撲笉鍋氶殣寮忔媶鍒嗐€
+?[zcode] 璺ㄥ簱浜嬪姟琚嫆缁濓細琛?A 褰掑睘杩炴帴 DH锛岃〃 L 褰掑睘杩炴帴 Log銆?  涓€涓簨鍔″彧鑳藉湪涓€涓繛鎺ヤ笂鎵ц锛涜法搴撳啓鍏ラ渶瑕佷笟鍔¤ˉ鍋匡紙Outbox / 涓ら樁娈碉級锛屾湰搴撲笉鍋氶殣寮忔媶鍒嗐€?OK
+40/66 integration_shard_batch.test.鍒嗚〃鍒嗗簱 + 鑷姩鍑戞壒锛氬悓鍒嗙墖鍚堝苟鎴愪竴鏉″琛?INSERT锛屼笉鍚屽垎鐗囧悇鑷竴鎵?..OK
+41/66 integration_tsql.test.SQL Server锛氳繛鎺ヤ覆閿悕涓庣鍙ｅ洖钀?..OK
+42/66 integration_tsql.test.SQL Server锛歴yncSchema 璧扮湡瀹?TDS 甯у缓琛紙鍋囨湇鍔＄锛?..OK
+43/66 integration_dbservice.test.鏁版嵁搴撹繙绋嬫湇鍔★細Login/Query/Execute/Identity/Count/GetTables/浜嬪姟/璐熷悜...[dbservice] Login锛歞bType=sqlite
+[dbservice] InsertAndGetIdentity锛?
+[dbservice] Query锛? 琛岋紝Title=鏉ヨ嚜杩滅▼鏈嶅姟
+[dbservice] 浜嬪姟鍥炴粴锛氳鏁颁粛涓?1
+[dbservice] 浜嬪姟鎻愪氦锛氳鏁板彉 2
+[dbservice] packet锛氬垪 3 / 琛?2锛圖bTable v3 浜岃繘鍒讹級
+[dbservice] 澶勭悊璇锋眰澶辫触锛欻ttpConnectionClosing
+OK
+44/66 integration_mysql_compress.test.MySQL 鐪熷簱锛氬帇缂╁崗璁線杩旓紙闇€ -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩囧帇缂╁崗璁敤渚?OK
+45/66 integration_mysql_tls.test.MySQL 鐪熷簱 TLS锛歊equired 鐪熷姞瀵?/ None 鏄庢枃 / 璇佷功鏍￠獙澶辫触锛堥渶 -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩?TLS 鐢ㄤ緥
+OK
+46/66 integration_mysql_bulk.test.MySQL 鐪熷簱锛歀OAD DATA LOCAL INFILE 鎵归噺瑁呰浇锛堥渶 -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩?LOCAL INFILE 鐢ㄤ緥
+OK
+47/66 integration_shard.test.璺ㄥ簱鍒嗙墖锛氭寜 ConnPolicy 鍐欏叆涓嶅悓搴撴枃浠讹紝鍒嗙墖琛ㄨ嚜鍔ㄥ缓琛?..OK
+48/66 integration_shard.test.璺ㄥ簱鍒嗙墖锛氭湭鎸傝浇鐨勮繛鎺ユ槑纭姤閿欙紙涓嶉潤榛樺啓涓诲簱锛?..[zcode] 鍒嗚〃锛氳繛鎺?DH_2024 鏈寕杞斤紙琛?DH_Log_2024锛夈€傝法搴撳垎鐗囬渶鍏?attachConnection(鍚嶇О, 杩炴帴涓?
+[zcode] 杩炴帴 DH_2024 鏈寕杞斤紝鏃犳硶寮€浼氳瘽
+OK
+49/66 integration_pg_real.test.PostgreSQL 鐪熷簱锛氬缓琛?+ CRUD + 鎵归噺鎻?+ 鍙嶅悜宸ョ▼...[SKIP] 鏈彁渚?-Dpg-conn锛堝厛璺?tools/pg-local.ps1 -Action setup锛屽啀甯﹁繛鎺ヤ覆锛?SKIP
+50/66 integration_pg_real.test.PostgreSQL 鐪熷簱锛歴cram-sha-256 閴存潈锛堝彲閫?-Dpg-conn-scram锛?..[SKIP] 鏈彁渚?-Dpg-conn-scram锛岃烦杩囧瘑鐮侀壌鏉冮獙璇?SKIP
+51/66 integration_pg.test.PostgreSQL锛氳繛鎺ヤ覆閿悕锛圫erver/Port/Database/UserID/Password锛夎姝ｇ‘瑙ｆ瀽...OK
+52/66 integration_pg.test.PostgreSQL锛氭湭鍐?Port 鏃跺洖钀藉埌 5432锛堜笉鑳芥部鐢?MySQL 鐨?3306锛?..OK
+53/66 integration_pg.test.PostgreSQL锛氱己 Database 鏃跺垵濮嬪寲鍗虫姤閿欙紙涓嶆嫋鍒扮涓€娆℃煡璇級...OK
+54/66 integration_features.test.鍒嗚〃锛氭寜鏈堣矾鐢卞埌涓嶅悓鐗╃悊琛ㄥ苟鐪熷疄鍐欏叆...[zcode] 鍒嗚〃锛氶洩鑺?Id 瑙ｆ瀽鏃堕棿澶辫触锛坕d=0锛屽瓧娈?CreateTime锛?OK
+55/66 integration_features.test.鍒嗚〃锛氬尯闂存壂鎻忎笌鏉′欢鎺ㄥ锛堥泦鎴愬彛寰勶級...OK
+56/66 integration_features.test.璇诲啓鍒嗙锛氫粠搴撲細璇濆彧璇伙紝蹇界暐琛ㄤ笌鍏ㄥ眬鍒囦富搴撳洖钀戒富搴?..OK
+57/66 integration_features.test.璇诲啓鍒嗙锛氭柟瑷€涓嶄竴鑷寸殑浠庡簱鎷掔粷鎸傝浇...[zcode] 璇诲啓鍒嗙锛氫粠搴撴柟瑷€ mysql 涓庝富搴?sqlite 涓嶄竴鑷达紝鎷掔粷鎸傝浇锛圥rovider=MySQL;Server=127.0.0.1;Database=x;UserID=root;Password=锛?OK
+58/66 integration_features.test.杩炴帴姹狅細Dal 绾ф睜鍖栵紙鏂囦欢搴擄級鍙鐢ㄤ笖鍐欏悗鍙...OK
+59/66 integration_features.test.杩炴帴姹狅細鍐呭瓨搴撲笉鏀寔姹犲寲锛堟瘡娆¤繛鎺ユ槸鐙珛搴擄級...OK
+60/66 integration_features.test.鎷︽埅鍣細鎻掑叆鑷姩琛?CreateTime/UpdateTime锛屾洿鏂板彧鍒锋柊 UpdateTime...OK
+61/66 integration_features.test.鎷︽埅鍣細鎵归噺鎻掑叆鍚屾牱琛ュ璁″垪...OK
+62/66 integration_features.test.杩佺Щ锛歄n 妗ｄ笉鍒犲垪锛孎ull 妗ｅ垹闄ゆā鍨嬪鐨勫垪涓庣储寮?..OK
+63/66 integration_features.test.杩佺Щ锛氳〃绾ф。浣嶅彧鑳芥敹绱э紙琛ㄧ骇 Off 鏃朵笉寤鸿〃锛?..OK
+64/66 integration_features.test.杩佺Щ锛欶ull 妗ｆ敼鍒楃被鍨?闀垮害锛圫QLite 鐪熷簱锛屾暣琛ㄩ噸寤猴級...[sync_schema] SQLite 鏀瑰垪锛氭暣琛ㄩ噸寤?alter_probe锛堜复鏃惰〃 alter_probe_zcode_old锛?OK
+65/66 integration_features.test.杩佺Щ锛歁ySQL 鐪熷簱 Full 妗ｆ敼鍒楋紙闇€ -Dmysql-conn锛?..[SKIP] 鏈彁渚?-Dmysql-conn锛岃烦杩?MySQL 鏀瑰垪鐪熷簱鐢ㄤ緥
+OK
+66/66 integration_features.test.瀛楁缂撳瓨锛欳ode鈫扞d 鏁磋〃瀛楀吀 + 鍐欏悗鑷姩澶辨晥 + TTL...OK
+64 passed; 2 skipped; 0 failed.

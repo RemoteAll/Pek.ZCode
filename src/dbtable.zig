@@ -20,6 +20,7 @@ const query = @import("query.zig");
 const Where = query.Where;
 const Query = query.Query;
 const DateTime = @import("zzig").DateTime;
+const SaveModes = @import("setting.zig").SaveModes;
 
 pub const TableRef = struct {
     gpa: std.mem.Allocator,
@@ -210,6 +211,296 @@ pub const TableRef = struct {
             affected += try s.execute(sql.text, sql.params);
             start = end;
         }
+        if (affected > 0) self.notifyWrite();
+        return affected;
+    }
+
+    /// 批量写入，按 `SaveModes` 决定 SQL 形态（对应 C# `DataAccessLayer/SaveModes`）。
+    ///
+    /// | 模式 | SQLite | MySQL | PostgreSQL 系 |
+    /// |---|---|---|---|
+    /// | `insert` | `INSERT INTO` | 同左 | 同左 |
+    /// | `upsert` | `... ON CONFLICT(pk) DO UPDATE SET` | `... ON DUPLICATE KEY UPDATE` | `... ON CONFLICT(pk) DO UPDATE SET` |
+    /// | `insert_ignore` | `INSERT OR IGNORE INTO` | `INSERT IGNORE INTO` | `... ON CONFLICT DO NOTHING` |
+    /// | `replace` | `INSERT OR REPLACE INTO` | `REPLACE INTO` | 退回 `upsert`（PG 无 REPLACE） |
+    ///
+    /// 其它方言（SQL Server / Oracle / Access …）**不做字符串改写**：整批退化为
+    /// 「逐行先 UPDATE、未命中再 INSERT」，放在同一个事务里（语义等价、往返多）。
+    ///
+    /// 冲突目标用**模型定义**：优先主键（且主键列都在插入列里），
+    /// 否则第一个「列全在插入列里」的**唯一索引**；都不适用时 SQLite/PG 报 `error.NoUniqueKey`
+    /// （不编造一个不存在的冲突目标，否则 SQL 会报 UNIQUE constraint failed）。
+    ///
+    /// MySQL 的 `ON DUPLICATE KEY UPDATE` 不需要目标，因此它不受此限制。
+    pub fn upsertBatch(self: *const TableRef, s: *Session, rows: []const []const sqlbuild.Field, mode: SaveModes) !usize {
+        try self.ensureWritable();
+        if (rows.len == 0) return 0;
+        if (mode == .insert) return self.insertBatch(s, rows);
+
+        const pks = try self.table.primaryKeys(self.gpa);
+        defer self.gpa.free(pks);
+        if (pks.len == 0) {
+            std.debug.print("[zcode] upsertBatch：表 {s} 没有主键，无法做 {s}\n", .{ self.table_name, mode.name() });
+            return error.NoPrimaryKey;
+        }
+
+        // 拦截器：与 insertBatch 一致地逐行补齐审计列
+        var patched: std.ArrayList([]const sqlbuild.Field) = .empty;
+        defer {
+            for (patched.items) |r| self.gpa.free(r);
+            patched.deinit(self.gpa);
+        }
+        if (self.chain) |chain| {
+            if (chain.count() > 0) {
+                try patched.ensureTotalCapacity(self.gpa, rows.len);
+                for (rows) |row| {
+                    const effective = try self.applyInterceptors(s, .insert, row);
+                    patched.appendAssumeCapacity(effective);
+                }
+            }
+        }
+        const effective_rows: []const []const sqlbuild.Field = if (patched.items.len > 0) patched.items else rows;
+
+        const cols = effective_rows[0].len;
+        if (cols == 0) return error.Model;
+
+        // 冲突目标（主键 → 唯一索引），只选「列都在插入列里」的
+        const conflict = try self.conflictColumnsAlloc(effective_rows[0], pks);
+        defer if (conflict) |c| self.gpa.free(c);
+        if (conflict == null and self.kind != .mysql) {
+            std.debug.print(
+                "[zcode] upsertBatch：表 {s} 既无可用主键也无覆盖插入列的唯一索引，无法做 {s}" ++
+                    "（MySQL 除外，它不需要冲突目标）\n",
+                .{ self.table_name, mode.name() },
+            );
+            return error.NoUniqueKey;
+        }
+
+        switch (self.kind) {
+            .sqlite, .mysql, .postgresql, .kingbase, .highgo, .vastbase => {},
+            else => return self.upsertFallback(s, effective_rows, pks, mode),
+        }
+
+        var per_batch: usize = 5000;
+        const param_limit = self.kind.maxStatementParams() / cols;
+        if (param_limit > 0 and param_limit < per_batch) per_batch = param_limit;
+        if (per_batch == 0) per_batch = 1;
+
+        var affected: usize = 0;
+        var start: usize = 0;
+        while (start < effective_rows.len) {
+            const end = @min(start + per_batch, effective_rows.len);
+            const base = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end]);
+            defer base.deinit(self.gpa);
+
+            const text = try self.upsertSqlAlloc(base.text, effective_rows[0], conflict, mode);
+            defer self.gpa.free(text);
+
+            affected += s.execute(text, base.params) catch |e| {
+                std.debug.print(
+                    "[zcode] upsertBatch 失败：表 {s} 模式 {s}\n  SQL: {s}\n  错误: {s}\n",
+                    .{ self.table_name, mode.name(), text, s.lastError() },
+                );
+                return e;
+            };
+            start = end;
+        }
+        if (affected > 0) self.notifyWrite();
+        return affected;
+    }
+
+    /// 选冲突目标：主键（列都在 row 里）→ 第一个可覆盖的唯一索引；都不行返回 null。
+    fn conflictColumnsAlloc(
+        self: *const TableRef,
+        row: []const sqlbuild.Field,
+        pks: []const *const ColumnMeta,
+    ) !?[]const []const u8 {
+        const all_present = struct {
+            fn check(fields: []const sqlbuild.Field, names: []const []const u8) bool {
+                for (names) |n| {
+                    var hit = false;
+                    for (fields) |f| {
+                        if (std.ascii.eqlIgnoreCase(f.name, n)) hit = true;
+                    }
+                    if (!hit) return false;
+                }
+                return true;
+            }
+        }.check;
+
+        // 1) 主键
+        if (pks.len > 0) {
+            const names = try self.gpa.alloc([]const u8, pks.len);
+            for (pks, 0..) |pk, i| names[i] = self.table.effectiveColumnName(pk);
+            if (all_present(row, names)) return names;
+            self.gpa.free(names);
+        }
+
+        // 2) 唯一索引（按模型顺序取第一个可覆盖的）
+        for (self.table.indexes) |idx| {
+            if (!idx.unique) continue;
+            var names = try self.gpa.alloc([]const u8, idx.columns.len);
+            for (idx.columns, 0..) |c, i| {
+                const col = self.table.column(c) orelse {
+                    self.gpa.free(names);
+                    names = &.{};
+                    break;
+                };
+                names[i] = self.table.effectiveColumnName(col);
+            }
+            if (names.len == idx.columns.len and all_present(row, names)) return names;
+            self.gpa.free(names);
+        }
+        return null;
+    }
+
+    /// 把多行 `INSERT INTO` 改写成对应方言的 upsert/ignore/replace 语句。
+    fn upsertSqlAlloc(
+        self: *const TableRef,
+        insert_sql: []const u8,
+        row: []const sqlbuild.Field,
+        conflict: ?[]const []const u8,
+        mode: SaveModes,
+    ) ![]u8 {
+        const gpa = self.gpa;
+        const verb = "INSERT INTO ";
+        const rest = if (std.mem.startsWith(u8, insert_sql, verb)) insert_sql[verb.len..] else insert_sql;
+
+        var b = @import("zzig").Buf.init(gpa);
+        defer b.deinit();
+
+        switch (mode) {
+            .replace => {
+                if (self.kind == .sqlite) {
+                    try b.add("INSERT OR REPLACE INTO ");
+                    try b.add(rest);
+                } else if (self.kind == .mysql) {
+                    try b.add("REPLACE INTO ");
+                    try b.add(rest);
+                } else {
+                    // PG 系没有 REPLACE：等价语义 = 冲突时更新全部非主键列
+                    try b.add(insert_sql);
+                    try self.pushConflictSuffix(&b, row, conflict);
+                }
+            },
+            .insert_ignore => {
+                if (self.kind == .sqlite) {
+                    try b.add("INSERT OR IGNORE INTO ");
+                    try b.add(rest);
+                } else if (self.kind == .mysql) {
+                    try b.add("INSERT IGNORE INTO ");
+                    try b.add(rest);
+                } else {
+                    try b.add(insert_sql);
+                    try b.add(" ON CONFLICT DO NOTHING");
+                }
+            },
+            .upsert => {
+                try b.add(insert_sql);
+                try self.pushConflictSuffix(&b, row, conflict);
+            },
+            .insert => try b.add(insert_sql), // 已在上层分流，保持穷尽
+        }
+        return b.toOwnedSlice();
+    }
+
+    /// 追加冲突处理子句（`ON CONFLICT (...) DO UPDATE SET` / `ON DUPLICATE KEY UPDATE`）。
+    fn pushConflictSuffix(
+        self: *const TableRef,
+        b: *@import("zzig").Buf,
+        row: []const sqlbuild.Field,
+        conflict: ?[]const []const u8,
+    ) !void {
+        if (self.kind == .mysql) {
+            try b.add(" ON DUPLICATE KEY UPDATE ");
+        } else {
+            try b.add(" ON CONFLICT (");
+            if (conflict) |cols| {
+                for (cols, 0..) |c, i| {
+                    if (i > 0) try b.add(", ");
+                    try self.kind.pushQuoted(b, c);
+                }
+            }
+            try b.add(") DO UPDATE SET ");
+        }
+
+        var first = true;
+        for (row) |f| {
+            var conflict_hit = false;
+            if (conflict) |cols| {
+                for (cols) |c| {
+                    if (std.ascii.eqlIgnoreCase(c, f.name)) conflict_hit = true;
+                }
+            }
+            if (conflict_hit) continue;
+
+            if (!first) try b.add(", ");
+            first = false;
+            const quoted = try self.kind.quoteAlloc(self.gpa, f.name);
+            defer self.gpa.free(quoted);
+            if (self.kind == .mysql) {
+                try b.add(quoted);
+                try b.add(" = VALUES(");
+                try b.add(quoted);
+                try b.add(")");
+            } else {
+                try b.add(quoted);
+                try b.add(" = excluded.");
+                try b.add(quoted);
+            }
+        }
+    }
+
+    /// 方言不支持 SQL 级 upsert 时的退路：同事务内逐行「先 UPDATE，未命中再 INSERT」。
+    fn upsertFallback(
+        self: *const TableRef,
+        s: *Session,
+        rows: []const []const sqlbuild.Field,
+        pks: []const *const ColumnMeta,
+        mode: SaveModes,
+    ) !usize {
+        _ = mode;
+        var affected: usize = 0;
+        var scoped = try Session.Scoped.begin(s);
+        errdefer scoped.rollback();
+
+        for (rows) |row| {
+            var w = Where.init(self.gpa);
+            defer w.deinit();
+            for (pks) |pk| {
+                const name = self.table.effectiveColumnName(pk);
+                var found: ?Value = null;
+                for (row) |f| {
+                    if (std.ascii.eqlIgnoreCase(f.name, name)) found = f.value;
+                }
+                if (found == null) return error.Model;
+                _ = try w.eq(name, found.?);
+            }
+
+            var sets: std.ArrayList(sqlbuild.Field) = .empty;
+            defer sets.deinit(self.gpa);
+            for (row) |f| {
+                var pk_hit = false;
+                for (pks) |pk| {
+                    if (std.ascii.eqlIgnoreCase(self.table.effectiveColumnName(pk), f.name)) pk_hit = true;
+                }
+                if (!pk_hit) try sets.append(self.gpa, f);
+            }
+
+            var n: usize = 0;
+            if (sets.items.len > 0) {
+                const sql = try sqlbuild.update(self.gpa, self.kind, self.table, self.table_name, sets.items, &w);
+                defer sql.deinit(self.gpa);
+                n = try s.execute(sql.text, sql.params);
+            }
+            if (n == 0) {
+                const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, row);
+                defer sql.deinit(self.gpa);
+                n = try s.execute(sql.text, sql.params);
+            }
+            affected += n;
+        }
+        try scoped.commit();
         if (affected > 0) self.notifyWrite();
         return affected;
     }
