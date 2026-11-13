@@ -29,4 +29,6 @@ dist/
 .vscode/.browse*
 Thumbs.db
 desktop.ini
-`.tmp-*.txt
+
+# ---- 我自己的临时抓屏/日志（命令行重定向用，别入库）----
+.tmp-*.txt
