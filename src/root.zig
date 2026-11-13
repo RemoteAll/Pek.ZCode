@@ -64,6 +64,12 @@ pub const ConnectionOptions = dal.ConnectionOptions;
 pub const Migration = model.Migration;
 /// 对象实体（脏字段更新 / insert / save / update / delete / find / query）
 pub const entity = @import("entity.zig");
+/// 实体扩展（脏数据列裁剪 / 克隆 / 合并 / 截断 / CSV，对应 C# `EntityExtension`）
+pub const entity_ext = @import("entity_ext.zig");
+/// 实体扩展属性缓存（TTL + 惰加载，对应 C# `EntityExtend`）
+pub const extends = @import("extends.zig");
+/// CSV 读写（RFC4180 风格，全仓只此一份）
+pub const csv = @import("csv.zig");
 /// 整表实体缓存（Blocking 一致性 + 写后自动失效）
 pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
@@ -179,6 +185,9 @@ test {
     _ = @import("window.zig");
     _ = @import("pagesplit.zig");
     _ = @import("pinyin.zig");
+    _ = @import("csv.zig");
+    _ = @import("entity_ext.zig");
+    _ = @import("extends.zig");
     _ = @import("fieldcache.zig");
     _ = @import("setting.zig");
     _ = @import("sqltemplate.zig");

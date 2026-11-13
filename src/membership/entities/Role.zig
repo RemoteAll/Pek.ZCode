@@ -11,21 +11,13 @@ pub const Role = struct {
     @"ID": i32 = 0,
     /// 名称
     @"Name": []const u8 = "",
-    /// 类型。1系统/2普通/3租户
-    @"Type": i32 = 0,
     /// 启用
     @"Enable": bool = false,
     /// 系统。用于业务系统开发使用，不受数据权限约束，禁止修改名称或删除
     @"IsSystem": bool = false,
     /// 租户。角色所属组合，0表示全局角色
     @"TenantId": i32 = 0,
-    /// 数据范围。控制用户可访问的数据范围，0全部/1本部门及下级/2本部门/3仅本人/4自定义
-    @"DataScope": i32 = 0,
-    /// 数据部门。数据范围为自定义时，选择的部门编号列表
-    @"DataDepartmentIds": []const u8 = "",
-    /// 敏感字段。是否可以查看其他人的敏感字段数据
-    @"ViewSensitive": bool = false,
-    /// 权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7
+    /// 权限。对不同资源的权限，逗号分隔，每个资源的权限子项竖线分隔
     @"Permission": []const u8 = "",
     /// 排序
     @"Sort": i32 = 0,
@@ -66,14 +58,10 @@ pub const Role = struct {
         .fields = &.{
             .{ .name = "ID", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
             .{ .name = "Name", .data_type = .string, .description = "名称" },
-            .{ .name = "Type", .data_type = .int32, .description = "类型。1系统/2普通/3租户" },
             .{ .name = "Enable", .data_type = .boolean, .description = "启用" },
             .{ .name = "IsSystem", .data_type = .boolean, .description = "系统。用于业务系统开发使用，不受数据权限约束，禁止修改名称或删除" },
             .{ .name = "TenantId", .data_type = .int32, .description = "租户。角色所属组合，0表示全局角色" },
-            .{ .name = "DataScope", .data_type = .int32, .description = "数据范围。控制用户可访问的数据范围，0全部/1本部门及下级/2本部门/3仅本人/4自定义" },
-            .{ .name = "DataDepartmentIds", .data_type = .string, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
-            .{ .name = "ViewSensitive", .data_type = .boolean, .description = "敏感字段。是否可以查看其他人的敏感字段数据" },
-            .{ .name = "Permission", .data_type = .string, .description = "权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7" },
+            .{ .name = "Permission", .data_type = .string, .description = "权限。对不同资源的权限，逗号分隔，每个资源的权限子项竖线分隔" },
             .{ .name = "Sort", .data_type = .int32, .description = "排序" },
             .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
             .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
@@ -110,133 +98,135 @@ pub const Role = struct {
     }
     pub fn getID(self: @This()) i32 { return self.@"ID"; }
     pub fn setID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"ID", v)) return;
         self.@"ID" = v;
         zcode.entity.markDirty(&self.dirty, 0);
     }
     pub fn getName(self: @This()) []const u8 { return self.@"Name"; }
     pub fn setName(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Name", v)) return;
         self.@"Name" = v;
         zcode.entity.markDirty(&self.dirty, 1);
     }
-    pub fn getType(self: @This()) i32 { return self.@"Type"; }
-    pub fn setType(self: *@This(), v: i32) void {
-        self.@"Type" = v;
-        zcode.entity.markDirty(&self.dirty, 2);
-    }
     pub fn getEnable(self: @This()) bool { return self.@"Enable"; }
     pub fn setEnable(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"Enable", v)) return;
         self.@"Enable" = v;
-        zcode.entity.markDirty(&self.dirty, 3);
+        zcode.entity.markDirty(&self.dirty, 2);
     }
     pub fn getIsSystem(self: @This()) bool { return self.@"IsSystem"; }
     pub fn setIsSystem(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"IsSystem", v)) return;
         self.@"IsSystem" = v;
-        zcode.entity.markDirty(&self.dirty, 4);
+        zcode.entity.markDirty(&self.dirty, 3);
     }
     pub fn getTenantId(self: @This()) i32 { return self.@"TenantId"; }
     pub fn setTenantId(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"TenantId", v)) return;
         self.@"TenantId" = v;
-        zcode.entity.markDirty(&self.dirty, 5);
-    }
-    pub fn getDataScope(self: @This()) i32 { return self.@"DataScope"; }
-    pub fn setDataScope(self: *@This(), v: i32) void {
-        self.@"DataScope" = v;
-        zcode.entity.markDirty(&self.dirty, 6);
-    }
-    pub fn getDataDepartmentIds(self: @This()) []const u8 { return self.@"DataDepartmentIds"; }
-    pub fn setDataDepartmentIds(self: *@This(), v: []const u8) void {
-        self.@"DataDepartmentIds" = v;
-        zcode.entity.markDirty(&self.dirty, 7);
-    }
-    pub fn getViewSensitive(self: @This()) bool { return self.@"ViewSensitive"; }
-    pub fn setViewSensitive(self: *@This(), v: bool) void {
-        self.@"ViewSensitive" = v;
-        zcode.entity.markDirty(&self.dirty, 8);
+        zcode.entity.markDirty(&self.dirty, 4);
     }
     pub fn getPermission(self: @This()) []const u8 { return self.@"Permission"; }
     pub fn setPermission(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Permission", v)) return;
         self.@"Permission" = v;
-        zcode.entity.markDirty(&self.dirty, 9);
+        zcode.entity.markDirty(&self.dirty, 5);
     }
     pub fn getSort(self: @This()) i32 { return self.@"Sort"; }
     pub fn setSort(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Sort", v)) return;
         self.@"Sort" = v;
-        zcode.entity.markDirty(&self.dirty, 10);
+        zcode.entity.markDirty(&self.dirty, 6);
     }
     pub fn getEx1(self: @This()) i32 { return self.@"Ex1"; }
     pub fn setEx1(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Ex1", v)) return;
         self.@"Ex1" = v;
-        zcode.entity.markDirty(&self.dirty, 11);
+        zcode.entity.markDirty(&self.dirty, 7);
     }
     pub fn getEx2(self: @This()) i32 { return self.@"Ex2"; }
     pub fn setEx2(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Ex2", v)) return;
         self.@"Ex2" = v;
-        zcode.entity.markDirty(&self.dirty, 12);
+        zcode.entity.markDirty(&self.dirty, 8);
     }
     pub fn getEx3(self: @This()) f64 { return self.@"Ex3"; }
     pub fn setEx3(self: *@This(), v: f64) void {
+        if (zcode.entity.valueEql(self.@"Ex3", v)) return;
         self.@"Ex3" = v;
-        zcode.entity.markDirty(&self.dirty, 13);
+        zcode.entity.markDirty(&self.dirty, 9);
     }
     pub fn getEx4(self: @This()) []const u8 { return self.@"Ex4"; }
     pub fn setEx4(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex4", v)) return;
         self.@"Ex4" = v;
-        zcode.entity.markDirty(&self.dirty, 14);
+        zcode.entity.markDirty(&self.dirty, 10);
     }
     pub fn getEx5(self: @This()) []const u8 { return self.@"Ex5"; }
     pub fn setEx5(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex5", v)) return;
         self.@"Ex5" = v;
-        zcode.entity.markDirty(&self.dirty, 15);
+        zcode.entity.markDirty(&self.dirty, 11);
     }
     pub fn getEx6(self: @This()) []const u8 { return self.@"Ex6"; }
     pub fn setEx6(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex6", v)) return;
         self.@"Ex6" = v;
-        zcode.entity.markDirty(&self.dirty, 16);
+        zcode.entity.markDirty(&self.dirty, 12);
     }
     pub fn getCreateUser(self: @This()) []const u8 { return self.@"CreateUser"; }
     pub fn setCreateUser(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"CreateUser", v)) return;
         self.@"CreateUser" = v;
-        zcode.entity.markDirty(&self.dirty, 17);
+        zcode.entity.markDirty(&self.dirty, 13);
     }
     pub fn getCreateUserID(self: @This()) i32 { return self.@"CreateUserID"; }
     pub fn setCreateUserID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"CreateUserID", v)) return;
         self.@"CreateUserID" = v;
-        zcode.entity.markDirty(&self.dirty, 18);
+        zcode.entity.markDirty(&self.dirty, 14);
     }
     pub fn getCreateIP(self: @This()) []const u8 { return self.@"CreateIP"; }
     pub fn setCreateIP(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"CreateIP", v)) return;
         self.@"CreateIP" = v;
-        zcode.entity.markDirty(&self.dirty, 19);
+        zcode.entity.markDirty(&self.dirty, 15);
     }
     pub fn getCreateTime(self: @This()) zcode.DateTime { return self.@"CreateTime"; }
     pub fn setCreateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"CreateTime", v)) return;
         self.@"CreateTime" = v;
-        zcode.entity.markDirty(&self.dirty, 20);
+        zcode.entity.markDirty(&self.dirty, 16);
     }
     pub fn getUpdateUser(self: @This()) []const u8 { return self.@"UpdateUser"; }
     pub fn setUpdateUser(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"UpdateUser", v)) return;
         self.@"UpdateUser" = v;
-        zcode.entity.markDirty(&self.dirty, 21);
+        zcode.entity.markDirty(&self.dirty, 17);
     }
     pub fn getUpdateUserID(self: @This()) i32 { return self.@"UpdateUserID"; }
     pub fn setUpdateUserID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"UpdateUserID", v)) return;
         self.@"UpdateUserID" = v;
-        zcode.entity.markDirty(&self.dirty, 22);
+        zcode.entity.markDirty(&self.dirty, 18);
     }
     pub fn getUpdateIP(self: @This()) []const u8 { return self.@"UpdateIP"; }
     pub fn setUpdateIP(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"UpdateIP", v)) return;
         self.@"UpdateIP" = v;
-        zcode.entity.markDirty(&self.dirty, 23);
+        zcode.entity.markDirty(&self.dirty, 19);
     }
     pub fn getUpdateTime(self: @This()) zcode.DateTime { return self.@"UpdateTime"; }
     pub fn setUpdateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"UpdateTime", v)) return;
         self.@"UpdateTime" = v;
-        zcode.entity.markDirty(&self.dirty, 24);
+        zcode.entity.markDirty(&self.dirty, 20);
     }
     pub fn getRemark(self: @This()) []const u8 { return self.@"Remark"; }
     pub fn setRemark(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Remark", v)) return;
         self.@"Remark" = v;
-        zcode.entity.markDirty(&self.dirty, 25);
+        zcode.entity.markDirty(&self.dirty, 21);
     }
 
     /// 读取第 i 列（与 meta.fields 同序）。
@@ -244,30 +234,26 @@ pub const Role = struct {
         return switch (i) {
             0 => .{ .int = @intCast(self.@"ID") },
             1 => .{ .text = self.@"Name" },
-            2 => .{ .int = @intCast(self.@"Type") },
-            3 => .{ .boolean = self.@"Enable" },
-            4 => .{ .boolean = self.@"IsSystem" },
-            5 => .{ .int = @intCast(self.@"TenantId") },
-            6 => .{ .int = @intCast(self.@"DataScope") },
-            7 => .{ .text = self.@"DataDepartmentIds" },
-            8 => .{ .boolean = self.@"ViewSensitive" },
-            9 => .{ .text = self.@"Permission" },
-            10 => .{ .int = @intCast(self.@"Sort") },
-            11 => .{ .int = @intCast(self.@"Ex1") },
-            12 => .{ .int = @intCast(self.@"Ex2") },
-            13 => .{ .float = self.@"Ex3" },
-            14 => .{ .text = self.@"Ex4" },
-            15 => .{ .text = self.@"Ex5" },
-            16 => .{ .text = self.@"Ex6" },
-            17 => .{ .text = self.@"CreateUser" },
-            18 => .{ .int = @intCast(self.@"CreateUserID") },
-            19 => .{ .text = self.@"CreateIP" },
-            20 => .{ .datetime = self.@"CreateTime" },
-            21 => .{ .text = self.@"UpdateUser" },
-            22 => .{ .int = @intCast(self.@"UpdateUserID") },
-            23 => .{ .text = self.@"UpdateIP" },
-            24 => .{ .datetime = self.@"UpdateTime" },
-            25 => .{ .text = self.@"Remark" },
+            2 => .{ .boolean = self.@"Enable" },
+            3 => .{ .boolean = self.@"IsSystem" },
+            4 => .{ .int = @intCast(self.@"TenantId") },
+            5 => .{ .text = self.@"Permission" },
+            6 => .{ .int = @intCast(self.@"Sort") },
+            7 => .{ .int = @intCast(self.@"Ex1") },
+            8 => .{ .int = @intCast(self.@"Ex2") },
+            9 => .{ .float = self.@"Ex3" },
+            10 => .{ .text = self.@"Ex4" },
+            11 => .{ .text = self.@"Ex5" },
+            12 => .{ .text = self.@"Ex6" },
+            13 => .{ .text = self.@"CreateUser" },
+            14 => .{ .int = @intCast(self.@"CreateUserID") },
+            15 => .{ .text = self.@"CreateIP" },
+            16 => .{ .datetime = self.@"CreateTime" },
+            17 => .{ .text = self.@"UpdateUser" },
+            18 => .{ .int = @intCast(self.@"UpdateUserID") },
+            19 => .{ .text = self.@"UpdateIP" },
+            20 => .{ .datetime = self.@"UpdateTime" },
+            21 => .{ .text = self.@"Remark" },
             else => .{ .null = {} },
         };
     }
@@ -277,30 +263,26 @@ pub const Role = struct {
         switch (i) {
             0 => { self.@"ID" = v.asI32() orelse 0; },
             1 => { switch (v) { .text => |t| self.@"Name" = t, .null => self.@"Name" = "", else => {} } },
-            2 => { self.@"Type" = v.asI32() orelse 0; },
-            3 => { self.@"Enable" = v.asBool() orelse false; },
-            4 => { self.@"IsSystem" = v.asBool() orelse false; },
-            5 => { self.@"TenantId" = v.asI32() orelse 0; },
-            6 => { self.@"DataScope" = v.asI32() orelse 0; },
-            7 => { switch (v) { .text => |t| self.@"DataDepartmentIds" = t, .null => self.@"DataDepartmentIds" = "", else => {} } },
-            8 => { self.@"ViewSensitive" = v.asBool() orelse false; },
-            9 => { switch (v) { .text => |t| self.@"Permission" = t, .null => self.@"Permission" = "", else => {} } },
-            10 => { self.@"Sort" = v.asI32() orelse 0; },
-            11 => { self.@"Ex1" = v.asI32() orelse 0; },
-            12 => { self.@"Ex2" = v.asI32() orelse 0; },
-            13 => { self.@"Ex3" = v.asF64() orelse 0; },
-            14 => { switch (v) { .text => |t| self.@"Ex4" = t, .null => self.@"Ex4" = "", else => {} } },
-            15 => { switch (v) { .text => |t| self.@"Ex5" = t, .null => self.@"Ex5" = "", else => {} } },
-            16 => { switch (v) { .text => |t| self.@"Ex6" = t, .null => self.@"Ex6" = "", else => {} } },
-            17 => { switch (v) { .text => |t| self.@"CreateUser" = t, .null => self.@"CreateUser" = "", else => {} } },
-            18 => { self.@"CreateUserID" = v.asI32() orelse 0; },
-            19 => { switch (v) { .text => |t| self.@"CreateIP" = t, .null => self.@"CreateIP" = "", else => {} } },
-            20 => { self.@"CreateTime" = v.asDatetime() orelse .{}; },
-            21 => { switch (v) { .text => |t| self.@"UpdateUser" = t, .null => self.@"UpdateUser" = "", else => {} } },
-            22 => { self.@"UpdateUserID" = v.asI32() orelse 0; },
-            23 => { switch (v) { .text => |t| self.@"UpdateIP" = t, .null => self.@"UpdateIP" = "", else => {} } },
-            24 => { self.@"UpdateTime" = v.asDatetime() orelse .{}; },
-            25 => { switch (v) { .text => |t| self.@"Remark" = t, .null => self.@"Remark" = "", else => {} } },
+            2 => { self.@"Enable" = v.asBool() orelse false; },
+            3 => { self.@"IsSystem" = v.asBool() orelse false; },
+            4 => { self.@"TenantId" = v.asI32() orelse 0; },
+            5 => { switch (v) { .text => |t| self.@"Permission" = t, .null => self.@"Permission" = "", else => {} } },
+            6 => { self.@"Sort" = v.asI32() orelse 0; },
+            7 => { self.@"Ex1" = v.asI32() orelse 0; },
+            8 => { self.@"Ex2" = v.asI32() orelse 0; },
+            9 => { self.@"Ex3" = v.asF64() orelse 0; },
+            10 => { switch (v) { .text => |t| self.@"Ex4" = t, .null => self.@"Ex4" = "", else => {} } },
+            11 => { switch (v) { .text => |t| self.@"Ex5" = t, .null => self.@"Ex5" = "", else => {} } },
+            12 => { switch (v) { .text => |t| self.@"Ex6" = t, .null => self.@"Ex6" = "", else => {} } },
+            13 => { switch (v) { .text => |t| self.@"CreateUser" = t, .null => self.@"CreateUser" = "", else => {} } },
+            14 => { self.@"CreateUserID" = v.asI32() orelse 0; },
+            15 => { switch (v) { .text => |t| self.@"CreateIP" = t, .null => self.@"CreateIP" = "", else => {} } },
+            16 => { self.@"CreateTime" = v.asDatetime() orelse .{}; },
+            17 => { switch (v) { .text => |t| self.@"UpdateUser" = t, .null => self.@"UpdateUser" = "", else => {} } },
+            18 => { self.@"UpdateUserID" = v.asI32() orelse 0; },
+            19 => { switch (v) { .text => |t| self.@"UpdateIP" = t, .null => self.@"UpdateIP" = "", else => {} } },
+            20 => { self.@"UpdateTime" = v.asDatetime() orelse .{}; },
+            21 => { switch (v) { .text => |t| self.@"Remark" = t, .null => self.@"Remark" = "", else => {} } },
             else => {},
         }
     }

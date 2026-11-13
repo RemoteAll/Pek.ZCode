@@ -219,6 +219,9 @@ pub fn generateTableAllocOpt(gpa: std.mem.Allocator, t: *const TableMeta, opts: 
         defer gpa.free(suffix);
         try b.fmt("    pub fn get{s}(self: @This()) {s} {{ return self.@\"{s}\"; }}\n", .{ suffix, zigType(c.data_type), c.name });
         try b.fmt("    pub fn set{s}(self: *@This(), v: {s}) void {{\n", .{ suffix, zigType(c.data_type) });
+        // 「未改不置脏」：值相同时直接返回。这是 `update` 只写脏列的前提，
+        // 也让批量写不会把「赋了相同值」的列带进 SQL（对齐 Rust Pek.RCode 的 dirty 口径）。
+        try b.fmt("        if (zcode.entity.valueEql(self.@\"{s}\", v)) return;\n", .{c.name});
         try b.fmt("        self.@\"{s}\" = v;\n", .{c.name});
         try b.fmt("        zcode.entity.markDirty(&self.dirty, {d});\n    }}\n", .{i});
     }

@@ -37,12 +37,25 @@ const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dal_mod = @import("dal.zig");
 const Dal = dal_mod.Dal;
+const dbtable_mod = @import("dbtable.zig");
+const TableRef = dbtable_mod.TableRef;
+const shards = @import("shards.zig");
 
 /// 单表实体支持的最大列数（脏位图宽度）。
 pub const max_fields = 256;
 
 /// 脏列位图。
 pub const DirtyBits = u256;
+
+/// 两个字段值是否相等（生成代码的 setter 用它做「未改不置脏」）。
+///
+/// - 字符串（`[]const u8`）比**内容**（切片直接 `==` 只比 ptr+len，会误判）；
+/// - 结构体（`DateTime` / `Decimal`）与标量走 `std.meta.eql`。
+pub fn valueEql(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    if (comptime T == []const u8) return std.mem.eql(u8, a, b);
+    return std.meta.eql(a, b);
+}
 
 pub const FieldMeta = struct {
     /// 模型里的逻辑列名（`Model.xml` 的 `Column@Name`）
@@ -224,15 +237,143 @@ pub fn saveBatch(dal: *Dal, comptime T: type, entities: []const *T, s: *Session)
     return saveBatchWith(dal, T, entities, s, .insert);
 }
 
-/// 批量保存（可指定 `SaveModes`）：
-/// - `insert`：多行 `INSERT`（原来 `saveBatch` 的行为）
-/// - `upsert` / `insert_ignore` / `replace`：交给表级 `upsertBatch`，按方言生成
-///   `ON CONFLICT` / `ON DUPLICATE KEY` / `OR REPLACE` 等（SQL Server 等退化为同事务逐行先改后插）
+/// 已存在实体的批量更新：按「脏列签名」分组合并成多行 `UPDATE`。
+/// **口径**（两条都是用户明确要求）：
+/// 1. **未改的列不进 SQL**：只写各自置脏的列；没脏列的实体在 `saveBatchWith` 里就已被跳过。
+/// 2. **并发安全**：不做整行覆盖（upsert/全列 update）。同一张表被多个业务系统同时写时，
+///    别人刚写的列不会被我们手里的旧值盖回去。
 ///
-/// 已存在实体（主键非 0）仍走脏列逐条 `update`——这是 C# `IList.Update()` 的语义：
-/// 只写脏列，不整行覆盖。
+/// 同组（脏列集合完全相同）才合并成一条语句；方言不支持多行 UPDATE 时退化逐条，
+/// 每条仍只写脏列。
+fn updateDirtyBatch(dal: *Dal, comptime T: type, list: []const *T, s: *Session) !usize {
+    const gpa = dal.gpa;
+    const meta = T.meta;
+    _ = try tableOf(dal, meta);
+
+    var groups = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*T)).empty;
+    defer {
+        var git = groups.keyIterator();
+        while (git.next()) |k| gpa.free(k.*);
+        var vit = groups.valueIterator();
+        while (vit.next()) |v| v.deinit(gpa);
+        groups.deinit(gpa);
+    }
+
+    for (list) |e| {
+        var sig: std.ArrayListUnmanaged(u8) = .empty;
+        defer sig.deinit(gpa);
+        for (meta.fields, 0..) |_, i| {
+            if (!isDirty(e.dirty, i)) continue;
+            var nb: [8]u8 = undefined;
+            try sig.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d},", .{i}) catch "");
+        }
+        const gop = try groups.getOrPut(gpa, sig.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try gpa.dupe(u8, sig.items);
+            // `getOrPut` 不会初始化 value，unmanaged 容器必须显式置空，否则 append 读到垃圾
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(gpa, e);
+    }
+
+    var affected: usize = 0;
+    var it = groups.valueIterator();
+    while (it.next()) |rows| {
+        affected += try updateSameColumns(dal, T, rows.items, s);
+    }
+    return affected;
+}
+
+/// 脏列集合完全相同的若干实体 → 一条多行 `UPDATE`（失败/不支持则逐条）。
+fn updateSameColumns(dal: *Dal, comptime T: type, rows: []const *T, s: *Session) !usize {
+    if (rows.len == 0) return 0;
+    const gpa = dal.gpa;
+    const meta = T.meta;
+    const t = try tableOf(dal, meta);
+
+    // 复合主键不走批量（多行 UPDATE 的关联条件会变复杂）
+    var pk_idx: ?usize = null;
+    var pk_count: usize = 0;
+    for (meta.fields, 0..) |f, i| {
+        if (f.primary_key) {
+            pk_count += 1;
+            pk_idx = i;
+        }
+    }
+    if (pk_count != 1) return updateEach(dal, T, rows, s);
+    const pk = pk_idx.?;
+
+    var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer cols.deinit(gpa);
+    var col_idx: std.ArrayListUnmanaged(usize) = .empty;
+    defer col_idx.deinit(gpa);
+    for (meta.fields, 0..) |f, i| {
+        if (i == pk) continue;
+        if (!isDirty(rows[0].dirty, i)) continue;
+        try cols.append(gpa, effectiveName(t, f.name));
+        try col_idx.append(gpa, i);
+    }
+    if (cols.items.len == 0) return 0;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const values = try a.alloc([]const Value, rows.len);
+    for (rows, 0..) |e, ri| {
+        const one = try a.alloc(Value, col_idx.items.len + 1);
+        one[0] = e.columnValue(pk);
+        for (col_idx.items, 0..) |ci, k| one[k + 1] = e.columnValue(ci);
+        values[ri] = one;
+    }
+
+    const sql = sqlbuild.updateMulti(
+        gpa,
+        dal.opts.provider,
+        t,
+        meta.table_name,
+        effectiveName(t, meta.fields[pk].name),
+        cols.items,
+        values,
+    ) catch |e| switch (e) {
+        // 方言不支持多行 UPDATE：退化逐条（仍只写脏列）
+        error.Unsupported => return updateEach(dal, T, rows, s),
+        else => return e,
+    };
+    defer sql.deinit(gpa);
+
+    const n = s.execute(sql.text, sql.params) catch |e| {
+        std.debug.print(
+            "[zcode] 批量更新失败：表 {s}，列 {d} 个，行 {d} 条\n  SQL: {s}\n  错误: {s}；{s}\n",
+            .{ meta.table_name, cols.items.len, rows.len, sql.text, @errorName(e), s.lastError() },
+        );
+        return e;
+    };
+    for (rows) |e| e.dirty = 0;
+    return n;
+}
+
+fn updateEach(dal: *Dal, comptime T: type, rows: []const *T, s: *Session) !usize {
+    var n: usize = 0;
+    for (rows) |e| {
+        if (try update(dal, e, s) > 0) n += 1;
+    }
+    return n;
+}
+
+/// 批量保存（可指定 `SaveModes`）：
+/// - 新增：全列合并成一条多行 `INSERT`（`upsert` / `insert_ignore` / `replace` 走方言 `ON CONFLICT` 等）；
+/// - 已存在：**只写脏列**，同脏列签名合并成一条多行 `UPDATE`（未改的列不进 SQL，并发不覆盖别人）；
+/// - 没脏列的实体：一条 SQL 都不发（计入 `unchanged`）；
+/// - **配了分片策略的表自动走分片批量**（先按连接 + 物理分片表分组，绝不跨分片合并）。
 pub fn saveBatchWith(dal: *Dal, comptime T: type, entities: []const *T, s: *Session, mode: SaveModes) !SaveBatchReport {
     const meta = T.meta;
+
+    // 分表 / 分库：分片边界优先于「合并成一条」——跨库/跨表绝不能合成一条语句
+    if (dal.shardPolicyFor(meta.table_name) != null) {
+        return saveBatchSharded(dal, T, entities, mode);
+    }
+
     const t = try tableOf(dal, meta);
     try assertWritable(t);
 
@@ -244,6 +385,12 @@ pub fn saveBatchWith(dal: *Dal, comptime T: type, entities: []const *T, s: *Sess
     }
 
     var report = SaveBatchReport{};
+
+    // 第一步：分流。新增 → 全列（一条多行 INSERT）；已存在 → 只按**各自的脏列**更新。
+    // 「有脏列」与「没脏列」分开统计：没脏列的实体**一条 SQL 都不发**。
+    var dirty_list: std.ArrayList(*T) = .empty;
+    defer dirty_list.deinit(gpa);
+
     for (entities) |e| {
         if (isNewEntity(meta, t, e)) {
             var field_count: usize = 0;
@@ -259,12 +406,10 @@ pub fn saveBatchWith(dal: *Dal, comptime T: type, entities: []const *T, s: *Sess
             }
             try new_rows.append(gpa, fields);
             e.dirty = 0;
+        } else if (e.dirty != 0) {
+            try dirty_list.append(gpa, e);
         } else {
-            if (try update(dal, e, s) > 0) {
-                report.updated += 1;
-            } else {
-                report.unchanged += 1;
-            }
+            report.unchanged += 1;
         }
     }
 
@@ -272,7 +417,240 @@ pub fn saveBatchWith(dal: *Dal, comptime T: type, entities: []const *T, s: *Sess
         const ref = try dal.table(meta.table_name);
         report.inserted = try ref.upsertBatch(s, new_rows.items, mode);
     }
+
+    // 第二步：已存在实体按「脏列签名」分组合并成多行 UPDATE（同组列相同才能合）；
+    // 方言不支持时退化为逐条（每条仍只写脏列，**不会**覆盖别人改过的列）。
+    if (dirty_list.items.len > 0) {
+        report.updated = try updateDirtyBatch(dal, T, dirty_list.items, s);
+    }
     return report;
+}
+
+/// 分表分库的批量保存：**先按「连接 + 物理分片表」分组，再在组内按脏列签名分组**。
+///
+/// 三条硬约束（与主表批量同样的口径，但多一层分片边界）：
+/// 1. **绝不跨分片合并**——不同库 / 不同物理表必须是不同语句，也不共用会话；
+/// 2. **未改的列不进 SQL**——组内只带主键 + 该实体的脏列；
+/// 3. **每个分片一次往返**——同组多行合成一条（方言不支持多行 UPDATE 时退化逐条）。
+fn saveBatchSharded(dal: *Dal, comptime T: type, entities: []const *T, mode: SaveModes) !SaveBatchReport {
+    const gpa = dal.gpa;
+    const meta = T.meta;
+    const policy = dal.shardPolicyFor(meta.table_name) orelse return error.NoShardPolicy;
+
+    // 分片列在实体里的下标（模型字段名或物理列名都认）
+    var fidx: ?usize = null;
+    for (meta.fields, 0..) |f, i| {
+        if (std.ascii.eqlIgnoreCase(f.name, policy.field) or
+            std.ascii.eqlIgnoreCase(f.effectiveName(), policy.field))
+        {
+            fidx = i;
+        }
+    }
+    const shard_field = fidx orelse {
+        std.debug.print(
+            "[zcode] 批量保存：表 {s} 配了分片策略，但实体里找不到分片列 {s}\n",
+            .{ meta.table_name, policy.field },
+        );
+        return error.ShardFieldNotFound;
+    };
+
+    const Group = struct {
+        model: shards.ShardModel,
+        list: std.ArrayListUnmanaged(*T) = .empty,
+    };
+
+    var groups = std.StringHashMapUnmanaged(Group).empty;
+    defer {
+        var git = groups.keyIterator();
+        while (git.next()) |k| gpa.free(k.*);
+        var vit = groups.valueIterator();
+        while (vit.next()) |g| {
+            var m = g.model;
+            m.deinit(gpa);
+            g.list.deinit(gpa);
+        }
+        groups.deinit(gpa);
+    }
+
+    var report = SaveBatchReport{};
+    for (entities) |e| {
+        const sm = try dal.shardOfTable(meta.table_name, e.columnValue(shard_field));
+        var kb: std.ArrayListUnmanaged(u8) = .empty;
+        defer kb.deinit(gpa);
+        try kb.appendSlice(gpa, sm.conn_name);
+        try kb.append(gpa, 0);
+        try kb.appendSlice(gpa, sm.table_name);
+
+        const gop = try groups.getOrPut(gpa, kb.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try gpa.dupe(u8, kb.items);
+            gop.value_ptr.* = .{ .model = sm };
+        } else {
+            var owned = sm;
+            owned.deinit(gpa);
+        }
+        try gop.value_ptr.list.append(gpa, e);
+    }
+
+    var it = groups.valueIterator();
+    while (it.next()) |g| {
+        // 分片表可能还不存在（首次写入）
+        _ = dal.ensureShardTable(meta.table_name, g.model) catch |e| {
+            std.debug.print(
+                "[zcode] 批量保存：建分片表失败 {s}.{s}：{s}\n",
+                .{ g.model.conn_name, g.model.table_name, @errorName(e) },
+            );
+            return e;
+        };
+
+        const ref = try dal.tableShardOn(meta.table_name, g.model);
+        var s = try dal.sessionForConn(g.model.conn_name);
+        defer s.deinit();
+
+        // 组内二分：新增（全列一次多行 INSERT）/ 已存在（脏列合并 UPDATE）
+        var new_rows: std.ArrayListUnmanaged([]const sqlbuild.Field) = .empty;
+        defer {
+            for (new_rows.items) |r| gpa.free(r);
+            new_rows.deinit(gpa);
+        }
+        var dirty_list: std.ArrayListUnmanaged(*T) = .empty;
+        defer dirty_list.deinit(gpa);
+
+        for (g.list.items) |e| {
+            if (isNewEntity(meta, ref.table, e)) {
+                var n: usize = 0;
+                for (meta.fields) |f| {
+                    if (!f.identity) n += 1;
+                }
+                const fields = try gpa.alloc(sqlbuild.Field, n);
+                var k: usize = 0;
+                for (meta.fields, 0..) |f, i| {
+                    if (f.identity) continue;
+                    fields[k] = .{ .name = effectiveName(ref.table, f.name), .value = e.columnValue(i) };
+                    k += 1;
+                }
+                try new_rows.append(gpa, fields);
+                e.dirty = 0;
+            } else if (e.dirty != 0) {
+                try dirty_list.append(gpa, e);
+            } else {
+                report.unchanged += 1;
+            }
+        }
+
+        if (new_rows.items.len > 0) {
+            report.inserted += try ref.upsertBatch(&s, new_rows.items, mode);
+        }
+        if (dirty_list.items.len > 0) {
+            report.updated += try updateDirtyOn(dal, T, ref, &s, dirty_list.items);
+        }
+    }
+    return report;
+}
+
+/// 在**指定分片表**上做脏列合并更新（`updateDirtyBatch` 的分片版）。
+fn updateDirtyOn(dal: *Dal, comptime T: type, ref: TableRef, s: *Session, list: []const *T) !usize {
+    const gpa = dal.gpa;
+    const meta = T.meta;
+
+    var groups = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*T)).empty;
+    defer {
+        var git = groups.keyIterator();
+        while (git.next()) |k| gpa.free(k.*);
+        var vit = groups.valueIterator();
+        while (vit.next()) |v| v.deinit(gpa);
+        groups.deinit(gpa);
+    }
+
+    for (list) |e| {
+        var sig: std.ArrayListUnmanaged(u8) = .empty;
+        defer sig.deinit(gpa);
+        for (meta.fields, 0..) |_, i| {
+            if (!isDirty(e.dirty, i)) continue;
+            var nb: [8]u8 = undefined;
+            try sig.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d},", .{i}) catch "");
+        }
+        const gop = try groups.getOrPut(gpa, sig.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try gpa.dupe(u8, sig.items);
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(gpa, e);
+    }
+
+    var affected: usize = 0;
+    var it = groups.valueIterator();
+    while (it.next()) |rows| {
+        if (rows.items.len == 0) continue;
+
+        var pk_idx: ?usize = null;
+        var pk_count: usize = 0;
+        for (meta.fields, 0..) |f, i| {
+            if (f.primary_key) {
+                pk_count += 1;
+                pk_idx = i;
+            }
+        }
+        if (pk_count != 1) {
+            for (rows.items) |e| {
+                if (try update(dal, e, s) > 0) affected += 1;
+            }
+            continue;
+        }
+        const pk = pk_idx.?;
+
+        var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer cols.deinit(gpa);
+        var col_idx: std.ArrayListUnmanaged(usize) = .empty;
+        defer col_idx.deinit(gpa);
+        for (meta.fields, 0..) |f, i| {
+            if (i == pk) continue;
+            if (!isDirty(rows.items[0].dirty, i)) continue;
+            try cols.append(gpa, effectiveName(ref.table, f.name));
+            try col_idx.append(gpa, i);
+        }
+        if (cols.items.len == 0) continue;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const values = try a.alloc([]const Value, rows.items.len);
+        for (rows.items, 0..) |e, ri| {
+            const one = try a.alloc(Value, col_idx.items.len + 1);
+            one[0] = e.columnValue(pk);
+            for (col_idx.items, 0..) |ci, k| one[k + 1] = e.columnValue(ci);
+            values[ri] = one;
+        }
+
+        const sql = sqlbuild.updateMulti(
+            gpa,
+            dal.opts.provider,
+            ref.table,
+            ref.table_name,
+            effectiveName(ref.table, meta.fields[pk].name),
+            cols.items,
+            values,
+        ) catch |e| switch (e) {
+            error.Unsupported => {
+                for (rows.items) |it2| {
+                    if (try update(dal, it2, s) > 0) affected += 1;
+                }
+                continue;
+            },
+            else => return e,
+        };
+        defer sql.deinit(gpa);
+
+        affected += s.execute(sql.text, sql.params) catch |e| {
+            std.debug.print(
+                "[zcode] 分片批量更新失败：表 {s}，列 {d} 个，行 {d} 条\n  SQL: {s}\n  错误: {s}；{s}\n",
+                .{ ref.table_name, cols.items.len, rows.items.len, sql.text, @errorName(e), s.lastError() },
+            );
+            return e;
+        };
+        for (rows.items) |e| e.dirty = 0;
+    }
+    return affected;
 }
 
 /// 异步保存（对齐 C# `Entity.SaveAsync(msDelay)`）：**入凑批队列**，不是一调一线程。

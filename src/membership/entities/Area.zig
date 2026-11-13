@@ -88,91 +88,109 @@ pub const Area = struct {
     }
     pub fn getID(self: @This()) i32 { return self.@"ID"; }
     pub fn setID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"ID", v)) return;
         self.@"ID" = v;
         zcode.entity.markDirty(&self.dirty, 0);
     }
     pub fn getName(self: @This()) []const u8 { return self.@"Name"; }
     pub fn setName(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Name", v)) return;
         self.@"Name" = v;
         zcode.entity.markDirty(&self.dirty, 1);
     }
     pub fn getFullName(self: @This()) []const u8 { return self.@"FullName"; }
     pub fn setFullName(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"FullName", v)) return;
         self.@"FullName" = v;
         zcode.entity.markDirty(&self.dirty, 2);
     }
     pub fn getParentID(self: @This()) i32 { return self.@"ParentID"; }
     pub fn setParentID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"ParentID", v)) return;
         self.@"ParentID" = v;
         zcode.entity.markDirty(&self.dirty, 3);
     }
     pub fn getLevel(self: @This()) i32 { return self.@"Level"; }
     pub fn setLevel(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Level", v)) return;
         self.@"Level" = v;
         zcode.entity.markDirty(&self.dirty, 4);
     }
     pub fn getKind(self: @This()) []const u8 { return self.@"Kind"; }
     pub fn setKind(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Kind", v)) return;
         self.@"Kind" = v;
         zcode.entity.markDirty(&self.dirty, 5);
     }
     pub fn getEnglish(self: @This()) []const u8 { return self.@"English"; }
     pub fn setEnglish(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"English", v)) return;
         self.@"English" = v;
         zcode.entity.markDirty(&self.dirty, 6);
     }
     pub fn getPinYin(self: @This()) []const u8 { return self.@"PinYin"; }
     pub fn setPinYin(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"PinYin", v)) return;
         self.@"PinYin" = v;
         zcode.entity.markDirty(&self.dirty, 7);
     }
     pub fn getJianPin(self: @This()) []const u8 { return self.@"JianPin"; }
     pub fn setJianPin(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"JianPin", v)) return;
         self.@"JianPin" = v;
         zcode.entity.markDirty(&self.dirty, 8);
     }
     pub fn getTelCode(self: @This()) []const u8 { return self.@"TelCode"; }
     pub fn setTelCode(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"TelCode", v)) return;
         self.@"TelCode" = v;
         zcode.entity.markDirty(&self.dirty, 9);
     }
     pub fn getZipCode(self: @This()) []const u8 { return self.@"ZipCode"; }
     pub fn setZipCode(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"ZipCode", v)) return;
         self.@"ZipCode" = v;
         zcode.entity.markDirty(&self.dirty, 10);
     }
     pub fn getLongitude(self: @This()) f64 { return self.@"Longitude"; }
     pub fn setLongitude(self: *@This(), v: f64) void {
+        if (zcode.entity.valueEql(self.@"Longitude", v)) return;
         self.@"Longitude" = v;
         zcode.entity.markDirty(&self.dirty, 11);
     }
     pub fn getLatitude(self: @This()) f64 { return self.@"Latitude"; }
     pub fn setLatitude(self: *@This(), v: f64) void {
+        if (zcode.entity.valueEql(self.@"Latitude", v)) return;
         self.@"Latitude" = v;
         zcode.entity.markDirty(&self.dirty, 12);
     }
     pub fn getGeoHash(self: @This()) []const u8 { return self.@"GeoHash"; }
     pub fn setGeoHash(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"GeoHash", v)) return;
         self.@"GeoHash" = v;
         zcode.entity.markDirty(&self.dirty, 13);
     }
     pub fn getEnable(self: @This()) bool { return self.@"Enable"; }
     pub fn setEnable(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"Enable", v)) return;
         self.@"Enable" = v;
         zcode.entity.markDirty(&self.dirty, 14);
     }
     pub fn getCreateTime(self: @This()) zcode.DateTime { return self.@"CreateTime"; }
     pub fn setCreateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"CreateTime", v)) return;
         self.@"CreateTime" = v;
         zcode.entity.markDirty(&self.dirty, 15);
     }
     pub fn getUpdateTime(self: @This()) zcode.DateTime { return self.@"UpdateTime"; }
     pub fn setUpdateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"UpdateTime", v)) return;
         self.@"UpdateTime" = v;
         zcode.entity.markDirty(&self.dirty, 16);
     }
     pub fn getRemark(self: @This()) []const u8 { return self.@"Remark"; }
     pub fn setRemark(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Remark", v)) return;
         self.@"Remark" = v;
         zcode.entity.markDirty(&self.dirty, 17);
     }

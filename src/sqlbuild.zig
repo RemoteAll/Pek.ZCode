@@ -99,6 +99,159 @@ pub fn insert(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
+/// 多行 UPDATE（同一个列集合）：把 N 条「按主键更新同样几列」合并成**一条**语句。
+///
+/// 为什么需要：逐条 `UPDATE` 的往返是 N 次；同组（脏列集合相同）合并后只要 1 次。
+/// **只写 `cols` 里的列**——未改的列不进 SQL，多业务系统并发写同一张表时不会把
+/// 别人刚写的值覆盖回旧值。
+///
+/// 方言：
+/// - SQLite / PostgreSQL 系 / DuckDB / SQL Server：`UPDATE t SET c=v.c FROM (VALUES (...)) AS v(pk,c) WHERE t.pk=v.pk`
+/// - MySQL：`UPDATE t JOIN (SELECT ? AS pk, ? AS c UNION ALL ...) v ON ... SET t.c=v.c`
+/// - 其它方言返回 `error.Unsupported`（调用方逐条，仍只写脏列）
+///
+/// `rows` 每行：主键值 + `cols` 各列的值（顺序一致）。
+pub fn updateMulti(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    pk_name: []const u8,
+    cols: []const []const u8,
+    rows: []const []const Value,
+) !Sql {
+    if (rows.len == 0 or cols.len == 0) return error.Model;
+    for (rows) |r| {
+        if (r.len != cols.len + 1) return error.Model;
+    }
+
+    const pk_col = try columnName(table, pk_name);
+
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+
+    var idx: usize = 0;
+
+    switch (kind) {
+        .mysql => {
+            try b.add("UPDATE ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(" JOIN (");
+            for (rows, 0..) |row, ri| {
+                try b.add(if (ri == 0) "SELECT " else " UNION ALL SELECT ");
+                try kind.pushPlaceholder(&b, idx);
+                idx += 1;
+                try b.add(" AS ");
+                try kind.pushQuoted(&b, pk_col);
+                for (cols) |c| {
+                    try b.add(", ");
+                    try kind.pushPlaceholder(&b, idx);
+                    idx += 1;
+                    try b.add(" AS ");
+                    try kind.pushQuoted(&b, try columnName(table, c));
+                }
+                try params.appendSlice(gpa, row);
+            }
+            try b.add(") AS v ON ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(".");
+            try kind.pushQuoted(&b, pk_col);
+            try b.add(" = v.");
+            try kind.pushQuoted(&b, pk_col);
+            try b.add(" SET ");
+            for (cols, 0..) |c, ci| {
+                if (ci > 0) try b.add(", ");
+                const cc = try columnName(table, c);
+                try kind.pushQuoted(&b, table_name);
+                try b.add(".");
+                try kind.pushQuoted(&b, cc);
+                try b.add(" = v.");
+                try kind.pushQuoted(&b, cc);
+            }
+        },
+        // SQLite 的 `UPDATE ... FROM` **不接受** `(VALUES ...) AS v(a,b)` 的列名列表
+        // （实测报 `near "(": syntax error`），改用 `SELECT ? AS a UNION ALL ...`；
+        // 每个 SELECT 的列别名已足够，外层不再需要列名列表。
+        .sqlite => {
+            try b.add("UPDATE ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(" SET ");
+            for (cols, 0..) |c, ci| {
+                if (ci > 0) try b.add(", ");
+                const cc = try columnName(table, c);
+                try kind.pushQuoted(&b, cc);
+                try b.add(" = v.");
+                try kind.pushQuoted(&b, cc);
+            }
+            try b.add(" FROM (");
+            for (rows, 0..) |row, ri| {
+                try b.add(if (ri == 0) "SELECT " else " UNION ALL SELECT ");
+                try kind.pushPlaceholder(&b, idx);
+                idx += 1;
+                try b.add(" AS ");
+                try kind.pushQuoted(&b, pk_col);
+                for (cols) |c| {
+                    try b.add(", ");
+                    try kind.pushPlaceholder(&b, idx);
+                    idx += 1;
+                    try b.add(" AS ");
+                    try kind.pushQuoted(&b, try columnName(table, c));
+                }
+                try params.appendSlice(gpa, row);
+            }
+            try b.add(") AS v WHERE ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(".");
+            try kind.pushQuoted(&b, pk_col);
+            try b.add(" = v.");
+            try kind.pushQuoted(&b, pk_col);
+        },
+        .postgresql, .kingbase, .highgo, .vastbase, .duckdb, .sqlserver => {
+            try b.add("UPDATE ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(" SET ");
+            for (cols, 0..) |c, ci| {
+                if (ci > 0) try b.add(", ");
+                const cc = try columnName(table, c);
+                try kind.pushQuoted(&b, cc);
+                try b.add(" = v.");
+                try kind.pushQuoted(&b, cc);
+            }
+            try b.add(" FROM (VALUES ");
+            for (rows, 0..) |row, ri| {
+                if (ri > 0) try b.add(", ");
+                try b.add("(");
+                for (row, 0..) |v, k| {
+                    if (k > 0) try b.add(", ");
+                    try kind.pushPlaceholder(&b, idx);
+                    idx += 1;
+                    try params.append(gpa, v);
+                }
+                try b.add(")");
+            }
+            try b.add(") AS v(");
+            try kind.pushQuoted(&b, pk_col);
+            for (cols) |c| {
+                try b.add(", ");
+                try kind.pushQuoted(&b, try columnName(table, c));
+            }
+            try b.add(") WHERE ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(".");
+            try kind.pushQuoted(&b, pk_col);
+            try b.add(" = v.");
+            try kind.pushQuoted(&b, pk_col);
+        },
+        else => return error.Unsupported,
+    }
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
 /// 组装多行 INSERT：`INSERT INTO "T" ("a","b") VALUES (?,?),(?,?)`。
 ///
 /// 约束（与 XCode 批量写一致）：所有行列集合必须**完全一致**（含顺序），否则报 `error.Model`。

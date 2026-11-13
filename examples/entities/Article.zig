@@ -49,31 +49,37 @@ pub const Article = struct {
     }
     pub fn getId(self: @This()) i32 { return self.@"Id"; }
     pub fn setId(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Id", v)) return;
         self.@"Id" = v;
         zcode.entity.markDirty(&self.dirty, 0);
     }
     pub fn getTitle(self: @This()) []const u8 { return self.@"Title"; }
     pub fn setTitle(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Title", v)) return;
         self.@"Title" = v;
         zcode.entity.markDirty(&self.dirty, 1);
     }
     pub fn getAuthor(self: @This()) []const u8 { return self.@"Author"; }
     pub fn setAuthor(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Author", v)) return;
         self.@"Author" = v;
         zcode.entity.markDirty(&self.dirty, 2);
     }
     pub fn getScore(self: @This()) i32 { return self.@"Score"; }
     pub fn setScore(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Score", v)) return;
         self.@"Score" = v;
         zcode.entity.markDirty(&self.dirty, 3);
     }
     pub fn getOk(self: @This()) bool { return self.@"Ok"; }
     pub fn setOk(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"Ok", v)) return;
         self.@"Ok" = v;
         zcode.entity.markDirty(&self.dirty, 4);
     }
     pub fn getCreateTime(self: @This()) zcode.DateTime { return self.@"CreateTime"; }
     pub fn setCreateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"CreateTime", v)) return;
         self.@"CreateTime" = v;
         zcode.entity.markDirty(&self.dirty, 5);
     }

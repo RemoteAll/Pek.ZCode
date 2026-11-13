@@ -139,3 +139,98 @@ test "分表分库 + 自动凑批：同分片合并成一条多行 INSERT，不�
         try std.testing.expectEqual(@as(i64, 3), rows[0].at(0).?.int);
     }
 }
+
+// ── 分片批量更新：脏列裁剪 + 每个分片一条 UPDATE ──────────────────
+
+const ShardSink = struct {
+    a: std.mem.Allocator,
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn write(ctx: ?*anyopaque, line: []const u8) void {
+        const self: *ShardSink = @ptrCast(@alignCast(ctx orelse return));
+        self.buf.appendSlice(self.a, line) catch return;
+        self.buf.append(self.a, '\n') catch return;
+    }
+    fn all(self: *const ShardSink) []const u8 {
+        return self.buf.items;
+    }
+};
+
+test "分片 + 脏列裁剪：每个分片一条 UPDATE，且不写未改的列" {
+    const a = std.testing.allocator;
+
+    const main_path = try tempDbPath(a, "smain");
+    defer a.free(main_path);
+    defer zcode.File.DeleteQuiet(main_path);
+    const y2023_path = try tempDbPath(a, "s2023");
+    defer a.free(y2023_path);
+    defer zcode.File.DeleteQuiet(y2023_path);
+    const y2024_path = try tempDbPath(a, "s2024");
+    defer a.free(y2024_path);
+    defer zcode.File.DeleteQuiet(y2024_path);
+
+    const main_conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{main_path});
+    defer a.free(main_conn);
+    const y2023_conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{y2023_path});
+    defer a.free(y2023_conn);
+    const y2024_conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{y2024_path});
+    defer a.free(y2024_conn);
+
+    const m = try zcode.EntityModel.parse(a, model_xml);
+    var dal = try zcode.Dal.initWithModel(a, main_conn, m);
+    defer dal.deinit();
+    try dal.attachConnection("DH_2023", y2023_conn);
+    try dal.attachConnection("DH_2024", y2024_conn);
+
+    var policy = zcode.shards.TimePolicy.init(a, "CreateTime", "DH", "DH_Log", "DH_Log_{1:yyyy}");
+    policy.conn_policy = "DH_{1:yyyy}";
+    policy.step_ms = 365 * zcode.shards.day_ms;
+    try dal.addShardPolicy("DH_Log", policy);
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    // 先写数据（同时把分片表建好）
+    var items = [_]Log{
+        .{ .Title = "a", .CreateTime = zcode.DateTime.parse("2023-03-01 00:00:00") catch .{} },
+        .{ .Title = "b", .CreateTime = zcode.DateTime.parse("2023-08-01 00:00:00") catch .{} },
+        .{ .Title = "c", .CreateTime = zcode.DateTime.parse("2024-05-01 00:00:00") catch .{} },
+    };
+    var ptrs = [_]*Log{ &items[0], &items[1], &items[2] };
+    const ins = try zcode.entity.saveBatchWith(&dal, Log, &ptrs, &s, .insert);
+    try std.testing.expectEqual(@as(usize, 3), ins.inserted);
+
+    // 直接构造带主键的实体（分片表里已有数据）
+    var upd = [_]Log{
+        .{ .Id = 1, .Title = "a2", .CreateTime = zcode.DateTime.parse("2023-03-01 00:00:00") catch .{} },
+        .{ .Id = 2, .Title = "b2", .CreateTime = zcode.DateTime.parse("2023-08-01 00:00:00") catch .{} },
+        .{ .Id = 3, .Title = "c2", .CreateTime = zcode.DateTime.parse("2024-05-01 00:00:00") catch .{} },
+    };
+    for (&upd) |*u| {
+        u.dirty = 0;
+        zcode.entity.markDirty(&u.dirty, 1); // 只有 Title 脏
+    }
+
+    const old = zcode.setting.snapshot();
+    defer zcode.setting.restore(old);
+    zcode.setting.resetToDefaults();
+    zcode.setting.current().show_sql = true;
+
+    var sink = ShardSink{ .a = a };
+    defer sink.buf.deinit(a);
+    const prev = zcode.session.sqlSinkSnapshot();
+    zcode.session.setSqlSink(.{ .ctx = &sink, .writeFn = ShardSink.write });
+    defer zcode.session.setSqlSink(prev);
+
+    var uptr = [_]*Log{ &upd[0], &upd[1], &upd[2] };
+    const rep = try zcode.entity.saveBatchWith(&dal, Log, &uptr, &s, .upsert);
+
+    const sql = sink.all();
+    // 两个分片 → 两条 UPDATE（绝不跨分片合并）
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, sql, "UPDATE "));
+    // 只写脏列 Title，未改的 CreateTime 不进 SQL
+    try std.testing.expect(std.mem.indexOf(u8, sql, "Title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "CreateTime") == null);
+    try std.testing.expect(rep.updated >= 2);
+}

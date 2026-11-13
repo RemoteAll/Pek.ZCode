@@ -145,181 +145,217 @@ pub const User = struct {
     }
     pub fn getID(self: @This()) i32 { return self.@"ID"; }
     pub fn setID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"ID", v)) return;
         self.@"ID" = v;
         zcode.entity.markDirty(&self.dirty, 0);
     }
     pub fn getName(self: @This()) []const u8 { return self.@"Name"; }
     pub fn setName(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Name", v)) return;
         self.@"Name" = v;
         zcode.entity.markDirty(&self.dirty, 1);
     }
     pub fn getPassword(self: @This()) []const u8 { return self.@"Password"; }
     pub fn setPassword(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Password", v)) return;
         self.@"Password" = v;
         zcode.entity.markDirty(&self.dirty, 2);
     }
     pub fn getDisplayName(self: @This()) []const u8 { return self.@"DisplayName"; }
     pub fn setDisplayName(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"DisplayName", v)) return;
         self.@"DisplayName" = v;
         zcode.entity.markDirty(&self.dirty, 3);
     }
     pub fn getSex(self: @This()) i32 { return self.@"Sex"; }
     pub fn setSex(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Sex", v)) return;
         self.@"Sex" = v;
         zcode.entity.markDirty(&self.dirty, 4);
     }
     pub fn getMail(self: @This()) []const u8 { return self.@"Mail"; }
     pub fn setMail(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Mail", v)) return;
         self.@"Mail" = v;
         zcode.entity.markDirty(&self.dirty, 5);
     }
     pub fn getMailVerified(self: @This()) bool { return self.@"MailVerified"; }
     pub fn setMailVerified(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"MailVerified", v)) return;
         self.@"MailVerified" = v;
         zcode.entity.markDirty(&self.dirty, 6);
     }
     pub fn getMobile(self: @This()) []const u8 { return self.@"Mobile"; }
     pub fn setMobile(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Mobile", v)) return;
         self.@"Mobile" = v;
         zcode.entity.markDirty(&self.dirty, 7);
     }
     pub fn getMobileVerified(self: @This()) bool { return self.@"MobileVerified"; }
     pub fn setMobileVerified(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"MobileVerified", v)) return;
         self.@"MobileVerified" = v;
         zcode.entity.markDirty(&self.dirty, 8);
     }
     pub fn getCode(self: @This()) []const u8 { return self.@"Code"; }
     pub fn setCode(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Code", v)) return;
         self.@"Code" = v;
         zcode.entity.markDirty(&self.dirty, 9);
     }
     pub fn getAreaId(self: @This()) i32 { return self.@"AreaId"; }
     pub fn setAreaId(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"AreaId", v)) return;
         self.@"AreaId" = v;
         zcode.entity.markDirty(&self.dirty, 10);
     }
     pub fn getAvatar(self: @This()) []const u8 { return self.@"Avatar"; }
     pub fn setAvatar(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Avatar", v)) return;
         self.@"Avatar" = v;
         zcode.entity.markDirty(&self.dirty, 11);
     }
     pub fn getRoleID(self: @This()) i32 { return self.@"RoleID"; }
     pub fn setRoleID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"RoleID", v)) return;
         self.@"RoleID" = v;
         zcode.entity.markDirty(&self.dirty, 12);
     }
     pub fn getRoleIds(self: @This()) []const u8 { return self.@"RoleIds"; }
     pub fn setRoleIds(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"RoleIds", v)) return;
         self.@"RoleIds" = v;
         zcode.entity.markDirty(&self.dirty, 13);
     }
     pub fn getDepartmentID(self: @This()) i32 { return self.@"DepartmentID"; }
     pub fn setDepartmentID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"DepartmentID", v)) return;
         self.@"DepartmentID" = v;
         zcode.entity.markDirty(&self.dirty, 14);
     }
     pub fn getOnline(self: @This()) bool { return self.@"Online"; }
     pub fn setOnline(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"Online", v)) return;
         self.@"Online" = v;
         zcode.entity.markDirty(&self.dirty, 15);
     }
     pub fn getEnable(self: @This()) bool { return self.@"Enable"; }
     pub fn setEnable(self: *@This(), v: bool) void {
+        if (zcode.entity.valueEql(self.@"Enable", v)) return;
         self.@"Enable" = v;
         zcode.entity.markDirty(&self.dirty, 16);
     }
     pub fn getAge(self: @This()) i32 { return self.@"Age"; }
     pub fn setAge(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Age", v)) return;
         self.@"Age" = v;
         zcode.entity.markDirty(&self.dirty, 17);
     }
     pub fn getBirthday(self: @This()) zcode.DateTime { return self.@"Birthday"; }
     pub fn setBirthday(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"Birthday", v)) return;
         self.@"Birthday" = v;
         zcode.entity.markDirty(&self.dirty, 18);
     }
     pub fn getLogins(self: @This()) i32 { return self.@"Logins"; }
     pub fn setLogins(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Logins", v)) return;
         self.@"Logins" = v;
         zcode.entity.markDirty(&self.dirty, 19);
     }
     pub fn getLastLogin(self: @This()) zcode.DateTime { return self.@"LastLogin"; }
     pub fn setLastLogin(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"LastLogin", v)) return;
         self.@"LastLogin" = v;
         zcode.entity.markDirty(&self.dirty, 20);
     }
     pub fn getLastLoginIP(self: @This()) []const u8 { return self.@"LastLoginIP"; }
     pub fn setLastLoginIP(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"LastLoginIP", v)) return;
         self.@"LastLoginIP" = v;
         zcode.entity.markDirty(&self.dirty, 21);
     }
     pub fn getRegisterTime(self: @This()) zcode.DateTime { return self.@"RegisterTime"; }
     pub fn setRegisterTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"RegisterTime", v)) return;
         self.@"RegisterTime" = v;
         zcode.entity.markDirty(&self.dirty, 22);
     }
     pub fn getRegisterIP(self: @This()) []const u8 { return self.@"RegisterIP"; }
     pub fn setRegisterIP(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"RegisterIP", v)) return;
         self.@"RegisterIP" = v;
         zcode.entity.markDirty(&self.dirty, 23);
     }
     pub fn getOnlineTime(self: @This()) i32 { return self.@"OnlineTime"; }
     pub fn setOnlineTime(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"OnlineTime", v)) return;
         self.@"OnlineTime" = v;
         zcode.entity.markDirty(&self.dirty, 24);
     }
     pub fn getEx1(self: @This()) i32 { return self.@"Ex1"; }
     pub fn setEx1(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Ex1", v)) return;
         self.@"Ex1" = v;
         zcode.entity.markDirty(&self.dirty, 25);
     }
     pub fn getEx2(self: @This()) i32 { return self.@"Ex2"; }
     pub fn setEx2(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"Ex2", v)) return;
         self.@"Ex2" = v;
         zcode.entity.markDirty(&self.dirty, 26);
     }
     pub fn getEx3(self: @This()) f64 { return self.@"Ex3"; }
     pub fn setEx3(self: *@This(), v: f64) void {
+        if (zcode.entity.valueEql(self.@"Ex3", v)) return;
         self.@"Ex3" = v;
         zcode.entity.markDirty(&self.dirty, 27);
     }
     pub fn getEx4(self: @This()) []const u8 { return self.@"Ex4"; }
     pub fn setEx4(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex4", v)) return;
         self.@"Ex4" = v;
         zcode.entity.markDirty(&self.dirty, 28);
     }
     pub fn getEx5(self: @This()) []const u8 { return self.@"Ex5"; }
     pub fn setEx5(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex5", v)) return;
         self.@"Ex5" = v;
         zcode.entity.markDirty(&self.dirty, 29);
     }
     pub fn getEx6(self: @This()) []const u8 { return self.@"Ex6"; }
     pub fn setEx6(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Ex6", v)) return;
         self.@"Ex6" = v;
         zcode.entity.markDirty(&self.dirty, 30);
     }
     pub fn getUpdateUser(self: @This()) []const u8 { return self.@"UpdateUser"; }
     pub fn setUpdateUser(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"UpdateUser", v)) return;
         self.@"UpdateUser" = v;
         zcode.entity.markDirty(&self.dirty, 31);
     }
     pub fn getUpdateUserID(self: @This()) i32 { return self.@"UpdateUserID"; }
     pub fn setUpdateUserID(self: *@This(), v: i32) void {
+        if (zcode.entity.valueEql(self.@"UpdateUserID", v)) return;
         self.@"UpdateUserID" = v;
         zcode.entity.markDirty(&self.dirty, 32);
     }
     pub fn getUpdateIP(self: @This()) []const u8 { return self.@"UpdateIP"; }
     pub fn setUpdateIP(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"UpdateIP", v)) return;
         self.@"UpdateIP" = v;
         zcode.entity.markDirty(&self.dirty, 33);
     }
     pub fn getUpdateTime(self: @This()) zcode.DateTime { return self.@"UpdateTime"; }
     pub fn setUpdateTime(self: *@This(), v: zcode.DateTime) void {
+        if (zcode.entity.valueEql(self.@"UpdateTime", v)) return;
         self.@"UpdateTime" = v;
         zcode.entity.markDirty(&self.dirty, 34);
     }
     pub fn getRemark(self: @This()) []const u8 { return self.@"Remark"; }
     pub fn setRemark(self: *@This(), v: []const u8) void {
+        if (zcode.entity.valueEql(self.@"Remark", v)) return;
         self.@"Remark" = v;
         zcode.entity.markDirty(&self.dirty, 35);
     }

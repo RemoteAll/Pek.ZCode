@@ -100,11 +100,9 @@ pub fn loginCore(
 
     // 5. 库密码为空 → 任意密码可登录，并写回散列
     if (user.Password.len == 0) {
-        const hashed = try password.hashAlloc(a, plain_or_md5);
-        user.Password = hashed;
-        // 必须走 setter：脏位图才记录 Password，真实 ORM（`entity.update` 只写脏列）才会把它落库。
-        // 直接赋字段只会改内存对象，接上 `OrmStore` 后**密码根本不会写回**（实测踩过）。
-        user.setPassword(hashed);
+        // 只调 setter：它负责「赋值 + 置脏」。先赋值再 setter 会因为值相等而**不置脏**，
+        // 接上真实 ORM 后这一列根本不会落库（setter 已做「未改不置脏」）。
+        user.setPassword(try password.hashAlloc(a, plain_or_md5));
         wrote_password = true;
     } else {
         // 校验失败一律"用户名或密码不正确"
@@ -112,19 +110,13 @@ pub fn loginCore(
 
         // 6. 旧格式自动升级
         if (password.needsUpgrade(user.Password)) {
-            const hashed = try password.hashAlloc(a, plain_or_md5);
-            user.Password = hashed;
-            user.setPassword(hashed);
+            user.setPassword(try password.hashAlloc(a, plain_or_md5));
             upgraded = true;
         }
     }
 
-    // 7. 登录信息
-    user.Logins += 1;
-    user.LastLogin = now;
-    user.LastLoginIP = ip;
-    user.Online = true;
-    user.setLogins(user.Logins);
+    // 7. 登录信息（全走 setter：赋值 + 置脏一步到位）
+    user.setLogins(user.Logins + 1);
     user.setLastLogin(now);
     user.setLastLoginIP(ip);
     user.setOnline(true);
@@ -180,8 +172,7 @@ pub fn changePasswordCore(
         if (!password.verify(old_password, user.Password)) return LoginError.BadPassword;
     }
 
-    user.Password = try password.hashAlloc(a, new_password);
-    user.setPassword(user.Password);
+    user.setPassword(try password.hashAlloc(a, new_password));
     return user;
 }
 
