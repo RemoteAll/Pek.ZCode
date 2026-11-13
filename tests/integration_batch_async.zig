@@ -584,3 +584,50 @@ test "insert_ignore：无主键表按唯一索引判存也能跳过（不需要�
     try std.testing.expectEqual(@as(usize, 0), try t.upsertBatch(&s, &one, .insert_ignore));
     try std.testing.expectEqual(@as(i64, 1), try t.count(&s, null));
 }
+
+test "insert_ignore：只忽略唯一冲突，其它约束违反照常报错（不被静默吞掉）" {
+    const a = std.testing.allocator;
+    const model_strict =
+        \\<?xml version="1.0" encoding="utf-8"?>
+        \\<EntityModel><Option><ConnName>DH</ConnName></Option><Tables>
+        \\  <Table Name="Kv" TableName="BH_Kv2">
+        \\    <Columns>
+        \\      <Column Name="Key" DataType="String" Length="50" />
+        \\      <Column Name="Val" DataType="String" Length="50" />
+        \\    </Columns>
+        \\    <Indexes><Index Unique="True" Columns="Key" /></Indexes>
+        \\  </Table>
+        \\</Tables></EntityModel>
+    ;
+
+    const path = try tempDbPath(a, "ignore-strict");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    const m = try zcode.EntityModel.parse(a, model_strict);
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{path});
+    defer a.free(conn);
+    var dal = try zcode.Dal.initWithModel(a, conn, m);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const t = try dal.table("Kv");
+
+    // Val 是 NOT NULL：插 null 必须报错，不能被「忽略」成 0 条
+    const bad = [_]Field{
+        .{ .name = "Key", .value = .{ .text = "a" } },
+        .{ .name = "Val", .value = .null },
+    };
+    const rows_bad = [_][]const Field{&bad};
+    try std.testing.expectError(error.Sqlite, t.upsertBatch(&s, &rows_bad, .insert_ignore));
+
+    // 正常行仍然能插
+    const good = [_]Field{
+        .{ .name = "Key", .value = .{ .text = "a" } },
+        .{ .name = "Val", .value = .{ .text = "1" } },
+    };
+    const rows_good = [_][]const Field{&good};
+    try std.testing.expectEqual(@as(usize, 1), try t.upsertBatch(&s, &rows_good, .insert_ignore));
+}

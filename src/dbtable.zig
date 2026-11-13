@@ -221,7 +221,7 @@ pub const TableRef = struct {
     /// |---|---|---|---|
     /// | `insert` | `INSERT INTO` | 同左 | 同左 |
     /// | `upsert` | `... ON CONFLICT(pk) DO UPDATE SET` | `... ON DUPLICATE KEY UPDATE` | `... ON CONFLICT(pk) DO UPDATE SET` |
-    /// | `insert_ignore` | `INSERT OR IGNORE INTO` | `INSERT IGNORE INTO` | `... ON CONFLICT DO NOTHING` |
+    /// | `insert_ignore` | `... ON CONFLICT DO NOTHING`（只忽略唯一冲突） | `INSERT IGNORE`（⚠️ 也会吞数据错误） | `... ON CONFLICT DO NOTHING` |
     /// | `replace` | `INSERT OR REPLACE INTO` | `REPLACE INTO` | 退回 `upsert`（PG 无 REPLACE） |
     ///
     /// 其它方言（SQL Server / Oracle / Access …）**不做字符串改写**：整批退化为
@@ -240,9 +240,14 @@ pub const TableRef = struct {
         const pks = try self.table.primaryKeys(self.gpa);
         defer self.gpa.free(pks);
 
-        // `insert_ignore` 是「存在就跳过」，**不需要主键也不需要冲突目标**：
-        // `INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` 都是「忽略任意唯一约束」。
+        // `insert_ignore` 是「存在就跳过」，**不需要主键也不需要冲突目标**（冲突由数据库按唯一约束判定）。
         // 需要冲突目标的是 `upsert` / `replace`。
+        //
+        // ⚠️ 方言语义差异（重要）：
+        // - SQLite / PG 系：`ON CONFLICT DO NOTHING` 只忽略**唯一/排他冲突**，其它约束照常报错；
+        // - MySQL：`INSERT IGNORE` 会把 NOT NULL / 数据截断 / 非法日期等**一并降级为 warning 后跳过**，
+        //   对数据质量敏感的表不要用 `.insert_ignore`（改用 `.upsert` 或先清洗数据）；
+        // - SQL Server / Oracle 等：走 `INSERT ... SELECT ... WHERE NOT EXISTS`（只按唯一键判存）。
         var conflict: ?[]const []const u8 = null;
         if (mode != .insert_ignore) {
             if (pks.len == 0) {
@@ -391,9 +396,18 @@ pub const TableRef = struct {
             },
             .insert_ignore => {
                 if (self.kind == .sqlite) {
-                    try b.add("INSERT OR IGNORE INTO ");
-                    try b.add(rest);
+                    // 用 `ON CONFLICT DO NOTHING` 而**不是** `INSERT OR IGNORE`：
+                    // 后者会把 NOT NULL / CHECK / 外键等**任意约束违反**也静默跳过，
+                    // 调用方只看到「插入数少了一条」，查不出是「已存在」还是「数据坏了」。
+                    // `ON CONFLICT DO NOTHING` 只忽略唯一/排他冲突，其它约束照常报错。
+                    try b.add(insert_sql);
+                    try b.add(" ON CONFLICT DO NOTHING");
                 } else if (self.kind == .mysql) {
+                    // MySQL 没有窄语义的「只忽略唯一键冲突」写法：
+                    // `INSERT IGNORE` 会把数据截断、非法日期等也降级为 warning（数据风险），
+                    // 但它是唯一能准确统计「插入条数」的形态（`ON DUPLICATE KEY UPDATE` 在
+                    // `CLIENT_FOUND_ROWS` 下会把跳过也算成匹配行）。这里保留它并**明确告警**：
+                    // 对数据质量敏感的表请改用 `.upsert` 或先清洗数据。
                     try b.add("INSERT IGNORE INTO ");
                     try b.add(rest);
                 } else {
