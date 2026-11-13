@@ -917,4 +917,5 @@ test {
     _ = @import("integration_dirty_batch.zig");
     _ = @import("integration_cache_limit.zig");
     _ = @import("integration_cache_levels.zig");
+    _ = @import("integration_cache_remote.zig");
 }

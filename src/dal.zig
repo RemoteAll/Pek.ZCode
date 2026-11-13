@@ -23,6 +23,8 @@ const readwrite = @import("readwrite.zig");
 const shards = @import("shards.zig");
 const interceptor = @import("interceptor.zig");
 const pool = @import("pool.zig");
+const sqlbuild = @import("sqlbuild.zig");
+const Value = @import("zzig").db.Value;
 
 pub const ConnectionOptions = struct {
     provider: DatabaseKind = .sqlite,
@@ -209,6 +211,26 @@ pub const Dal = struct {
     connections: std.ArrayListUnmanaged(NamedConn) = .empty,
     /// 写入拦截器链（不拥有，由调用方创建与销毁）
     chain: ?*interceptor.Chain = null,
+    /// 跨进程缓存版本协调器（可选，类型擦除——避免 `dal` ← `dbcache` 循环依赖）
+    remote_cache: ?RemoteCache = null,
+
+    /// 跨进程缓存版本协调器（`dbcache.CacheInvalidator` 的注入面）。
+    ///
+    /// 多系统共用同一张表时，本地缓存必须能感知**别的进程**的写入：
+    /// - 写方：本 Dal 任何写操作 → `bump`（递增分布式版本号）
+    /// - 读方：`Cache` / `SingleCache` 定时 `poll` 后比对 `localVersion`，变了就过期本地缓存
+    ///
+    /// 注意：`bump` 实现**不得**回调 `Dal.invalidateCaches`（本地已由本 Dal 失效，会无限递归）。
+    pub const RemoteCache = struct {
+        ctx: *anyopaque,
+        bump: *const fn (ctx: *anyopaque, table_name: []const u8) void,
+        /// 本地已知版本（**纯内存**，不得有网络开销）
+        local_version: *const fn (ctx: *anyopaque, table_name: []const u8) i64,
+        /// 拉一次远端版本；返回变更表数
+        poll: *const fn (ctx: *anyopaque) usize,
+        /// 登记表：首次读时记下当前版本，避免第一轮误判为「变化」
+        attach: *const fn (ctx: *anyopaque, table_name: []const u8) void,
+    };
 
     /// 一条分表路由：表名 + 策略（表名/模板字符串由 Dal 持有）
     pub const ShardRoute = struct {
@@ -345,13 +367,13 @@ pub const Dal = struct {
         try self.cache_hooks.append(self.gpa, hook);
     }
 
-    /// 注销整表缓存（按 ctx 指针匹配）。
+    /// 注销整表缓存（按 ctx 指针匹配；同一缓存若误注册多次也会一次清干净）。
     pub fn unregisterCache(self: *Dal, ctx: *anyopaque) void {
         var i: usize = 0;
         while (i < self.cache_hooks.items.len) {
             if (self.cache_hooks.items[i].ctx == ctx) {
                 _ = self.cache_hooks.swapRemove(i);
-                return;
+                continue; // 不前进：swapRemove 把末尾元素换到了 i
             }
             i += 1;
         }
@@ -368,7 +390,8 @@ pub const Dal = struct {
     /// - `key != null`：优先走缓存的**精确失效**（单对象缓存只删那一条，不清整表）；
     ///   不支持精确失效的缓存（整表缓存）退回整体失效
     pub fn invalidateCachesOn(self: *Dal, table_name: []const u8, conn_name: ?[]const u8, key: ?i64) void {
-        if (self.cache_hooks.items.len == 0) return;
+        // 早退：没有任何缓存、也没挂跨进程版本协调器时零开销
+        if (self.cache_hooks.items.len == 0 and self.remote_cache == null) return;
 
         // 调用方给的可能是**实体名**（`Small`）也可能是**物理表名**（`BH_Small`），
         // 而 `TableRef` 的写通知一律用物理名 —— 这里归一后两种都比一次，
@@ -392,6 +415,84 @@ pub const Dal = struct {
             }
             hook.invalidate(hook.ctx);
         }
+
+        // 多系统共用表：把「这张表变了」广播给其它进程（本地已失效，这里只递增版本号）
+        if (self.remote_cache) |rc| rc.bump(rc.ctx, phys);
+    }
+
+    // ── 行数：恒定成本判定 / 大表统计估算 ──────────────────────
+
+    /// 「至多 `limit` 行」的计数：`min(实际行数, limit)`，**成本与表大小无关**。
+    ///
+    /// 用来判定「这张表是否超过某阈值」（如整表缓存上限），不要在大表上直接 `COUNT(*)`。
+    pub fn countUpTo(self: *Dal, s: *Session, table_name: []const u8, limit: u64) !i64 {
+        const sql = try sqlbuild.countUpTo(self.gpa, self.opts.provider, self.physicalName(table_name), limit);
+        defer sql.deinit(self.gpa);
+        const v = try s.queryScalar(sql.text, sql.params);
+        if (v) |value| return value.asI64() orelse 0;
+        return 0;
+    }
+
+    /// 精确 `COUNT(*)`（大表上很慢，业务侧优先用 `countTotal`）。
+    pub fn countRows(self: *Dal, s: *Session, table_name: []const u8) !i64 {
+        var ref = try self.table(table_name);
+        return ref.count(s, null);
+    }
+
+    /// 表总行数：小表精确、大表走统计估算（消费 `Setting.full_count_floor`）。
+    ///
+    /// 1. 先用 `countUpTo(floor+1)`：`<= floor` 说明是小表，**直接就是精确值**（成本 ≤ floor 行）；
+    /// 2. 超过 floor → 读数据库统计（`sqlite_stat1` / `information_schema` / `pg_class` / …）；
+    /// 3. 统计拿不到 → 打警告退回精确 `COUNT(*)`（此时慢是可预期的，提示去 ANALYZE）。
+    pub fn countTotal(self: *Dal, s: *Session, table_name: []const u8) !i64 {
+        const floor = @import("setting.zig").current().full_count_floor;
+        const phys = self.physicalName(table_name);
+        if (floor > 0) {
+            const up = try self.countUpTo(s, table_name, @as(u64, @intCast(floor)) + 1);
+            if (up <= floor) return up;
+            if (try self.countApprox(s, phys)) |est| {
+                if (est > 0) return est;
+            }
+            std.debug.print(
+                "[zcode] 大表 {s} 缺少统计信息（SQLite 先 ANALYZE / MySQL 开 innodb_stats_on_metadata 或 ANALYZE TABLE），" ++
+                    "退回精确 COUNT(*)，可能很慢\n",
+                .{phys},
+            );
+        }
+        return self.countRows(s, table_name);
+    }
+
+    /// 从数据库统计信息取近似行数；拿不到返回 `null`（不同方言实现不同）。
+    pub fn countApprox(self: *Dal, s: *Session, table_name: []const u8) !?i64 {
+        const sql: ?[]const u8 = switch (self.opts.provider) {
+            // stat 形如 "1234 5 3"，取第一段；多索引多行 → 取 MAX 避免重复累加
+            .sqlite => "SELECT MAX(CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER)) FROM sqlite_stat1 WHERE tbl = ?",
+            .mysql => "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            .postgresql => "SELECT reltuples::bigint FROM pg_class WHERE relname = ? AND relkind IN ('r', 'p') ORDER BY reltuples DESC LIMIT 1",
+            .sqlserver => "SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.objects o ON p.object_id = o.object_id WHERE o.name = ? AND p.index_id IN (0, 1)",
+            .oracle => "SELECT NUM_ROWS FROM USER_TABLES WHERE TABLE_NAME = ?",
+            else => null,
+        };
+        const text = sql orelse return null;
+
+        var params: [1]Value = .{.{ .text = table_name }};
+        const v = s.queryScalar(text, &params) catch |e| {
+            // 统计表不存在（SQLite 没跑过 ANALYZE 等）属正常情况，不当错误抛出
+            std.debug.print("[zcode] 读取 {s} 的统计信息失败（{s}），按「无统计」处理\n", .{ table_name, @errorName(e) });
+            return null;
+        };
+        if (v) |value| {
+            if (value.asI64()) |n| {
+                if (n >= 0) return n;
+            }
+        }
+        return null;
+    }
+
+    /// 实体名 → 物理表名（未知表原样返回）。
+    pub fn physicalName(self: *const Dal, name: []const u8) []const u8 {
+        if (self.model.table(name)) |t| return t.effectiveTableName();
+        return name;
     }
 
     // ── 读写分离 ────────────────────────────────────────────────

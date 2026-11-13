@@ -186,6 +186,14 @@ pub const CacheInvalidator = struct {
 
     /// 通知所有进程清除指定表的缓存：递增分布式版本号，并立即过期本地缓存。
     pub fn invalidate(self: *CacheInvalidator, table_name: []const u8) void {
+        self.markWritten(table_name);
+        self.dal.invalidateCaches(table_name);
+    }
+
+    /// 只广播（递增分布式版本号 + 更新本地版本），**不**回调 `Dal.invalidateCaches`。
+    ///
+    /// `Dal` 的写操作会调它（本地已由 Dal 自己失效），这样不会重入。
+    pub fn markWritten(self: *CacheInvalidator, table_name: []const u8) void {
         const ver = self.version(table_name) + 1;
         if (self.provider) |p| {
             const key = keyOf(self.gpa, table_name) catch return;
@@ -193,8 +201,49 @@ pub const CacheInvalidator = struct {
             p.setFn(p.ctx, key, ver);
         }
         self.remember(table_name, ver);
-        self.dal.invalidateCaches(table_name);
         self.bumps += 1;
+    }
+
+    /// 本进程已知版本号（**纯内存**，热路径可调，无网络开销）。
+    pub fn localVersion(self: *CacheInvalidator, table_name: []const u8) i64 {
+        return self.versions.get(table_name) orelse 0;
+    }
+
+    /// 把本协调器挂到 `Dal` 上：写操作自动广播、读缓存自动比对本地版本。
+    ///
+    /// 典型用法（多系统/多进程共用同一张表）：
+    /// ```zig
+    /// var inv = zcode.dbcache.CacheInvalidator.init(gpa, &dal, provider);
+    /// inv.attach();
+    /// ```
+    pub fn attach(self: *CacheInvalidator) void {
+        self.dal.remote_cache = .{
+            .ctx = @ptrCast(self),
+            .bump = bumpImpl,
+            .local_version = localVersionImpl,
+            .poll = pollImpl,
+            .attach = attachImpl,
+        };
+    }
+
+    fn bumpImpl(ctx: *anyopaque, table_name: []const u8) void {
+        const self: *CacheInvalidator = @ptrCast(@alignCast(ctx));
+        self.markWritten(table_name);
+    }
+
+    fn localVersionImpl(ctx: *anyopaque, table_name: []const u8) i64 {
+        const self: *CacheInvalidator = @ptrCast(@alignCast(ctx));
+        return self.localVersion(table_name);
+    }
+
+    fn pollImpl(ctx: *anyopaque) usize {
+        const self: *CacheInvalidator = @ptrCast(@alignCast(ctx));
+        return self.poll();
+    }
+
+    fn attachImpl(ctx: *anyopaque, table_name: []const u8) void {
+        const self: *CacheInvalidator = @ptrCast(@alignCast(ctx));
+        self.register(table_name);
     }
 
     /// 读当前分布式版本号（没有 provider 时返回本进程记录的版本）。

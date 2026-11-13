@@ -32,6 +32,10 @@
     `invalidate()`（可先拿旧值）/ `invalidateForced()`（阻塞到新值）。
   - 作用域 = `conn_name + 物理表名`（`TableRef.conn_name`，分库分片取 `ShardModel.conn_name`）→ 分库同名表不串。
   - 谓词查询：`Cache.find/findAll`；观测：`stats()`（total/success/loads/over_limit/evicted + `hitRate()`）。
+  - **多系统共用表**：`dbcache.CacheInvalidator` + `attach()` 挂到 `Dal`，写方自动 `markWritten`（递增 `XCode:Cache:Ver:{table}`），
+    读方 `checkRemote()` 默认每 1s `poll()` 一次后比对本地版本（热路径不碰网络）；未挂时零开销。
+  - 行数：`Dal.countUpTo(limit)`（恒定成本，`LIMIT n+1` 子查询）与 `Dal.countTotal`（消费 `Setting.full_count_floor`：
+    小表精确 / 大表统计估算 / 无统计则警告后退回精确）；**大表不要直接 `COUNT(*)`**。
 - **代码生成器**：`tools/zcodegen.zig`（`zig build` → `zig-out/bin/zcodegen.exe`），产出**双文件**：
   `{Name}.zig`（每次生成覆盖）+ `{Name}.biz.zig`（**只在不存在时创建，手写内容永不覆盖**）；
   `mod.zig` 导出实体与 `{Name}Biz`。用法与生成物清单见 `docs/代码生成.md`；改生成器后必跑
@@ -43,7 +47,7 @@
   与 TLS 可叠加（压缩在 TLS 内层）；服务端不支持时明确打印而不是静默当成功。
   **供应商化文件 `zzig/src/db/tls_client.zig`**：std TLS 客户端副本 + 补 `CertificateRequest`（MySQL 8 默认 `ssl_ca` 必发这条，std 不处理会连不上）；
   改它前先看头部注释，std 支持后应整个删掉。
-- 测试：`zig build test`（**单元 195 项 + 集成 93 项全通过 / 2 SKIP**，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
+- 测试：`zig build test`（**单元 195 项 + 集成 98 项全通过 / 2 SKIP**，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
 - 方言覆盖：`zig build audit-dialects`（**19/19 可实现方言无缺口**；不连库，纯 SQL 生成层），已进 `tools/regression.ps1`。
   改 `src/dialect.zig` 的 `else` 分支后必跑（`else =>` 默认分支是静默错误高发区）。

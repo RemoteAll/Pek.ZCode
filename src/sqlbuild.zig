@@ -535,6 +535,42 @@ pub fn count(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
+/// 「至多 N 行」的计数：`min(实际行数, limit)`。
+///
+/// 用于**恒定成本**地判定「这张表是否超过缓存上限」——不会像 `COUNT(*)` 那样扫全表，
+/// 亿级表上也只读 `limit` 行。各方言尽量用子查询 + 行数限制实现。
+pub fn countUpTo(gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const u8, limit: u64) !Sql {
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+    try params.append(gpa, .{ .int = @intCast(limit) });
+
+    switch (kind) {
+        .sqlserver => {
+            // 没有 LIMIT，用 TOP(n) 包一层
+            try b.add("SELECT COUNT(*) FROM (SELECT TOP (?) 1 AS zcode_x FROM ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(") AS zcode_t");
+        },
+        .oracle => {
+            try b.add("SELECT COUNT(*) FROM (SELECT 1 FROM ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(" WHERE ROWNUM <= ?) zcode_t");
+        },
+        .sqlite, .mysql, .postgresql => {
+            try b.add("SELECT COUNT(*) FROM (SELECT 1 FROM ");
+            try kind.pushQuoted(&b, table_name);
+            try b.add(" LIMIT ?) zcode_t");
+        },
+        else => return error.Unsupported,
+    }
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
 /// 组装 SELECT（含排序、分页、取前 N 条）。
 ///
 /// - `query.select` 中的列名会校验并引用；不是列名的内容按原始表达式使用（如 `COUNT(*)`）

@@ -95,6 +95,8 @@ pub fn Cache(comptime T: type) type {
         gpa: std.mem.Allocator,
         /// 缓存作用域：连接名（空 = 随表归属/主连接）。分库场景下同名表靠它区分。
         conn_name: []const u8 = "",
+        /// 物理表名（init 时算一次，读路径不再查模型）
+        phys_name: []const u8 = "",
         /// 过期秒数（0 = 不过期）
         ttl_seconds: i64 = 60,
         /// 模型 `MaxCacheCount`：0 = **不缓存**；>0 = 最多缓存这么多行
@@ -115,6 +117,13 @@ pub fn Cache(comptime T: type) type {
         stale: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         /// 强制失效：下次读必须**等到新快照**，不能返回旧值
         forced: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        /// 跨进程版本检查间隔（毫秒；0 = 每次访问都拉一次，仅测试用）
+        remote_poll_ms: i64 = 1000,
+        /// 上次拉远端版本的时间（毫秒）
+        last_poll_ms: i64 = 0,
+        /// 本进程已知的该表分布式版本（变了 → 本地快照过期）
+        remote_ver: i64 = 0,
 
         total: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         success: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -138,6 +147,7 @@ pub fn Cache(comptime T: type) type {
                 .dal = dal,
                 .gpa = dal.gpa,
                 .conn_name = conn_name,
+                .phys_name = if (dal.model.table(T.meta.table_name)) |t| t.effectiveTableName() else T.meta.table_name,
                 .ttl_seconds = ttl_seconds,
                 .max_rows = max_rows,
             };
@@ -179,6 +189,26 @@ pub fn Cache(comptime T: type) type {
                 .invalidate = invalidateHook,
             });
             self.registered = true;
+            // 登记到跨进程版本表（首轮记下当前版本，避免误判为「变化」）
+            if (self.dal.remote_cache) |rc| rc.attach(rc.ctx, phys);
+        }
+
+        /// 多系统共用表：定时拉一次远端版本，变了就过期本地快照。
+        ///
+        /// 未挂 `CacheInvalidator` 时零开销；挂了也是「每 `remote_poll_ms` 一次」——
+        /// 热路径只查本地版本（`local_version`），不碰网络。
+        fn checkRemote(self: *Self) void {
+            const rc = self.dal.remote_cache orelse return;
+            const now_ms = @import("zzig").compat.milliTimestamp();
+            if (now_ms - self.last_poll_ms >= self.remote_poll_ms) {
+                self.last_poll_ms = now_ms;
+                _ = rc.poll(rc.ctx);
+            }
+            const v = rc.local_version(rc.ctx, self.phys_name);
+            if (v != self.remote_ver) {
+                self.remote_ver = v;
+                self.stale.store(true, .release);
+            }
         }
 
         /// 手动清缓存（非强制）：下次读刷新；多线程下其余线程可能先拿到旧值。
@@ -223,6 +253,7 @@ pub fn Cache(comptime T: type) type {
         fn snapshotForRead(self: *Self, s: *Session) !?*Snapshot {
             if (self.max_rows == 0) return null;
             if (self.over_limit_until > DateTime.nowUnix()) return null;
+            self.checkRemote();
 
             if (self.snap.load(.acquire)) |snap| {
                 if (!self.isStale(snap)) return snap;
@@ -258,7 +289,6 @@ pub fn Cache(comptime T: type) type {
         fn reloadInner(self: *Self, s: *Session) !?*Snapshot {
             if (self.max_rows == 0) return null;
             try self.ensureRegistered();
-
             const snap = try self.gpa.create(Snapshot);
             snap.* = .{ .arena = std.heap.ArenaAllocator.init(self.gpa) };
             errdefer self.destroySnapshot(snap);
@@ -294,6 +324,8 @@ pub fn Cache(comptime T: type) type {
             self.stale.store(false, .release);
             self.forced.store(false, .release);
             _ = self.load_count.fetchAdd(1, .monotonic);
+            // 记下装载时的分布式版本：之后只要它变了就说明别的进程改过这张表
+            if (self.dal.remote_cache) |rc| self.remote_ver = rc.local_version(rc.ctx, self.phys_name);
 
             // 发布新快照；旧快照延迟一代释放（读线程可能还拿着它的切片）
             const old = self.snap.swap(snap, .acq_rel);
@@ -393,13 +425,21 @@ pub fn SingleCache(comptime T: type) type {
         gpa: std.mem.Allocator,
         /// 缓存作用域：连接名（空 = 随表归属）
         conn_name: []const u8 = "",
+        /// 物理表名（init 时算一次）
+        phys_name: []const u8 = "",
         ttl_seconds: i64 = 60,
         /// 条目上限（C# `MaxEntity`）：防止大表把内存吃满；0 = 不限
         max_entries: usize = 10_000,
         entries: std.AutoHashMapUnmanaged(i64, Entry) = .empty,
         mutex: Mutex = .{},
+        /// 只保护「首次注册」：并发首访时只能注册一条钩子（否则会重复注册 + 泄漏）
+        reg_mutex: Mutex = .{},
         seq: u64 = 0,
         registered: bool = false,
+        /// 跨进程版本检查间隔（毫秒；0 = 每次访问都拉）
+        remote_poll_ms: i64 = 1000,
+        last_poll_ms: i64 = 0,
+        remote_ver: i64 = 0,
 
         total: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         success: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -413,7 +453,13 @@ pub fn SingleCache(comptime T: type) type {
 
         /// 按连接名初始化（分库：同名表在不同库各一份缓存）。
         pub fn initConn(dal: *Dal, conn_name: []const u8, ttl_seconds: i64) Self {
-            return .{ .dal = dal, .gpa = dal.gpa, .conn_name = conn_name, .ttl_seconds = ttl_seconds };
+            return .{
+                .dal = dal,
+                .gpa = dal.gpa,
+                .conn_name = conn_name,
+                .phys_name = if (dal.model.table(T.meta.table_name)) |t| t.effectiveTableName() else T.meta.table_name,
+                .ttl_seconds = ttl_seconds,
+            };
         }
 
         pub fn deinit(self: *Self) void {
@@ -469,6 +515,9 @@ pub fn SingleCache(comptime T: type) type {
 
         fn ensureRegistered(self: *Self) !void {
             if (self.registered) return;
+            self.reg_mutex.lock();
+            defer self.reg_mutex.unlock();
+            if (self.registered) return;
             const phys = if (self.dal.model.table(T.meta.table_name)) |t| t.effectiveTableName() else T.meta.table_name;
             const conn = if (self.conn_name.len > 0)
                 self.conn_name
@@ -482,6 +531,22 @@ pub fn SingleCache(comptime T: type) type {
                 .invalidate_key = invalidateKeyHook,
             });
             self.registered = true;
+            if (self.dal.remote_cache) |rc| rc.attach(rc.ctx, phys);
+        }
+
+        /// 多系统共用表：定时拉一次远端版本，变了就整体失效（精确到行靠本地写通知）。
+        fn checkRemote(self: *Self) void {
+            const rc = self.dal.remote_cache orelse return;
+            const now_ms = @import("zzig").compat.milliTimestamp();
+            if (now_ms - self.last_poll_ms >= self.remote_poll_ms) {
+                self.last_poll_ms = now_ms;
+                _ = rc.poll(rc.ctx);
+            }
+            const v = rc.local_version(rc.ctx, self.phys_name);
+            if (v != self.remote_ver) {
+                self.remote_ver = v;
+                self.invalidateAll();
+            }
         }
 
         fn isExpired(self: *const Self, entry: *const Entry) bool {
@@ -493,6 +558,7 @@ pub fn SingleCache(comptime T: type) type {
         /// 按主键取（未命中/过期回库并缓存；不存在返回 null，**不缓存空值**）。
         pub fn get(self: *Self, s: *Session, pk: i64) !?T {
             try self.ensureRegistered();
+            self.checkRemote();
             _ = self.total.fetchAdd(1, .monotonic);
 
             {
@@ -519,6 +585,8 @@ pub fn SingleCache(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             try self.putLocked(pk, owned, arena);
+            // 记下回库时的分布式版本：之后变了就说明别的进程改过这张表
+            if (self.dal.remote_cache) |rc| self.remote_ver = rc.local_version(rc.ctx, self.phys_name);
             return owned;
         }
 
