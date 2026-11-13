@@ -204,4 +204,18 @@ pub fn build(b: *std.Build) void {
     const bench_mysql_run = b.addRunArtifact(bench_mysql_exe);
     const bench_mysql_step = b.step("bench-mysql", "MySQL 批量写基准（insertBatch vs LOCAL INFILE）");
     bench_mysql_step.dependOn(&bench_mysql_run.step);
+
+    // PostgreSQL 预处理语句复用基准：`zig build bench-pg -Dpg-conn="..."`（需要本机有 PG 实例）
+    const bench_pg_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench_pg.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_pg_mod.addImport("zcode", zcode);
+    bench_pg_mod.addImport("zzig", zzig_mod);
+    bench_pg_mod.addOptions("build_options", build_options);
+    const bench_pg_exe = b.addExecutable(.{ .name = "zcode-bench-pg", .root_module = bench_pg_mod });
+    const bench_pg_run = b.addRunArtifact(bench_pg_exe);
+    const bench_pg_step = b.step("bench-pg", "PostgreSQL 预处理语句复用基准（同进程 A/B）");
+    bench_pg_step.dependOn(&bench_pg_run.step);
 }

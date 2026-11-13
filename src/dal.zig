@@ -225,7 +225,7 @@ const probe_failed: u64 = 1;
 
 /// `[flavor:8][major:16][minor:16][patch:16]` + 1（让 0 永远留给「未探测」）。
 fn packServerVersion(v: dialect.ServerVersion) u64 {
-    const flavor: u64 = @intFromEnum(v.flavor) & 0xFF;
+    const flavor: u64 = @backingInt(v.flavor) & 0xFF;
     return 1 + (flavor << 48) + (@as(u64, v.major) << 32) + (@as(u64, v.minor) << 16) + @as(u64, v.patch);
 }
 
@@ -236,7 +236,7 @@ fn unpackServerVersion(code: u64) ?dialect.ServerVersion {
         .major = @intCast((raw >> 32) & 0xFFFF),
         .minor = @intCast((raw >> 16) & 0xFFFF),
         .patch = @intCast(raw & 0xFFFF),
-        .flavor = @enumFromInt(@as(u8, @intCast((raw >> 48) & 0xFF))),
+        .flavor = @fromBackingInt(@intCast(@as(u8, @intCast((raw >> 48) & 0xFF)))),
     };
 }
 

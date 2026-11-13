@@ -79,6 +79,12 @@
   **基准不进门禁**（机器抖动会误报），改热路径后手动对比；跨语言绝对值不可比，只看同机相对值。
 - MySQL 带参语句已做**预处理句柄复用**（按 SQL 文本缓存，默认 32 条 FIFO）：`zig build bench-mysql` 同进程 A/B
   实测点查 **1.64×**、单行插入（同事务）**1.62×**；`setStmtCacheLimit(0)` 可关掉做对比，`stmtCacheStats()` 看命中率。
+- PostgreSQL 同样已做**命名预处理语句复用**（`zcode_p{N}`，首次 `Parse`+`Describe`，之后只 `Bind`+`Execute`+`Sync`，
+  列名走缓存）：`zig build bench-pg -Dpg-conn="…"` 实测点查 **1.64×**、单行插入 **1.5~1.6×**、命中率 100%。
+  **PG 的命名语句会因 DDL 失效**（`0A000 cached plan must not change result type`）→ 驱动里「丢弃缓存 + 重试一次」，
+  别把这个重试删掉。用例见 `tests/integration_pg_driver.zig`。
+- **PG 的 `ErrorResponse` 之后必须消费到 `ReadyForQuery`**（`drainUntilReady`）：不读掉它，下一条语句就吃到残留消息，
+  整条连接作废（实测：错一次之后所有查询都失败）。改 PG 驱动的错误分支时务必保留这一行。
 
 ## 工具链口径（本机实测）
 

@@ -139,7 +139,7 @@ test "SQLite：探测到版本、能力保守、全列冲突退化为 DO NOTHING
     // 表状态不能被这次失败的调用改动
     const after = try scan(&s, &table, a);
     try std.testing.expectEqual(@as(usize, 2), after.rows); // 原有 1 行 + 显式主键 1 行
-    try std.testing.expectEqual(@as(i64, 5), after.qty);    // 首行（Id 最小 = k1）的 Qty 不能被改掉
+    try std.testing.expectEqual(@as(i64, 5), after.qty); // 首行（Id 最小 = k1）的 Qty 不能被改掉
 }
 
 test "MySQL：探测版本 + 行别名 upsert（真库）+ 保守档对照（需 -Dmysql-conn）" {

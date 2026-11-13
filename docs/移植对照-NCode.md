@@ -257,6 +257,24 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
   `tests/integration_pg_real.zig` 建表后反读回列类型/主键/索引，并验证生成的 `Model.xml` 可再次解析。
   同一轮修掉了 `syncSchema` 的 `existingColumns()` 缺 PG 分支（原 `else => error.Unsupported` 让第二次同步必失败）。
 
+### 2.9 预处理语句复用（MySQL 2026-11-11 / PostgreSQL 2026-11-13）
+
+| 方言 | 复用前每条语句 | 复用后 | 淘汰 | 实测（同进程 A/B，本机） |
+|---|---|---|---|---|
+| MySQL | `COM_STMT_PREPARE` + `EXECUTE` + `CLOSE` | `EXECUTE` | FIFO 32 条，`COM_STMT_CLOSE` | 点查 **1.64×**、单行插入 **1.62×** |
+| PostgreSQL | `Parse` + `Describe` + `Bind` + `Execute` + `Sync` | `Bind` + `Execute` + `Sync`（列名走缓存） | FIFO 32 条，`Close(statement)` | 点查 **1.64×**、单行插入 **1.5~1.6×** |
+
+关键口径（都是实测踩出来的）：
+
+- **预处理语句是连接私有的**：缓存挂在 `Conn` 上，断线重连自然失效；不要跨连接共享句柄。
+- **PG 的命名语句会因 DDL 失效**：`SELECT *` 之后改表结构，再执行会报
+  `0A000 cached plan must not change result type`。驱动里做了「丢弃缓存 + 按首次路径重试一次」，
+  上层无感；真库用例 `tests/integration_pg_driver.zig` 守住这条。
+- **`setStmtCacheLimit(0)` 可关闭**（同进程 A/B 用），`stmtCacheStats()` 给命中/未命中原语。
+- **PG 的错误路径必须消费到 `ReadyForQuery`**：`ErrorResponse` 之后服务端一定会补一条
+  `ReadyForQuery`，不读掉它，下一条语句就吃到残留消息 → 整条连接作废。
+  这是本轮顺带修掉的真 bug（用例：故意查不存在的表 → 再 `SELECT 1`）。
+
 ## 3. 与 C#/Rust 的行为差异（有意为之）| 差异 | 原因 |
 |---|---|
 | `Decimal` 只有解析/格式化/比较，没有四则运算 | ORM 层不需要算术；C# 的 `decimal` 运算属于业务层 |
@@ -351,16 +369,16 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `DataAccessLayer/WindowFunction` | `window.zig` | 已迁移 |
 | `DataAccessLayer/ReadWriteStrategy` | `readwrite.zig` | 已迁移 |
 | `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL / PostgreSQL / SQL Server） | 已迁移（PG / SQL Server 的查结构 SQL 尚未在真库实测） |
-| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds}` 执行层 | 部分：SQL 生成层齐了；执行层只有 4 家驱动（其余无客户端库/无实例） |
+| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds}` 执行层 | 部分：SQL 生成层齐了；执行层只有 4 家驱动（其余无客户端库/无实例）。**预处理语句复用**：MySQL（2026-11-11）与 PostgreSQL（2026-11-13）均已做（PG 实测 1.64×） |
 | `DataAccessLayer/DbPackage`（数据包导入导出） | `dbpackage.zig`（表级导出/导入/跨库同步，四种保存模式） | 部分：`.gz` / `zip` 多表归档与 Actor 并行未做 |
 | `DataAccessLayer/XDbConnectionStringBuilder` | `dal.parseConnectionString` | 已迁移 |
 | `Entity/Entity*`、`EntitySession`、`IEntityPersistence` | `entity.zig`、`dbtable.zig`、`interceptor.zig` | 已迁移（按表/对象/脏更新三层） |
 | `Entity/EntityQueue`、`EntitySplit`、`EntityTransaction` | `entity_queue.zig`、`shards.zig`、`session.zig`（嵌套事务 + Scoped） | 已迁移 |
-| `Entity/EntityExtension`（71KB 扩展方法集） | 部分：`entity.zig` 的 insert/save/update/find/query。`Clone`/`CopyFrom`/`Valid`/`ToDictionary` 等**未做** | 部分 |
+| `Entity/EntityExtension`（71KB 扩展方法集） | `entity_ext.zig`：`hasDirty`/`clearDirty`/`dirtyCount`/`dirtyNamesAlloc`/`dirtyUnionOf*`（≂`GetDirtyColumns`）、`cloneAlloc`（≂`Clone`）、`copyFrom`（≂`CopyFrom`）、`checkRequired`（≂`Valid`）、`indexByAlloc`（≂`ToDictionary`）、`trimExtraLong`（≂`TrimExtraLong`）、`merge`（≂`Merge<T>`）、`saveCsvAlloc`/`loadCsvAlloc`（≂ CSV 导出/`LoadCsv`） | 已迁移（**未做**：跨类型 `Merge<T,T2>`；`LoadFile` 等价于调用方读文件 + `loadCsvAlloc`） |
 | `Entity/IEntityModule`（实体模块钩子：Time/User/Trace） | `interceptor.zig`（审计列补全，等价于 ThreeModule） | 等价 |
 | `Extension/数据缓存` | `cache.zig` | 已迁移 |
 | `Linq/EntityQueryProvider`（表达式树 → SQL） | `query.zig`（结构化 `Where`，无表达式树） | 不适用（Zig 无 LINQ） |
-| `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | `membership.zig`：`enums` / `password` / `datascope` / `log` / `rules` / `provider` + `entities/*`（9 张表由 `membership/Member.xml` 生成） | **大部分**：枚举与权限文本、口令散列 `md5+sha1` 字节互通、数据权限（上下文/翻译/掩码）、日志提供者（脏字段差量/口令屏蔽/LinkID）、各实体纯规则（角色 id 归一/年龄/抢管理员/类型推断/子菜单排序/租户角色/参数阈值）、`LoginCore` 八步 + 注册 + 改密、九张表实体。**待做**：`UserStore` 的真实 ORM 实现、`PinYin.GetFirst`（部门/租户 `Code` 依赖它，需迁移 GB2312 首字母表）、`Area` 地区算法（`FixName`/`MergeLevel3`/`Parse`） |
+| `Membership/*`（用户/角色/部门/菜单/租户/日志/参数/地区 + `DataScope`/`LogProvider`/`IManageProvider`） | `membership.zig`：`enums` / `password` / `datascope` / `log` / `rules` / `provider` + `entities/*`（9 张表由 `membership/Member.xml` 生成）+ `pinyin.zig` + `area.zig` | 已迁移：枚举与权限文本、口令散列 `md5+sha1` 字节互通、数据权限（上下文/翻译/掩码）、日志提供者（脏字段差量/口令屏蔽/LinkID）、各实体纯规则、`LoginCore` 八步 + 注册 + 改密、九张表实体、`UserStore` 的真实 ORM 实现（`OrmStore`）、`PinYin`（GB2312 三表 + 重庆特例）、`Area`（`FixName`/`MergeLevel3`/`Parse`/CSV）。**未做**：各实体的 `FindByXxx` 便捷查询、`InitData` 种子数据（业务口径，按需再加）；`Area.Import` 的远程下载/`.gz` 显式 `error.Unsupported` |
 | `Model/WhereExpression`、`OrderExpression`、`FieldExpression`、`InExpression`、`LikeExpression` | `query.zig`（14 种运算符 + 排序/分页） | 已迁移 |
 | `Model/ConcatExpression`、`FormatExpression` | `expression.zig`（`ConcatExpression` / `FormatExpression` / `FieldExpression` / `Expression`） | 已迁移 |
 | `Model/BatchFinder`、`BatchOption` | `batch.zig`（批量 `IN` 预取 + 去重 + 可替换 loader；`BatchOption` 参数载体） | 已迁移 |
@@ -376,7 +394,12 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `XCodeTool/`（代码生成模板引擎） | `codegen.zig` + `tools/zcodegen.zig`（`Model.xml` → Zig 实体，带元数据/索引/辅助函数）+ `tools/gencheck.zig` 生成后自检 | 已迁移（Razor 模板引擎不适用：Zig 侧只需生成代码，不需要模板语言） |
 | `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | `setting.zig`（字段与默认值逐项对齐 + `Key=Value` 读写） | 已迁移（无面板元数据） |
 
-**一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取）已覆盖；
-**`Membership` 已过六成**（枚举/口令/数据权限/日志/实体规则/登录核 + 九张表实体），
-剩 `PinYin` 拼音首字母、`Area` 地区算法与 `UserStore` 的 ORM 适配；其次是 `EntityExtension` 的扩展方法集、
-`InfluxDB` / `TDengine` 两个时序库驱动、`DbPackage` 的 zip 多表归档。
+**一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取/`Membership`）已覆盖；
+**剩余未做项 = 三件**：① `InfluxDB` / `TDengine` 两个时序库驱动（本机无实例，不能实测）；
+② `DbPackage` 的 `.gz` / `zip` 多表归档（本仓与 zzig 都没有 zip 实现）；
+③ 跨类型 `EntityExtension.Merge<T,T2>`（跨语言类型映射靠猜会错，不接）。
+**执行层仍只有 4 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server），其余 21 个方言只有 SQL 生成层（本机无实例可验证）。
+
+> 台账保鲜纪律（2026-11-13 实战教训）：这张表曾把 `Membership` 的 `UserStore`/`PinYin`/`Area` 与
+> `EntityExtension` 的 `Clone`/`CopyFrom`/`Valid`/`ToDictionary` 记成「未做」，而它们**早已实现**（见决策记录第二十五~三十节），
+> 于是“还有哪些没迁移”的答案直接错了。**每次改这两个模块必须回头改这张表**；不确定就 grep 代码，不要凭上一轮的记录。

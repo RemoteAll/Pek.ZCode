@@ -921,4 +921,5 @@ test {
     _ = @import("integration_count_dialect.zig");
     _ = @import("integration_rowlock.zig");
     _ = @import("integration_dialect_versions.zig");
+    _ = @import("integration_pg_driver.zig");
 }
