@@ -26,6 +26,10 @@ pub fn Cache(comptime T: type) type {
         gpa: std.mem.Allocator,
         /// 过期秒数（0 = 不过期）
         ttl_seconds: i64 = 60,
+        /// 模型 `MaxCacheCount`：`>0` 时整表装载超过它就**不缓存**
+        max_rows: usize = 0,
+        /// 已判定「禁用/太大」：后续 `get`/`all`/`count` 直接查库，不再尝试整表装载
+        disabled: bool = false,
         /// 上次装载时间（Unix 秒；0 = 未装载）
         loaded_at: i64 = 0,
         items: []const T = &.{},
@@ -34,12 +38,22 @@ pub fn Cache(comptime T: type) type {
         registered: bool = false,
 
         pub fn init(dal: *Dal, ttl_seconds: i64) Self {
-            return .{
+            // 内存保护：`MaxCacheCount <= 0`（含时序列强制置 0）直接禁用整表缓存——
+            // 大表整表装载到内存的代价远大于收益，C# `Meta.Cache` 也是这么做的。
+            const max_rows: usize = blk: {
+                const t = dal.model.table(T.meta.table_name) orelse break :blk 0;
+                break :blk if (t.max_cache_count > 0) @intCast(t.max_cache_count) else 0;
+            };
+
+            var self = Self{
                 .dal = dal,
                 .gpa = dal.gpa,
                 .ttl_seconds = ttl_seconds,
+                .max_rows = max_rows,
                 .arena = std.heap.ArenaAllocator.init(dal.gpa),
             };
+            if (max_rows == 0) self.disabled = true;
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
@@ -51,8 +65,11 @@ pub fn Cache(comptime T: type) type {
         /// 首次使用时注册（此时结构体已位于最终地址，指针稳定）。
         fn ensureRegistered(self: *Self) !void {
             if (self.registered) return;
+            // 注册用**物理表名**：`TableRef` 的写通知一律按物理名发出，
+            // 用实体名注册会导致「实体名 ≠ 物理名」的表写完之后缓存永不失效（实测踩过）。
+            const phys = if (self.dal.model.table(T.meta.table_name)) |t| t.effectiveTableName() else T.meta.table_name;
             try self.dal.registerCache(.{
-                .table_name = T.meta.table_name,
+                .table_name = phys,
                 .ctx = @ptrCast(self),
                 .invalidate = invalidateHook,
             });
@@ -76,6 +93,7 @@ pub fn Cache(comptime T: type) type {
         }
 
         fn ensureLoaded(self: *Self, s: *Session) !void {
+            if (self.disabled) return;
             if (!self.isExpired()) return;
             try self.ensureRegistered();
             try self.reload(s);
@@ -83,6 +101,8 @@ pub fn Cache(comptime T: type) type {
 
         /// 整表重载（会释放上一次装载的实体与其字符串）。
         pub fn reload(self: *Self, s: *Session) !void {
+            if (self.disabled) return;
+
             var q = Query.init(self.gpa);
             defer q.deinit();
 
@@ -93,6 +113,15 @@ pub fn Cache(comptime T: type) type {
             self.loaded_at = 0;
 
             const rows = try entity.queryRows(self.dal, T, s, &q);
+
+            // 超过模型上限：放弃整表缓存（内存保护），之后直接查库
+            if (self.max_rows == 0 or rows.len > self.max_rows) {
+                self.disabled = true;
+                _ = self.arena.reset(.retain_capacity);
+                self.index.clearRetainingCapacity();
+                self.items = &.{};
+                return;
+            }
 
             const pk_index = primaryKeyIndex(T.meta) orelse return error.Unsupported;
             for (rows, 0..) |row, i| {
@@ -105,19 +134,30 @@ pub fn Cache(comptime T: type) type {
 
         /// 按主键取（未加载/过期会先整表装载）。
         pub fn get(self: *Self, s: *Session, pk: i64) !?T {
-            try self.ensureLoaded(s);
+            if (!self.disabled) try self.ensureLoaded(s);
+            // `reload` 可能因为行数超限而刚把缓存禁用，这里必须再判一次
+            if (self.disabled) return entity.findByPk(self.dal, T, s, &.{.{ .int = pk }});
             const i = self.index.get(pk) orelse return null;
             return self.items[i];
         }
 
         /// 全部行（未加载/过期会先整表装载）。
         pub fn all(self: *Self, s: *Session) ![]const T {
-            try self.ensureLoaded(s);
+            if (!self.disabled) try self.ensureLoaded(s);
+            if (self.disabled) {
+                var q = Query.init(self.gpa);
+                defer q.deinit();
+                return entity.queryRows(self.dal, T, s, &q);
+            }
             return self.items;
         }
 
         pub fn count(self: *Self, s: *Session) !usize {
-            try self.ensureLoaded(s);
+            if (!self.disabled) try self.ensureLoaded(s);
+            if (self.disabled) {
+                const n = try entity.count(self.dal, T, s, null);
+                return @intCast(n);
+            }
             return self.items.len;
         }
 

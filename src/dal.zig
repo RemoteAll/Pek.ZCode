@@ -352,8 +352,16 @@ pub const Dal = struct {
 
     /// 写后失效：只通知与该表匹配的缓存。
     pub fn invalidateCaches(self: *Dal, table_name: []const u8) void {
+        // 调用方给的可能是**实体名**（`Small`）也可能是**物理表名**（`BH_Small`），
+        // 而 `TableRef` 的写通知一律用物理名 —— 这里归一后两种都比一次，
+        // 否则「实体名 ≠ 物理名」的表在写完之后缓存永远不失效（实测踩过）。
+        const phys = if (self.model.table(table_name)) |t| t.effectiveTableName() else table_name;
         for (self.cache_hooks.items) |hook| {
-            if (std.ascii.eqlIgnoreCase(hook.table_name, table_name)) hook.invalidate(hook.ctx);
+            if (std.ascii.eqlIgnoreCase(hook.table_name, phys) or
+                std.ascii.eqlIgnoreCase(hook.table_name, table_name))
+            {
+                hook.invalidate(hook.ctx);
+            }
         }
     }
 
