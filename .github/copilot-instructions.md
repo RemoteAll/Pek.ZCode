@@ -47,8 +47,22 @@
   与 TLS 可叠加（压缩在 TLS 内层）；服务端不支持时明确打印而不是静默当成功。
   **供应商化文件 `zzig/src/db/tls_client.zig`**：std TLS 客户端副本 + 补 `CertificateRequest`（MySQL 8 默认 `ssl_ca` 必发这条，std 不处理会连不上）；
   改它前先看头部注释，std 支持后应整个删掉。
-- 测试：`zig build test`（**单元 195 项 + 集成 101 项全通过 / 2 SKIP**，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
+- 测试：`zig build test`（**单元 196 项 + 集成 109 项**，2 项 SKIP 为「未给真库连接串」，给了就连跑）；真库另跑
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
+- **方言版本探测 + 能力开关**（`dialect.ServerVersion` / `dialect.Features`）：能力**不是编译期常量**，
+  连上之后探一次版本（`Dal.probeVersionOnce`，整套 Dal 只探一次，SQLite/MySQL/PG；SQL Server 不探），
+  失败→保守档 + 告警一次。现用到两处：
+  - MySQL **行别名** `INSERT ... VALUES (...) AS zcode_new ON DUPLICATE KEY UPDATE c = zcode_new.c`（**8.0.19+**；
+    `VALUES(col)` 官方已标 deprecated；**MariaDB 强制回退**老写法）；
+  - PG **`RETURNING`** 回写自增 ID（**8.2+**，PG 驱动 `lastInsertId` 恒 0）。
+  运维看 `Dal.describeServerAlloc()`；真库用例 `tests/integration_dialect_versions.zig`。
+- **最低版本（硬约束）**：SQLite **3.24**（UPSERT）/ **3.33**（`UPDATE ... FROM`）；MySQL **5.7**（8.0.19 以下自动回退
+  `VALUES()`）；PG 系 **9.5**（`ON CONFLICT`）。
+- **`upsert` 必须有可更新的列**：只写冲突列本身（典型「只写主键」）时 SQLite / MySQL 都**无法表达**
+  （SQLite 的 `DO NOTHING` 不处理 rowid 冲突、MySQL 严格模式报 1364），代码直接 `error.UpsertNeedsUpdatableColumn`，
+  **不要**改成“生成个空子句试试”（那是语法错）。
+- **不要在即将返回的会话上 prepare**：`Session` 按值返回，而 SQLite `Stmt` 持 `*Db` → 缓存会指向失效地址。
+  需要探测 / 预演时用**独立临时会话**（`Dal.probeVersionOnce` 就是这么做的）。
 - **SQL 里出现参数一律走 `kind.pushPlaceholder()`**：字面量 `?` 在 PG（`$1`）/ SQL Server（`@p0`）上是语法错误。
   2026-11-13 实际踩过（`countUpTo` 在 SQLite 绿、PG 直接 `syntax error at or near ")"`）。
 - **行锁**：`Query.lock = .skip_locked` → MySQL 8/PG：`FOR UPDATE SKIP LOCKED`；SQL Server：`WITH (UPDLOCK, READPAST)`；
@@ -56,6 +70,7 @@
 - **SQLite 并发档位**（连接串）：`JournalMode=WAL|DELETE|MEMORY` / `Synchronous=Off|Normal|Full` / `CacheSize=-64000`。
   **默认不设置**（实测：单行一事务下 `WAL+NORMAL` 写吞吐约慢 2.3×，且写中并发读并不会被 DELETE 阻塞）；
   只有「长写事务 + 别人要能读」才开 WAL，网络盘一律不开。
+  **主连接也必须走这条路径**：`openSessionRaw` 已收敛到 `openSessionWith`（早先直调 `Db.open` 会吞掉这些 PRAGMA）。
 - 方言覆盖：`zig build audit-dialects`（**19/19 可实现方言无缺口**；不连库，纯 SQL 生成层），已进 `tools/regression.ps1`。
   改 `src/dialect.zig` 的 `else` 分支后必跑（`else =>` 默认分支是静默错误高发区）。
 - 性能：`zig build bench`（ReleaseFast，SQLite 内存库）出数字：实体 insert 4.29 µs / 批量 1.95 µs 条 /

@@ -22,6 +22,11 @@ const Query = query.Query;
 const DateTime = @import("zzig").DateTime;
 const SaveModes = @import("setting.zig").SaveModes;
 
+/// MySQL 行别名（`INSERT ... VALUES (...) AS zcode_new ON DUPLICATE KEY UPDATE c = zcode_new.c`）。
+///
+/// MySQL 规定**行别名不能与表名相同**；`zcode_new` 带 ORM 前缀，业务表不会叫这个名字。
+const mysql_row_alias = "zcode_new";
+
 pub const TableRef = struct {
     gpa: std.mem.Allocator,
     kind: DatabaseKind,
@@ -35,6 +40,11 @@ pub const TableRef = struct {
     write_notify: ?*const fn (ctx: *anyopaque, table_name: []const u8, conn_name: []const u8, key: ?i64) void = null,
     /// 写入拦截器链（审计列自动补全；由 `Dal` 注入，可为空）
     chain: ?*@import("interceptor.zig").Chain = null,
+    /// 方言能力开关（由 `Dal` 探测服务端版本后注入）。
+    ///
+    /// 默认 `conservative`（只用各产品最早在役版本就有的语法）：调用方直接
+    /// `TableRef.init` 构造句柄时（工具 / 测试）行为可预期，不会突然产出对方不认识的 SQL。
+    features: @import("dialect.zig").Features = .conservative,
 
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, table: *const TableMeta) TableRef {
         return .{ .gpa = gpa, .kind = kind, .table = table, .table_name = table.effectiveTableName() };
@@ -105,13 +115,48 @@ pub const TableRef = struct {
         try self.ensureWritable();
         const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
         defer sql.deinit(self.gpa);
-        _ = try s.execute(sql.text, sql.params);
-        if (self.table.identity() != null) {
+
+        if (self.table.identity()) |idcol| {
+            // PG 系：`RETURNING <自增列>` 在**同一次往返**里拿回 ID。
+            // 驱动自身没有「自增值回写」（`lastInsertId` 恒 0），不用 RETURNING 就只能再发
+            // 一条 `SELECT currval()` / `SELECT ...`，那是白白多一个来回。
+            if (self.kind.isPostgresFamily() and self.features.pg_returning) {
+                var b = @import("zzig").Buf.init(self.gpa);
+                defer b.deinit();
+                try b.add(sql.text);
+                try b.add(" RETURNING ");
+                try self.kind.pushQuoted(&b, self.table.effectiveColumnName(idcol));
+                const returning_sql = try b.toOwnedSlice();
+                defer self.gpa.free(returning_sql);
+
+                const rows = s.queryRows(returning_sql, sql.params) catch |e| {
+                    std.debug.print(
+                        "[zcode] 插入回写自增 ID 失败：表 {s}\n  SQL: {s}\n  错误: {s}；{s}\n",
+                        .{ self.table_name, returning_sql, @errorName(e), s.lastError() },
+                    );
+                    return e;
+                };
+                if (rows.len == 0 or rows[0].values.len == 0) {
+                    // INSERT ... RETURNING 必须有行返回；没有说明服务端行为异常，不能装成功
+                    std.debug.print(
+                        "[zcode] 插入回写自增 ID 异常：表 {s} 的 RETURNING 没有任何行\n  SQL: {s}\n",
+                        .{ self.table_name, returning_sql },
+                    );
+                    return error.NoReturningRow;
+                }
+                const id = rows[0].values[0].asI64() orelse 0;
+                self.notifyWriteKey(if (id > 0) id else null);
+                return id;
+            }
+
+            _ = try s.execute(sql.text, sql.params);
             const id = s.lastInsertId();
             // 自增主键已知 → 精确失效那一行，免得单对象缓存被整表清空（写多读多场景的关键）
             self.notifyWriteKey(if (id > 0) id else null);
             return id;
         }
+
+        _ = try s.execute(sql.text, sql.params);
         self.notifyWrite();
         return 0;
     }
@@ -455,34 +500,79 @@ pub const TableRef = struct {
     }
 
     /// 追加冲突处理子句（`ON CONFLICT (...) DO UPDATE SET` / `ON DUPLICATE KEY UPDATE`）。
+    ///
+    /// 两种形态按服务端版本选：
+    /// - **MySQL 8.0.19+**：`... VALUES (...) AS <别名> ON DUPLICATE KEY UPDATE c = <别名>.c`
+    ///   （行别名；`VALUES(col)` 官方已标 deprecated）。别名固定 `zcode_new`——它不能与
+    ///   表名相同（MySQL 规定），业务表也不会叫这个名字。
+    /// - MySQL 5.7 / 8.0.18 / **MariaDB**：`c = VALUES(c)`（唯一可用的老写法）。
+    ///
+    /// **`conflict` 覆盖全部列时**（比如单列主键表只 upsert 主键）没有可更新列，
+    /// `DO UPDATE SET` 后面会是空的 → 语法错。这里退化成「冲突就什么都不改」：
+    /// MySQL 用第一列的恒等赋值，其它方言用 `ON CONFLICT (...) DO NOTHING`。
     fn pushConflictSuffix(
         self: *const TableRef,
         b: *@import("zzig").Buf,
         row: []const sqlbuild.Field,
         conflict: ?[]const []const u8,
     ) !void {
-        if (self.kind == .mysql) {
-            try b.add(" ON DUPLICATE KEY UPDATE ");
-        } else {
-            try b.add(" ON CONFLICT (");
-            if (conflict) |cols| {
-                for (cols, 0..) |c, i| {
-                    if (i > 0) try b.add(", ");
-                    try self.kind.pushQuoted(b, c);
+        const in_conflict = struct {
+            fn call(cols: ?[]const []const u8, name: []const u8) bool {
+                const list = cols orelse return false;
+                for (list) |c| {
+                    if (std.ascii.eqlIgnoreCase(c, name)) return true;
                 }
+                return false;
             }
-            try b.add(") DO UPDATE SET ");
+        }.call;
+
+        var updatable: usize = 0;
+        for (row) |f| {
+            if (!in_conflict(conflict, f.name)) updatable += 1;
+        }
+
+        const use_alias = self.kind == .mysql and self.features.mysql_row_alias;
+
+        // 没有可更新列（典型：只写主键）：多数方言上**无法表达**，明确报错而不是发一条注定失败的 SQL。
+        //
+        // 实测结论（三方言）：
+        // - MySQL 8.0.29 严格模式：先校验未提供列 → `ERROR 1364 Field 'X' doesn't have a default value`
+        //   （即使原本会走 `ON DUPLICATE KEY UPDATE` 分支）；
+        // - SQLite 3.49.1：`DO NOTHING` **不处理 rowid 冲突**（绕开冲突判定直接插入 → NOT NULL 失败），
+        //   而 `DO UPDATE` 又没有列可写；
+        // - 只有 PostgreSQL 系的 `ON CONFLICT (...) DO NOTHING` 行为正确（冲突时不插入 → 不校验列）。
+        if (updatable == 0) {
+            if (self.kind == .mysql or self.kind == .sqlite) {
+                std.debug.print(
+                    "[zcode] upsert 不可用：表 {s} 本次只写了冲突列本身，没有任何可更新的列。\n" ++
+                        "  MySQL 严格模式会报 1364（未提供列无默认值）；SQLite 的 DO NOTHING 不处理 rowid 冲突、" ++
+                        "DO UPDATE 又无列可写。\n" ++
+                        "  处理方式：带上至少一个非冲突列（哪怕值不变），或改用带唯一索引列作为冲突目标。\n",
+                    .{self.table_name},
+                );
+                return error.UpsertNeedsUpdatableColumn;
+            }
+            try self.pushConflictTarget(b, conflict);
+            try b.add(" DO NOTHING");
+            return;
+        }
+
+        if (self.kind == .mysql) {
+            if (use_alias) {
+                try b.add(" AS ");
+                try b.add(mysql_row_alias);
+                try b.add(" ON DUPLICATE KEY UPDATE ");
+            } else {
+                try b.add(" ON DUPLICATE KEY UPDATE ");
+            }
+        } else {
+            try self.pushConflictTarget(b, conflict);
+            try b.add(" DO UPDATE SET ");
         }
 
         var first = true;
         for (row) |f| {
-            var conflict_hit = false;
-            if (conflict) |cols| {
-                for (cols) |c| {
-                    if (std.ascii.eqlIgnoreCase(c, f.name)) conflict_hit = true;
-                }
-            }
-            if (conflict_hit) continue;
+            if (in_conflict(conflict, f.name)) continue;
 
             if (!first) try b.add(", ");
             first = false;
@@ -490,15 +580,34 @@ pub const TableRef = struct {
             defer self.gpa.free(quoted);
             if (self.kind == .mysql) {
                 try b.add(quoted);
-                try b.add(" = VALUES(");
-                try b.add(quoted);
-                try b.add(")");
+                if (use_alias) {
+                    try b.add(" = ");
+                    try b.add(mysql_row_alias);
+                    try b.add(".");
+                    try b.add(quoted);
+                } else {
+                    try b.add(" = VALUES(");
+                    try b.add(quoted);
+                    try b.add(")");
+                }
             } else {
                 try b.add(quoted);
                 try b.add(" = excluded.");
                 try b.add(quoted);
             }
         }
+    }
+
+    /// `ON CONFLICT (<冲突列>)` 的公共前缀（SQLite / PG 系）。
+    fn pushConflictTarget(self: *const TableRef, b: *@import("zzig").Buf, conflict: ?[]const []const u8) !void {
+        try b.add(" ON CONFLICT (");
+        if (conflict) |cols| {
+            for (cols, 0..) |c, i| {
+                if (i > 0) try b.add(", ");
+                try self.kind.pushQuoted(b, c);
+            }
+        }
+        try b.add(")");
     }
 
     /// 方言不支持 SQL 级 upsert 时的退路：同事务内逐行「先 UPDATE，未命中再 INSERT」。

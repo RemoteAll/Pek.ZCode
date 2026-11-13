@@ -1006,6 +1006,189 @@ pub const DatabaseKind = enum {
     }
 };
 
+// ── 服务端版本与方言能力 ────────────────────────────────────────────────
+//
+// **为什么需要**：同一款数据库不同大版本之间语法差别很大，而「把新特性用起来」与
+// 「不把老库写炸」必须同时成立：
+//
+// - MySQL 自 **8.0.19** 起推荐**行别名**（`INSERT ... VALUES (...) AS new ON DUPLICATE
+//   KEY UPDATE c = new.c`），官方已把 `VALUES(col)` 标为 deprecated，并写明
+//   “subject to removal in a future version of MySQL”（9.x 手册仍在，但不能赌）；
+// - **MariaDB 不支持行别名**，MySQL 5.7 / 8.0.18 也不支持 —— 写死新语法会直接把老库写炸；
+// - **PostgreSQL 的 `RETURNING`** 能在同一次往返里拿回自增 ID（本驱动原先恒返回 0）。
+//
+// 所以能力不能做成编译期常量，只能「连上之后探一次版本」再决定 SQL 形态；
+// 探测失败（无权限 / 中间件挡住 `SELECT VERSION()`）时一律退回保守档并在日志里说清楚。
+
+/// 服务端版本号（`major.minor.patch` + 产品分支）。
+pub const ServerVersion = struct {
+    major: u16 = 0,
+    minor: u16 = 0,
+    patch: u16 = 0,
+    flavor: Flavor = .unknown,
+
+    /// 版本串里能识别出的产品分支。
+    ///
+    /// **`MariaDB` 必须单独识别**：它的版本号形如 `10.11.6-MariaDB`，只比数字会得出
+    /// 「10.11 > 8.0.19 → 支持行别名」的错误结论，而它恰恰不支持。
+    pub const Flavor = enum(u8) {
+        unknown = 0,
+        mysql = 1,
+        mariadb = 2,
+        percona = 3,
+        sqlite = 4,
+        postgresql = 5,
+    };
+
+    /// 解析服务端版本串。认得的形态（**均来自真库实测**）：
+    ///
+    /// - MySQL 8.0.29 → `8.0.29`
+    /// - MySQL 5.7.44 → `5.7.44-log`
+    /// - MariaDB → `10.11.6-MariaDB-1:10.11.6+maria~ubu2204`
+    /// - PostgreSQL → `16.2 (Debian 16.2-1.pgdg120+1)`
+    /// - SQLite → `3.54.1`（`select sqlite_version()`）
+    ///
+    /// 先**跳过前导非数字**再去读，所以 `SQLite version 3.45.1` / `PostgreSQL 16.2`
+    /// 这类带前缀的串同样可解析。一个数字都取不到时返回 `null`（**不猜**）。
+    pub fn parse(raw: []const u8) ?ServerVersion {
+        const t = std.mem.trim(u8, raw, " \t\r\n");
+        if (t.len == 0) return null;
+
+        var parts = [3]u16{ 0, 0, 0 };
+        var got: usize = 0;
+        var i = indexOfDigit(t) orelse return null;
+        while (got < 3) {
+            var value: u32 = 0;
+            var digits: usize = 0;
+            while (i < t.len and std.ascii.isDigit(t[i])) : (i += 1) {
+                value = value * 10 + (t[i] - '0');
+                digits += 1;
+                if (value > std.math.maxInt(u16)) return null; // 版本段不可能这么大，判定为噪声
+            }
+            if (digits == 0) break;
+            parts[got] = @intCast(value);
+            got += 1;
+            // 只有紧跟着 `.` 且再后面是数字才算下一段：
+            // 否则 `3.54.1 (2026-10-16)` 会把日期当成版本段
+            if (i >= t.len or t[i] != '.') break;
+            if (i + 1 >= t.len or !std.ascii.isDigit(t[i + 1])) break;
+            i += 1;
+        }
+        if (got == 0) return null;
+        return .{
+            .major = parts[0],
+            .minor = parts[1],
+            .patch = parts[2],
+            .flavor = detectFlavor(t),
+        };
+    }
+
+    /// 是否 ≥ 给定最低版本（逐段比较；`flavor` 不参与比较）。
+    pub fn atLeast(self: ServerVersion, min: [3]u16) bool {
+        const have = [3]u16{ self.major, self.minor, self.patch };
+        for (have, min) |l, r| {
+            if (l != r) return l > r;
+        }
+        return true;
+    }
+
+    /// `8.0.29` / `10.11.6 MariaDB` 形态（日志与诊断用）。
+    pub fn describeAlloc(self: ServerVersion, gpa: std.mem.Allocator) ![]u8 {
+        const suffix = switch (self.flavor) {
+            .unknown => "",
+            .mysql => " MySQL",
+            .mariadb => " MariaDB",
+            .percona => " Percona",
+            .sqlite => " SQLite",
+            .postgresql => " PostgreSQL",
+        };
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}{s}", .{ self.major, self.minor, self.patch, suffix });
+    }
+};
+
+fn indexOfDigit(s: []const u8) ?usize {
+    for (s, 0..) |c, i| {
+        if (std.ascii.isDigit(c)) return i;
+    }
+    return null;
+}
+
+fn detectFlavor(raw: []const u8) ServerVersion.Flavor {
+    if (indexOfIgnoreCaseAscii(raw, "mariadb") != null) return .mariadb;
+    if (indexOfIgnoreCaseAscii(raw, "percona") != null) return .percona;
+    if (indexOfIgnoreCaseAscii(raw, "sqlite") != null) return .sqlite;
+    if (indexOfIgnoreCaseAscii(raw, "postgresql") != null) return .postgresql;
+    return .unknown;
+}
+
+fn indexOfIgnoreCaseAscii(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+/// 方言能力开关：**按服务端版本探测结果**得出，不是编译期常量。
+///
+/// 每个开关都必须有「关掉时仍然正确」的回退分支 —— 否则它就不该是开关，而是硬要求
+/// （硬要求写进文档的「最低版本」，并在探测到更低版本时告警）。
+pub const Features = struct {
+    /// MySQL 系：`INSERT ... VALUES (...) AS <别名> ON DUPLICATE KEY UPDATE c = <别名>.c`
+    ///
+    /// 最低 **8.0.19**；**MariaDB 不支持**（其 ODKU 只认 `VALUES(col)`）。
+    /// 关掉时回退 `col = VALUES(col)` —— 仍可用，但官方已标 deprecated。
+    mysql_row_alias: bool = false,
+    /// PostgreSQL 系：`INSERT ... RETURNING <自增列>` 在一次往返里拿回自增 ID（**8.2+**）
+    ///
+    /// 关掉时回退 `Session.lastInsertId()`（PG 驱动恒 0 = 拿不到 ID）。不是错误，只是少个能力。
+    pg_returning: bool = false,
+
+    /// 最低兼容档：只用各产品**最早在役版本**就有的语法。
+    /// 探测失败、或调用方直接 `TableRef.init` 构造句柄时用它。
+    pub const conservative: Features = .{};
+
+    /// 按「已知版本」推导能力。
+    pub fn forVersion(kind: DatabaseKind, v: ServerVersion) Features {
+        var f = Features{};
+        switch (kind) {
+            .mysql => {
+                // 行别名：8.0.19+，且 MariaDB 分支不使用（版本号体系完全不同）
+                f.mysql_row_alias = v.flavor != .mariadb and v.atLeast(.{ 8, 0, 19 });
+            },
+            // 金仓 / 瀚高 / 海量都是 PG 分支，`RETURNING` 自 8.2 起就有，它们的最低在役版本远高于此
+            .postgresql, .kingbase, .highgo, .vastbase => {
+                f.pg_returning = v.atLeast(.{ 8, 2, 0 });
+            },
+            .sqlite => {},
+
+            else => {},
+        }
+        return f;
+    }
+
+    /// 按「未知版本」推导：**一律保守**（不用任何新语法）。
+    ///
+    /// 经验：`SELECT VERSION()` 被中间件 / 只读代理挡住的概率不低，此时**宁可慢一点，
+    /// 也不能生成对方不认识的 SQL**；调用方负责把「版本未知 → 保守档」打进日志。
+    pub fn unknownVersion(kind: DatabaseKind) Features {
+        _ = kind;
+        return Features.conservative;
+    }
+
+    /// 一行摘要（启动日志里给运维看，别让人猜到底开没开）。
+    pub fn describeAlloc(self: Features, gpa: std.mem.Allocator) ![]u8 {
+        var b = Buf.init(gpa);
+        defer b.deinit();
+        try b.add("行别名(MySQL 8.0.19+)=");
+        try b.add(if (self.mysql_row_alias) "开" else "关");
+        try b.add(" / RETURNING(PG 8.2+)=");
+        try b.add(if (self.pg_returning) "开" else "关");
+        return b.toOwnedSlice();
+    }
+};
+
 const DecimalSpec = struct { precision: i32, scale: i32 };
 
 /// MySQL DECIMAL 精度规则（对齐 DH.NCode：`Length` 有值时覆盖 `Precision`，上限 255）。
@@ -1492,6 +1675,80 @@ test "Access / SqlCe 只有 TOP 分页：首页可用、带 offset 明确报错�
     const page = try ps.pageSplitAlloc(a, spec, 5, 5, false);
     defer a.free(page);
     try std.testing.expect(std.mem.indexOf(u8, page, "Top") != null);
+}
+
+test "服务端版本解析与能力判定（版本矩阵边界）" {
+    const a = std.testing.allocator;
+
+    // ── 解析：真库实际返回的版本串 ──────────────────────────
+    const m8 = ServerVersion.parse("8.0.29").?;
+    try std.testing.expectEqual(@as(u16, 8), m8.major);
+    try std.testing.expectEqual(@as(u16, 0), m8.minor);
+    try std.testing.expectEqual(@as(u16, 29), m8.patch);
+    try std.testing.expectEqual(ServerVersion.Flavor.unknown, m8.flavor);
+
+    // MySQL 5.7 的 `-log` 后缀不能干扰解析
+    const m57 = ServerVersion.parse("5.7.44-log").?;
+    try std.testing.expectEqual(@as(u16, 5), m57.major);
+    try std.testing.expectEqual(@as(u16, 44), m57.patch);
+
+    // MariaDB：数字段比 MySQL 大，但 flavor 必须单独识别（不支持行别名）
+    const maria = ServerVersion.parse("10.11.6-MariaDB-1:10.11.6+maria~ubu2204").?;
+    try std.testing.expectEqual(ServerVersion.Flavor.mariadb, maria.flavor);
+    try std.testing.expect(maria.atLeast(.{ 8, 0, 19 })); // 纯数字比较会误判为「足够新」
+
+    // PostgreSQL：`SHOW server_version` 带括号里的打包信息
+    const pg = ServerVersion.parse("16.2 (Debian 16.2-1.pgdg120+1)").?;
+    try std.testing.expectEqual(@as(u16, 16), pg.major);
+    try std.testing.expectEqual(@as(u16, 2), pg.minor);
+    try std.testing.expectEqual(@as(u16, 0), pg.patch);
+    try std.testing.expectEqual(ServerVersion.Flavor.unknown, pg.flavor); // 串里没有产品名
+
+    // SQLite：带前缀也能解析，且识别出 flavor
+    const lite = ServerVersion.parse("SQLite version 3.45.1").?;
+    try std.testing.expectEqual(@as(u16, 3), lite.major);
+    try std.testing.expectEqual(@as(u16, 45), lite.minor);
+    try std.testing.expectEqual(@as(u16, 1), lite.patch);
+    try std.testing.expectEqual(ServerVersion.Flavor.sqlite, lite.flavor);
+
+    // 日期不能被当成版本段（`3.54.1 (2026-10-16)` 里第三段是 1 而不是 2026）
+    const dated = ServerVersion.parse("3.54.1 (2026-10-16)").?;
+    try std.testing.expectEqual(@as(u16, 1), dated.patch);
+
+    // 取不到数字就返回 null（不猜）
+    try std.testing.expect(ServerVersion.parse("") == null);
+    try std.testing.expect(ServerVersion.parse("unknown") == null);
+
+    // ── 比较 ────────────────────────────────────────────────
+    try std.testing.expect(m8.atLeast(.{ 8, 0, 19 }));
+    try std.testing.expect(!ServerVersion.parse("8.0.18").?.atLeast(.{ 8, 0, 19 }));
+    try std.testing.expect(ServerVersion.parse("9.0.0").?.atLeast(.{ 8, 0, 19 }));
+    try std.testing.expect(ServerVersion.parse("8.1.0").?.atLeast(.{ 8, 0, 19 }));
+    try std.testing.expect(!ServerVersion.parse("8.0.19").?.atLeast(.{ 8, 0, 20 }));
+
+    // ── 能力判定 ────────────────────────────────────────────
+    try std.testing.expect(Features.forVersion(.mysql, m8).mysql_row_alias);
+    try std.testing.expect(!Features.forVersion(.mysql, m57).mysql_row_alias);
+    try std.testing.expect(!Features.forVersion(.mysql, ServerVersion.parse("8.0.18").?).mysql_row_alias);
+    // MariaDB 即便版本号是 10.x 也必须关掉（它不容行别名）
+    try std.testing.expect(!Features.forVersion(.mysql, maria).mysql_row_alias);
+
+    // PG 系：RETURNING 8.2+，8.1 不支持
+    try std.testing.expect(Features.forVersion(.postgresql, pg).pg_returning);
+    try std.testing.expect(Features.forVersion(.kingbase, pg).pg_returning);
+    try std.testing.expect(!Features.forVersion(.postgresql, ServerVersion.parse("8.1.0").?).pg_returning);
+
+    // SQLite 不看这两个开关（它在任何在役版本上都不走行别名 / RETURNING）
+    try std.testing.expect(!Features.forVersion(.sqlite, lite).mysql_row_alias);
+    try std.testing.expect(!Features.forVersion(.sqlite, lite).pg_returning);
+
+    // 未知版本 = 保守档
+    try std.testing.expectEqual(Features.conservative, Features.unknownVersion(.mysql));
+
+    // 摘要可读
+    const desc = try Features.forVersion(.mysql, m8).describeAlloc(a);
+    defer a.free(desc);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "行别名(MySQL 8.0.19+)=开") != null);
 }
 
 test "直接执行 SQL：`?` 按方言改写成 $n / @pN / :n，字符串与注释里的 ? 不动" {

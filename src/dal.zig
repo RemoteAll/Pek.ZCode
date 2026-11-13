@@ -218,6 +218,28 @@ pub const SchemaReport = struct {
     }
 };
 
+// ── 服务端版本探测的打包编码（供 `Dal.probe_code` 用）──────────────────────
+
+const probe_unset: u64 = 0;
+const probe_failed: u64 = 1;
+
+/// `[flavor:8][major:16][minor:16][patch:16]` + 1（让 0 永远留给「未探测」）。
+fn packServerVersion(v: dialect.ServerVersion) u64 {
+    const flavor: u64 = @intFromEnum(v.flavor) & 0xFF;
+    return 1 + (flavor << 48) + (@as(u64, v.major) << 32) + (@as(u64, v.minor) << 16) + @as(u64, v.patch);
+}
+
+fn unpackServerVersion(code: u64) ?dialect.ServerVersion {
+    if (code < 2) return null;
+    const raw = code - 1;
+    return .{
+        .major = @intCast((raw >> 32) & 0xFFFF),
+        .minor = @intCast((raw >> 16) & 0xFFFF),
+        .patch = @intCast(raw & 0xFFFF),
+        .flavor = @enumFromInt(@as(u8, @intCast((raw >> 48) & 0xFF))),
+    };
+}
+
 pub const Dal = struct {
     gpa: std.mem.Allocator,
     model: EntityModel,
@@ -240,6 +262,14 @@ pub const Dal = struct {
     chain: ?*interceptor.Chain = null,
     /// 跨进程缓存版本协调器（可选，类型擦除——避免 `dal` ← `dbcache` 循环依赖）
     remote_cache: ?RemoteCache = null,
+    /// 服务端版本探测缓存（**整套 Dal 只探一次**，之后纯内存读，零往返）。
+    ///
+    /// `0` = 未探测；`1` = 探测过但失败（走保守档）；`≥2` = `1 + 打包(major,minor,patch,flavor)`。
+    /// 用**单个** atomic 而不是「version + flavor 两个字段」：多线程同时读时才不会读到
+    /// 「版本是新的、flavor 还是旧的」这种撕裂组合。
+    probe_code: std.atomic.Value(u64) = std.atomic.Value(u64).init(probe_unset),
+    /// 「版本未知 → 保守档」只告警一次，避免高频路径刷日志
+    probe_warned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// 跨进程缓存版本协调器（`dbcache.CacheInvalidator` 的注入面）。
     ///
@@ -605,6 +635,16 @@ pub const Dal = struct {
 
     /// 用指定连接参数打开会话（内部使用；对外请用 `openSession` / `readSessionFor`）。
     pub fn openSessionWith(self: *Dal, opts: *const ConnectionOptions) !Session {
+        var s = try self.openDriverSession(opts);
+        s.read_only = opts.read_only;
+        s.show_sql = opts.show_sql;
+        // 方言能力探测：整套 Dal **只探一次**（已探测时这里只是两个 atomic 读）
+        self.probeVersionOnce(opts);
+        return s;
+    }
+
+    /// 真正建连接并按方言分派（不做 read_only / show_sql / 版本探测等公共处理）。
+    fn openDriverSession(self: *Dal, opts: *const ConnectionOptions) !Session {
         switch (opts.provider) {
             .sqlite => {
                 const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
@@ -615,10 +655,7 @@ pub const Dal = struct {
                     .cache_size = opts.cache_size,
                     .read_only = opts.read_only,
                 });
-                var s = Session.init(self.gpa, .sqlite, db);
-                s.read_only = opts.read_only;
-                s.show_sql = opts.show_sql;
-                return s;
+                return Session.init(self.gpa, .sqlite, db);
             },
             .mysql => {
                 const conn = try mysql.Conn.open(self.gpa, .{
@@ -631,10 +668,7 @@ pub const Dal = struct {
                     .ssl_ca = opts.ssl_ca,
                     .compress = opts.compress,
                 });
-                var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
-                s.read_only = opts.read_only;
-                s.show_sql = opts.show_sql;
-                return s;
+                return Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
             },
             .postgresql => {
                 const conn = try postgres.Conn.open(self.gpa, .{
@@ -644,10 +678,7 @@ pub const Dal = struct {
                     .password = opts.password,
                     .database = opts.database,
                 });
-                var s = Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
-                s.read_only = opts.read_only;
-                s.show_sql = opts.show_sql;
-                return s;
+                return Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
             },
             .sqlserver => {
                 const conn = try tds.Conn.open(self.gpa, .{
@@ -658,10 +689,7 @@ pub const Dal = struct {
                     .database = opts.database,
                     .pipe_name = opts.pipe_name,
                 });
-                var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
-                s.read_only = opts.read_only;
-                s.show_sql = opts.show_sql;
-                return s;
+                return Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
             },
             else => return error.Unsupported,
         }
@@ -769,6 +797,7 @@ pub const Dal = struct {
         ref.table_name = shard_model.table_name;
         // 分库分片：表名已按分片替换，连接名也必须是**该分片所在库**，否则缓存作用域会串
         ref.conn_name = shard_model.conn_name;
+        ref.features = self.featuresFor(self.opts.provider);
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
         ref.setInterceptorChain(self.chain);
         return ref;
@@ -992,6 +1021,129 @@ pub const Dal = struct {
         self.chain = chain;
     }
 
+    // ── 服务端版本与方言能力 ────────────────────────────────────
+    //
+    // 目的只有一个：**让新语法默认被用起来，同时不把老库写炸**。
+    // MySQL 8.0.19+ 的行别名、PG 的 `RETURNING` 都属此类（详见 `dialect.Features`）。
+    //
+    // 探测纪律：
+    // - **每条 Dal 只探一次**（`probe_code` 是 atomic，探过就不再发 SQL）；
+    // - 探测失败（无权限 / 中间件挡住 `SELECT VERSION()`）→ 记 `probe_failed` 走保守档，
+    //   **不影响连接可用性**，只告警一次；
+    // - SQL Server 不探：`@@VERSION` 返回的是 "Microsoft SQL Server 2022 (RTM) - 16.0..."，
+    //   首个数字是发布年份，解析会错；它也不用这两个能力，保守档即可。
+
+    /// 探测服务端版本（幂等；已探测过直接返回）。
+    ///
+    /// **用独立临时会话探测，绝不碰即将返回给调用方的那个会话**：
+    /// `Session` 的 SQLite 语句缓存里，`Stmt` 持有 `*Db` 指针，而 `Session` 是**按值返回**
+    /// 的（返回时地址会变）。若在 `openSessionWith` 里用主会话 prepare 一次再 `return s`，
+    /// 缓存里的 `Stmt` 就指向失效地址，`deinit` 时 `finalize` 段错误（2026-11-13 实测踩到）。
+    ///
+    /// 代价：**整套 Dal 只多开一次连接**（不是每次开会话），SQLite 是本地微秒级，
+    /// MySQL/PG 多一次握手——只在第一次发生，换来「新语法自动生效 + 老库自动降级」。
+    fn probeVersionOnce(self: *Dal, opts: *const ConnectionOptions) void {
+        if (self.probe_code.load(.acquire) != probe_unset) return;
+
+        const sql = switch (opts.provider) {
+            .sqlite => "SELECT sqlite_version()",
+            .mysql => "SELECT VERSION()",
+            .postgresql => "SHOW server_version",
+            else => {
+                // SQL Server 的 `@@VERSION` 形如 `Microsoft SQL Server 2022 (RTM) - 16.0.1000.6`，
+                // 首个数字是发布年份，解析必错；它也不用这两个能力，直接保守档。
+                self.probe_code.store(probe_failed, .release);
+                return;
+            },
+        };
+
+        var tmp = self.openDriverSession(opts) catch |e| {
+            self.probe_code.store(probe_failed, .release);
+            std.debug.print(
+                "[zcode] 服务端版本探测失败（{s} 建临时会话）：{s}\n" ++
+                    "  后续按保守档生成 SQL（不用 MySQL 行别名 / PG RETURNING），功能正常但少数优化不生效。\n",
+                .{ opts.provider.name(), @errorName(e) },
+            );
+            return;
+        };
+        defer tmp.deinit();
+
+        const value = tmp.queryScalar(sql, &.{}) catch |e| {
+            self.probe_code.store(probe_failed, .release);
+            std.debug.print(
+                "[zcode] 服务端版本探测失败（{s}）：{s}；{s}\n" ++
+                    "  后续按保守档生成 SQL（不用 MySQL 行别名 / PG RETURNING），功能正常但少数优化不生效。\n",
+                .{ sql, @errorName(e), tmp.lastError() },
+            );
+            return;
+        };
+        const raw = if (value) |v| v.asText() else null;
+        const text = raw orelse {
+            self.probe_code.store(probe_failed, .release);
+            std.debug.print("[zcode] 服务端版本探测失败（{s}）返回空值，按保守档处理\n", .{sql});
+            return;
+        };
+        const parsed = dialect.ServerVersion.parse(text) orelse {
+            self.probe_code.store(probe_failed, .release);
+            std.debug.print(
+                "[zcode] 服务端版本串无法解析：{s}（来自 {s}），按保守档处理\n",
+                .{ text, sql },
+            );
+            return;
+        };
+        // 版本串多半只有数字（`8.0.29` / `3.54.1` / `16.2 (Debian ...)`），产品分支要靠**连接串声明的
+        // provider** 补齐；但串里已经写明 `MariaDB` / `Percona` 时以串为准（那决定了行别名能不能用）。
+        var resolved = parsed;
+        if (resolved.flavor == .unknown) {
+            resolved.flavor = switch (opts.provider) {
+                .sqlite => .sqlite,
+                .mysql => .mysql,
+                .postgresql => .postgresql,
+                else => .unknown,
+            };
+        }
+        self.probe_code.store(packServerVersion(resolved), .release);
+    }
+
+    /// 已探测到的服务端版本（未探测或探测失败返回 `null`）。
+    pub fn serverVersion(self: *const Dal) ?dialect.ServerVersion {
+        return unpackServerVersion(self.probe_code.load(.acquire));
+    }
+
+    /// 当前主连接生效的方言能力（探测失败 → 保守档 + 一次性告警）。
+    pub fn features(self: *Dal) dialect.Features {
+        return self.featuresFor(self.opts.provider);
+    }
+
+    /// 指定方言的生效能力。**只有探测到的版本与请求的方言同源时才采信**：
+    /// 否则（还没连过库 / 探测失败）一律保守档。
+    pub fn featuresFor(self: *Dal, kind: DatabaseKind) dialect.Features {
+        if (kind != self.opts.provider) return dialect.Features.unknownVersion(kind);
+        const code = self.probe_code.load(.acquire);
+        if (unpackServerVersion(code)) |v| return dialect.Features.forVersion(kind, v);
+        if (code == probe_failed and !self.probe_warned.swap(true, .acquire)) {
+            std.debug.print(
+                "[zcode] {s}：服务端版本未知，方言能力按保守档（{s}）\n",
+                .{ kind.name(), (dialect.Features.conservative.describeAlloc(self.gpa) catch "行别名=关 / RETURNING=关") },
+            );
+        }
+        return dialect.Features.unknownVersion(kind);
+    }
+
+    /// 一行诊断：`MySQL 8.0.29 MySQL（行别名=开 / RETURNING=关）`。
+    /// 运维第一眼要看的就是「到底连的哪个版本、开了哪些能力」。
+    pub fn describeServerAlloc(self: *Dal) ![]u8 {
+        const f = self.features();
+        const feats = try f.describeAlloc(self.gpa);
+        defer self.gpa.free(feats);
+        if (self.serverVersion()) |v| {
+            const ver = try v.describeAlloc(self.gpa);
+            defer self.gpa.free(ver);
+            return std.fmt.allocPrint(self.gpa, "{s}（{s}）", .{ ver, feats });
+        }
+        return std.fmt.allocPrint(self.gpa, "版本未知（{s}）", .{feats});
+    }
+
     fn freeOptions(gpa: std.mem.Allocator, opts: *ConnectionOptions) void {
         opts.deinit(gpa);
     }
@@ -1007,57 +1159,10 @@ pub const Dal = struct {
     }
 
     fn openSessionRaw(self: *Dal) !Session {
-        switch (self.opts.provider) {
-            .sqlite => {
-                const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
-                var db = try sqlite.Db.open(lib_ptr, self.opts.data_source);
-                errdefer db.close();
-                var s = Session.init(self.gpa, .sqlite, db);
-                s.read_only = self.opts.read_only;
-                return s;
-            },
-            .mysql => {
-                const conn = try mysql.Conn.open(self.gpa, .{
-                    .host = self.opts.server,
-                    .port = self.opts.port,
-                    .user = self.opts.user,
-                    .password = self.opts.password,
-                    .database = self.opts.database,
-                    .ssl_mode = self.opts.ssl_mode,
-                    .ssl_ca = self.opts.ssl_ca,
-                    .compress = self.opts.compress,
-                });
-                var s = Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
-                s.read_only = self.opts.read_only;
-                return s;
-            },
-            .postgresql => {
-                const conn = try postgres.Conn.open(self.gpa, .{
-                    .host = self.opts.server,
-                    .port = self.opts.port,
-                    .user = self.opts.user,
-                    .password = self.opts.password,
-                    .database = self.opts.database,
-                });
-                var s = Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
-                s.read_only = self.opts.read_only;
-                return s;
-            },
-            .sqlserver => {
-                const conn = try tds.Conn.open(self.gpa, .{
-                    .host = self.opts.server,
-                    .port = self.opts.port,
-                    .user = self.opts.user,
-                    .password = self.opts.password,
-                    .database = self.opts.database,
-                    .pipe_name = self.opts.pipe_name,
-                });
-                var s = Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
-                s.read_only = self.opts.read_only;
-                return s;
-            },
-            else => return error.Unsupported,
-        }
+        // **不要**另写一套打开逻辑：`openSessionRaw` 早先直接调 `sqlite.Db.open`（不带 PRAGMA），
+        // 导致连接串里的 `JournalMode` / `Synchronous` / `CacheSize` 只在从库 / 命名连接上生效，
+        // 主连接反而被忽略。统一收敛到 `openSessionWith`（全 null 时与 `Db.open` 完全等价）。
+        return self.openSessionWith(&self.opts);
     }
 
     /// 取表句柄（按实体名或物理表名）。
@@ -1065,6 +1170,7 @@ pub const Dal = struct {
         const t = self.model.table(name) orelse return error.TableNotFound;
         var ref = TableRef.init(self.gpa, self.opts.provider, t);
         ref.conn_name = self.tableConnName(t.name) catch self.connName();
+        ref.features = self.featuresFor(self.opts.provider);
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
         ref.setInterceptorChain(self.chain);
         return ref;
