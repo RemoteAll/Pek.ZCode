@@ -919,4 +919,5 @@ test {
     _ = @import("integration_cache_levels.zig");
     _ = @import("integration_cache_remote.zig");
     _ = @import("integration_count_dialect.zig");
+    _ = @import("integration_rowlock.zig");
 }

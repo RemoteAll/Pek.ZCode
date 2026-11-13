@@ -51,6 +51,11 @@
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
 - **SQL 里出现参数一律走 `kind.pushPlaceholder()`**：字面量 `?` 在 PG（`$1`）/ SQL Server（`@p0`）上是语法错误。
   2026-11-13 实际踩过（`countUpTo` 在 SQLite 绿、PG 直接 `syntax error at or near ")"`）。
+- **行锁**：`Query.lock = .skip_locked` → MySQL 8/PG：`FOR UPDATE SKIP LOCKED`；SQL Server：`WITH (UPDLOCK, READPAST)`；
+  SQLite 显式 `error.Unsupported`（只能库级写锁）。真库用例见 `tests/integration_rowlock.zig`。
+- **SQLite 并发档位**（连接串）：`JournalMode=WAL|DELETE|MEMORY` / `Synchronous=Off|Normal|Full` / `CacheSize=-64000`。
+  **默认不设置**（实测：单行一事务下 `WAL+NORMAL` 写吞吐约慢 2.3×，且写中并发读并不会被 DELETE 阻塞）；
+  只有「长写事务 + 别人要能读」才开 WAL，网络盘一律不开。
 - 方言覆盖：`zig build audit-dialects`（**19/19 可实现方言无缺口**；不连库，纯 SQL 生成层），已进 `tools/regression.ps1`。
   改 `src/dialect.zig` 的 `else` 分支后必跑（`else =>` 默认分支是静默错误高发区）。
 - 性能：`zig build bench`（ReleaseFast，SQLite 内存库）出数字：实体 insert 4.29 µs / 批量 1.95 µs 条 /

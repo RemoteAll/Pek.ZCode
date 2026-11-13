@@ -611,6 +611,17 @@ pub fn select(
     try b.add(" FROM ");
     try kind.pushQuoted(&b, table_name);
 
+    // SQL Server 的行锁是**表提示**（`WITH (UPDLOCK, READPAST)`），必须跟在表名后；
+    // 其它方言是句尾后缀（`FOR UPDATE SKIP LOCKED`），在后面统一拼。
+    if (q.lock != .none and kind == .sqlserver) {
+        switch (q.lock) {
+            .update => try b.add(" WITH (UPDLOCK)"),
+            .no_wait => try b.add(" WITH (UPDLOCK, NOWAIT)"),
+            .skip_locked => try b.add(" WITH (UPDLOCK, READPAST)"),
+            .none => {},
+        }
+    }
+
     if (q.filter) |f| {
         if (!f.isEmpty()) {
             try b.add(" WHERE ");
@@ -643,6 +654,28 @@ pub fn select(
             try b.add(order.slice());
         }
         text = try b.toOwnedSlice();
+    }
+
+    // 行锁后缀（SQL Server 已在表名列处理，其余方言在此追加）
+    if (q.lock != .none and kind != .sqlserver) {
+        const suffix: ?[]const u8 = switch (kind) {
+            .sqlite => null, // SQLite 只有库级写锁，无法行锁
+            .mysql, .postgresql, .oracle, .dameng => switch (q.lock) {
+                .update => " FOR UPDATE",
+                .no_wait => " FOR UPDATE NOWAIT",
+                .skip_locked => " FOR UPDATE SKIP LOCKED",
+                .none => null,
+            },
+            else => null,
+        };
+        if (suffix) |sfx| {
+            const joined = try std.mem.concat(gpa, u8, &.{ text, sfx });
+            gpa.free(text);
+            text = joined;
+        } else {
+            gpa.free(text);
+            return error.Unsupported;
+        }
     }
 
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };

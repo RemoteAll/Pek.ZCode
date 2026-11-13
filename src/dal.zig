@@ -48,6 +48,15 @@ pub const ConnectionOptions = struct {
     ssl_ca: []const u8 = "",
     /// 压缩协议（`Compression=True`）：缺省关闭（与 MySqlConnector 的 `UseCompression` 缺省一致）
     compress: bool = false,
+    // ── SQLite 并发设置（对应 PRAGMA；MySQL/PG 忽略）────────
+    /// `JournalMode=WAL|DELETE|MEMORY|OFF`：`null` = **不设置**（SQLite 原生 `delete`）。
+    /// 实测见 `docs/决策记录.md` 第（三十九）节：单行一事务下 WAL 反而慢 2×；
+    /// 只有「长写事务同时要别人能读」才值得显式开 WAL，网络盘一律开不得
+    journal_mode: ?[]const u8 = null,
+    /// `Synchronous=Normal|Full|Off`（也认 0/1/2）：`null` = **不设置**（原生 `full`）
+    synchronous: ?[]const u8 = null,
+    /// `CacheSize=-64000`：`null` = 用库默认（负数=KB，正数=页数）
+    cache_size: ?i32 = null,
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
     extra: []model.KeyValue = &.{},
 
@@ -60,6 +69,10 @@ pub const ConnectionOptions = struct {
         if (self.database.len > 0) gpa.free(self.database);
         if (self.ssl_ca.len > 0) gpa.free(self.ssl_ca);
         if (self.extra.len > 0) gpa.free(self.extra);
+        if (self.journal_mode) |v| gpa.free(v);
+        if (self.synchronous) |v| gpa.free(v);
+        self.journal_mode = null;
+        self.synchronous = null;
         self.data_source = "";
         self.server = "";
         self.user = "";
@@ -146,6 +159,20 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
             opts.read_only = parseBool(value);
         } else if (std.ascii.eqlIgnoreCase(key, "Pooling")) {
             opts.pooling = parseBool(value);
+        } else if (std.ascii.eqlIgnoreCase(key, "JournalMode")) {
+            opts.journal_mode = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Synchronous")) {
+            // 允许 0/1/2 数字写法（SQLite 原生约定）与 OFF/NORMAL/FULL 文本
+            opts.synchronous = try gpa.dupe(u8, if (std.mem.eql(u8, value, "0"))
+                "OFF"
+            else if (std.mem.eql(u8, value, "1"))
+                "NORMAL"
+            else if (std.mem.eql(u8, value, "2"))
+                "FULL"
+            else
+                value);
+        } else if (std.ascii.eqlIgnoreCase(key, "CacheSize")) {
+            opts.cache_size = std.fmt.parseInt(i32, value, 10) catch null;
         } else {
             try extra.append(gpa, .{ .key = key, .value = value });
         }
@@ -581,7 +608,13 @@ pub const Dal = struct {
         switch (opts.provider) {
             .sqlite => {
                 const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
-                const db = try sqlite.Db.open(lib_ptr, opts.data_source);
+                // 并发相关 PRAGMA 随连接串走：多线程/多进程共用同一个库时，WAL 是读写不互斥的前提
+                const db = try sqlite.Db.openWithOptions(lib_ptr, opts.data_source, .{
+                    .journal_mode = opts.journal_mode,
+                    .synchronous = opts.synchronous,
+                    .cache_size = opts.cache_size,
+                    .read_only = opts.read_only,
+                });
                 var s = Session.init(self.gpa, .sqlite, db);
                 s.read_only = opts.read_only;
                 s.show_sql = opts.show_sql;

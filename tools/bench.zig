@@ -389,6 +389,150 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // 14) 文件库写吞吐：SQLite 并发档位实测（内存库看不出 journal 差异，所以单独开临时文件库）
+    //
+    //     每行一个事务（最接近「设备心跳一行一提交」的真实写法）。
+    //     每种档位先跑一轮热身（文件创建/页分配/缓冲预热），再量第二轮，避免把冷启动算进去。
+    {
+        const cases = [_]struct { label: []const u8, conn: []const u8 }{
+            .{ .label = "文件库写（WAL+NORMAL）", .conn = "JournalMode=WAL;Synchronous=NORMAL" },
+            .{ .label = "文件库写（DELETE+FULL）", .conn = "JournalMode=DELETE;Synchronous=FULL" },
+            .{ .label = "文件库写（DELETE+NORMAL）", .conn = "JournalMode=DELETE;Synchronous=NORMAL" },
+        };
+        for (cases) |c| {
+            const path = try zcode.File.UniqueTempName(gpa, "zcode-bench", ".db");
+            defer gpa.free(path);
+            defer zcode.File.DeleteQuiet(path);
+            defer {
+                const wal = std.fmt.allocPrint(gpa, "{s}-wal", .{path}) catch null;
+                if (wal) |w| {
+                    zcode.File.DeleteQuiet(w);
+                    gpa.free(w);
+                }
+                const shm = std.fmt.allocPrint(gpa, "{s}-shm", .{path}) catch null;
+                if (shm) |w| {
+                    zcode.File.DeleteQuiet(w);
+                    gpa.free(w);
+                }
+            }
+
+            const conn = try std.fmt.allocPrint(gpa, "Data Source={s};Provider=SQLite;{s}", .{ path, c.conn });
+            defer gpa.free(conn);
+
+            const m2 = try zcode.EntityModel.parse(gpa, model_xml);
+            var dal2 = try zcode.Dal.initWithModel(gpa, conn, m2);
+            defer dal2.deinit();
+            var s2 = try dal2.openSession();
+            defer s2.deinit();
+            _ = try dal2.syncSchema(&s2);
+
+            const rows: usize = 500;
+            var total: i128 = 0;
+            var pass: usize = 0;
+            while (pass < 2) : (pass += 1) {
+                var i: usize = 0;
+                const start = nowNs();
+                while (i < rows) : (i += 1) {
+                    var e = Article{};
+                    e.Title = try std.fmt.allocPrint(aa, "{s}-{d}-{d}", .{ c.label, pass, i });
+                    e.Author = "bench";
+                    e.Score = @intCast(i);
+                    e.CreateTime = now;
+                    _ = try zcode.entity.insert(&dal2, &e, &s2);
+                }
+                total = nowNs() - start; // 只保留第二轮（热身轮丢弃）
+            }
+            try results.append(gpa, .{ .name = c.label, .total_ns = total, .iterations = rows });
+        }
+    }
+
+    // 15) 并发读：写事务进行中，另一个线程还能读多少次（WAL vs DELETE 的真正区别）
+    //
+    //     单连接写吞吐 DELETE 反而更快；WAL 的价值在「写不阻塞读」，
+    //     所以这一项才是「多线程/多进程共用同一个库」该看的数字。
+    {
+        const cases = [_]struct { label: []const u8, conn: []const u8 }{
+            .{ .label = "写中并发读（WAL）", .conn = "JournalMode=WAL;Synchronous=NORMAL" },
+            .{ .label = "写中并发读（DELETE）", .conn = "JournalMode=DELETE;Synchronous=NORMAL" },
+        };
+        for (cases) |c| {
+            const path = try zcode.File.UniqueTempName(gpa, "zcode-bench-rw", ".db");
+            defer gpa.free(path);
+            defer zcode.File.DeleteQuiet(path);
+            defer {
+                const wal = std.fmt.allocPrint(gpa, "{s}-wal", .{path}) catch null;
+                if (wal) |w| {
+                    zcode.File.DeleteQuiet(w);
+                    gpa.free(w);
+                }
+                const shm = std.fmt.allocPrint(gpa, "{s}-shm", .{path}) catch null;
+                if (shm) |w| {
+                    zcode.File.DeleteQuiet(w);
+                    gpa.free(w);
+                }
+            }
+
+            const conn = try std.fmt.allocPrint(gpa, "Data Source={s};Provider=SQLite;{s}", .{ path, c.conn });
+            defer gpa.free(conn);
+
+            const m2 = try zcode.EntityModel.parse(gpa, model_xml);
+            var dal2 = try zcode.Dal.initWithModel(gpa, conn, m2);
+            defer dal2.deinit();
+            var sw = try dal2.openSession();
+            defer sw.deinit();
+            _ = try dal2.syncSchema(&sw);
+
+            var stop = std.atomic.Value(bool).init(false);
+            var ready = std.atomic.Value(bool).init(false);
+            var reads = std.atomic.Value(usize).init(0);
+            var busy = std.atomic.Value(usize).init(0);
+
+            const reader = try std.Thread.spawn(.{}, struct {
+                fn run(dal_ptr: *zcode.Dal, ready_v: *std.atomic.Value(bool), stop_flag: *std.atomic.Value(bool), reads_v: *std.atomic.Value(usize), busy_v: *std.atomic.Value(usize)) void {
+                    var sr = dal_ptr.openSession() catch |e| {
+                        std.debug.print("[bench] 读线程开会话失败：{s}\n", .{@errorName(e)});
+                        ready_v.store(true, .release);
+                        return;
+                    };
+                    defer sr.deinit();
+                    ready_v.store(true, .release);
+                    while (!stop_flag.load(.acquire)) {
+                        _ = sr.queryScalar("SELECT COUNT(*) FROM \"Bench_Article\"", &[_]zcode.Value{}) catch |e| {
+                            std.debug.print("[bench] 读线程查询失败：{s}\n", .{@errorName(e)});
+                            _ = busy_v.fetchAdd(1, .monotonic);
+                            continue;
+                        };
+                        _ = reads_v.fetchAdd(1, .monotonic);
+                    }
+                }
+            }.run, .{ &dal2, &ready, &stop, &reads, &busy });
+
+            // 等读线程真正进入循环再开写（否则可能整轮写完了它还没被调度）
+            while (!ready.load(.acquire)) std.atomic.spinLoopHint();
+
+            var i: usize = 0;
+            const start = nowNs();
+            while (i < 300) : (i += 1) {
+                var e = Article{};
+                e.Title = try std.fmt.allocPrint(aa, "rw-{s}-{d}", .{ c.label, i });
+                e.Author = "bench";
+                e.Score = @intCast(i);
+                e.CreateTime = now;
+                _ = try zcode.entity.insert(&dal2, &e, &sw);
+            }
+            const write_ns = nowNs() - start;
+            stop.store(true, .release);
+            reader.join();
+
+            const r = reads.load(.monotonic);
+            const b = busy.load(.monotonic);
+            std.debug.print("[bench] {s}：写入 {d} 行期间读到 {d} 次（busy {d} 次）\n", .{ c.label, 300, r, b });
+            // 报「每次读的平均耗时」= 写入窗口 / 读次数，越小说明读越不被写拖住
+            const iters = @max(r, 1);
+            try results.append(gpa, .{ .name = c.label, .total_ns = write_ns, .iterations = iters });
+        }
+    }
+
     // ── 输出 ────────────────────────────────────────────────────────────────
     std.debug.print("\n=== Pek.ZCode 基准（SQLite 内存库，ReleaseFast）===\n", .{});
     std.debug.print("{s: <32} {s: >8} {s: >12} {s: >12}\n", .{ "用例", "次数", "总耗时(ms)", "单次(µs)" });

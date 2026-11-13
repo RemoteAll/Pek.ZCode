@@ -275,6 +275,25 @@ pub const OrderBy = struct {
     desc: bool = false,
 };
 
+/// 行锁模式（多实例并发消费同一张表时用）。
+///
+/// 对应各方言的高版本特性：
+/// - MySQL 8.0 / PostgreSQL 9.5+ / Oracle 11g+：`FOR UPDATE [NOWAIT | SKIP LOCKED]`
+/// - SQL Server：`WITH (UPDLOCK, READPAST)`（表提示，不是后缀）
+/// - SQLite：**不支持**（整库写锁，改用 `BEGIN IMMEDIATE`）
+///
+/// 典型场景：亿级设备的指令队列 / 批量任务分发——多个 worker 同时抢任务，
+/// `skip_locked` 保证每人拿到不同的行，不会互相阻塞也不会重复消费。
+pub const LockMode = enum {
+    none,
+    /// `FOR UPDATE`：锁住选中行，别人要等
+    update,
+    /// `FOR UPDATE NOWAIT`：锁不到立即报错（不排队）
+    no_wait,
+    /// `FOR UPDATE SKIP LOCKED`：跳过已被别人锁住的行（抢任务首选）
+    skip_locked,
+};
+
 /// 查询描述（SELECT 语句的组装参数）。
 pub const Query = struct {
     a: std.mem.Allocator,
@@ -285,6 +304,8 @@ pub const Query = struct {
     offset: ?usize = null,
     page_index: usize = 0,
     page_size: usize = 0,
+    /// 行锁（需在事务内使用）；缺省不加锁
+    lock: LockMode = .none,
 
     pub fn init(a: std.mem.Allocator) Query {
         return .{ .a = a };
