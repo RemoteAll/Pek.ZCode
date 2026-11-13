@@ -21,6 +21,8 @@ const Where = query.Where;
 const Query = query.Query;
 const DateTime = @import("zzig").DateTime;
 const SaveModes = @import("setting.zig").SaveModes;
+/// InfluxDB 驱动（Line Protocol 拼装只在驱动里，本层只做「列 → tag/field/时间」的角色划分）
+const influx_mod = @import("zzig").influxdb;
 
 /// MySQL 行别名（`INSERT ... VALUES (...) AS zcode_new ON DUPLICATE KEY UPDATE c = zcode_new.c`）。
 ///
@@ -96,6 +98,97 @@ pub const TableRef = struct {
         return list.toOwnedSlice(gpa);
     }
 
+    /// 把一行字段拼成 InfluxDB 的 Line Protocol（对应 C# `InfluxDBSession.BuildLineProtocol`）。
+    ///
+    /// 角色划分（按模型列）：
+    /// - **时间列**：列名 `Time` / `CreateTime` / `UpdateTime` 且值非空 → 行尾纳秒时间戳；
+    /// - **标签（tag）**：`primary_key`（主键/主列）→ `key=value`；
+    /// - **字段（field）**：其余列 → `key=value`（字符串双引号包裹，数字/布尔原样）。
+    ///
+    /// 没给值（`fields` 里没有该列）的列**不出现**，让 InfluxDB 用默认值——不要凭空写 NULL。
+    pub fn influxLineAlloc(self: *const TableRef, a: std.mem.Allocator, fields: []const sqlbuild.Field) ![]u8 {
+        var tags: std.ArrayListUnmanaged(influx_mod.PointTag) = .empty;
+        defer tags.deinit(a);
+        var flds: std.ArrayListUnmanaged(influx_mod.PointField) = .empty;
+        defer flds.deinit(a);
+        var ts_ns: ?i64 = null;
+
+        for (self.table.columns) |col| {
+            const name = self.table.effectiveColumnName(&col);
+            const v = fieldValue(fields, name) orelse continue;
+            if (v == .null) continue;
+
+            if (col.primary_key and ts_ns == null and isTimeColumnName(name)) {
+                if (v.asDatetime()) |dt| ts_ns = datetimeToNanos(dt);
+                continue;
+            }
+            if (isTimeColumnName(name)) {
+                if (v.asDatetime()) |dt| {
+                    ts_ns = datetimeToNanos(dt);
+                    continue;
+                }
+            }
+
+            if (col.primary_key) {
+                const text = try v.toTextAlloc(a);
+                try tags.append(a, .{ .name = name, .value = text });
+            } else {
+                try flds.append(a, .{ .name = name, .value = try influxFieldValueAlloc(a, v) });
+            }
+        }
+
+        if (flds.items.len == 0) {
+            // Line Protocol 要求至少一个字段；只有标签 + 时间的一行是非法的
+            std.debug.print(
+                "[zcode] InfluxDB 写入：表 {s} 这一行没有可写字段（列都在标签/时间中），已拒绝\n",
+                .{self.table_name},
+            );
+            return error.InfluxNoField;
+        }
+
+        return influx_mod.buildLineAlloc(a, self.table_name, tags.items, flds.items, ts_ns);
+    }
+
+    fn fieldValue(fields: []const sqlbuild.Field, name: []const u8) ?Value {
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.value;
+        }
+        return null;
+    }
+
+    fn isTimeColumnName(name: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(name, "Time") or
+            std.ascii.eqlIgnoreCase(name, "CreateTime") or
+            std.ascii.eqlIgnoreCase(name, "UpdateTime");
+    }
+
+    /// 时间 → 纳秒时间戳（Line Protocol 缺省精度就是纳秒）。
+    fn datetimeToNanos(dt: DateTime) i64 {
+        const secs = dt.toUnixSeconds();
+        return secs * std.time.ns_per_s + @as(i64, @intCast(dt.nanos));
+    }
+
+    /// 字段值渲染：整数/浮点/布尔裸写，字符串/时间带双引号并转义。
+    fn influxFieldValueAlloc(a: std.mem.Allocator, v: Value) ![]u8 {
+        return switch (v) {
+            .int => |i| std.fmt.allocPrint(a, "{d}", .{i}),
+            .float => |f| std.fmt.allocPrint(a, "{d}", .{f}),
+            .boolean => |b| a.dupe(u8, if (b) "true" else "false"),
+            .decimal => |d| d.formatAlloc(a),
+            else => blk: {
+                const text = try v.toTextAlloc(a);
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                try out.append(a, '"');
+                for (text) |c| {
+                    if (c == '"' or c == '\\') try out.append(a, '\\');
+                    try out.append(a, c);
+                }
+                try out.append(a, '"');
+                break :blk try out.toOwnedSlice(a);
+            },
+        };
+    }
+
     /// 插入一行（带拦截器）：拦截器可能追加审计列。
     fn insertWithInterceptors(self: *const TableRef, s: *Session, fields: []const sqlbuild.Field) !i64 {
         const chain = self.chain orelse return self.insertRaw(s, fields);
@@ -113,6 +206,13 @@ pub const TableRef = struct {
 
     fn insertRaw(self: *const TableRef, s: *Session, fields: []const sqlbuild.Field) !i64 {
         try self.ensureWritable();
+        // InfluxDB 没有 INSERT 语句：写的是 Line Protocol（与 C# `InfluxDBSession.Insert` 一致）
+        if (self.kind == .influxdb) {
+            const line = try self.influxLineAlloc(s.resultAllocator(), fields);
+            _ = try s.execute(line, &.{});
+            self.notifyWrite();
+            return 0;
+        }
         const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
         defer sql.deinit(self.gpa);
 
@@ -251,6 +351,22 @@ pub const TableRef = struct {
     pub fn insertBatch(self: *const TableRef, s: *Session, rows: []const []const sqlbuild.Field) !usize {
         try self.ensureWritable();
         if (rows.len == 0) return 0;
+
+        // InfluxDB：整批拼成一个 Line Protocol 文本，**一次 HTTP 请求**写完
+        if (self.kind == .influxdb) {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var text: std.ArrayListUnmanaged(u8) = .empty;
+            for (rows) |row| {
+                const line = try self.influxLineAlloc(a, row);
+                try text.appendSlice(a, line);
+                try text.append(a, '\n');
+            }
+            _ = try s.execute(text.items, &.{});
+            self.notifyWrite();
+            return rows.len;
+        }
 
         // 拦截器：逐行补齐审计列（每行独立内存，避免复用同一缓冲）
         var patched: std.ArrayList([]const sqlbuild.Field) = .empty;
@@ -924,4 +1040,45 @@ test "规整时间与布尔" {
 
     const ok = try normalizeValue(arena.allocator(), .boolean, .{ .int = 1 }, "Ok");
     try std.testing.expect(ok.boolean);
+}
+
+test "InfluxDB：列按 时间 / 标签 / 字段 三种角色拼 Line Protocol" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    const xml =
+        \\<EntityModel><Tables><Table Name="Meter" TableName="MeterData">
+        \\  <Columns>
+        \\    <Column Name="DeviceId" DataType="String" Length="32" PrimaryKey="True" />
+        \\    <Column Name="Current" DataType="Double" />
+        \\    <Column Name="Online" DataType="Boolean" />
+        \\    <Column Name="CreateTime" DataType="DateTime" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    const m = try model.EntityModel.parse(a, xml);
+    defer {
+        var mm = m;
+        mm.deinit();
+    }
+
+    var t = TableRef.init(a, .influxdb, m.table("Meter").?);
+    const line = try t.influxLineAlloc(arena.allocator(), &[_]sqlbuild.Field{
+        .{ .name = "DeviceId", .value = .{ .text = "dev-1" } },
+        .{ .name = "Current", .value = .{ .float = 12.5 } },
+        .{ .name = "Online", .value = .{ .boolean = true } },
+        .{ .name = "CreateTime", .value = .{ .datetime = DateTime.fromUnixSeconds(1_700_000_000) } },
+    });
+
+    // measurement 用物理表名；主键 → tag；其余 → field；时间列 → 行尾纳秒时间戳
+    try std.testing.expectEqualStrings(
+        "MeterData,DeviceId=dev-1 Current=12.5,Online=true 1700000000000000000",
+        line,
+    );
+
+    // 没有任何 field 时明确报错（Line Protocol 不允许只有 tag + 时间）
+    try std.testing.expectError(error.InfluxNoField, t.influxLineAlloc(arena.allocator(), &[_]sqlbuild.Field{
+        .{ .name = "DeviceId", .value = .{ .text = "dev-1" } },
+    }));
 }

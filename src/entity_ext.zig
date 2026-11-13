@@ -311,10 +311,11 @@ pub fn merge(
     return report;
 }
 
-fn keyOfAlloc(comptime T: type, a: std.mem.Allocator, e: T, comptime keys: []const []const u8) ![]u8 {
+fn keyOfAlloc(comptime T: type, a: std.mem.Allocator, e: anytype, comptime keys: []const []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(a);
-    for (keys, 0..) |k, i| {
+    // `inline for`：`keys` 是 comptime 切片，`columnIndex` 需要在编译期解析出列下标
+    inline for (keys, 0..) |k, i| {
         const idx = comptime columnIndex(T, k) orelse @compileError("merge: 键列不存在 " ++ k);
         if (i > 0) try buf.append(a, 0x1F); // 列间分隔，避免 "ab"+"c" == "a"+"bc"
         const t = try csv.valueTextAlloc(a, e.columnValue(idx));
@@ -322,6 +323,116 @@ fn keyOfAlloc(comptime T: type, a: std.mem.Allocator, e: T, comptime keys: []con
         try buf.appendSlice(a, t);
     }
     return buf.toOwnedSlice(a);
+}
+
+// ── 跨类型合并（对应 C# `Merge<T, T2>`）─────────────────────
+
+/// 跨类型复制同名列（对应 C# `CopyFrom(model)`：`T2` 没有的列自动跳过，主键列也因此在
+/// 「目标实体本来就有主键、源实体没有」时不会被清掉）。
+///
+/// `T2` 必须有 `dirty` / `columnValue` / `meta`（生成器产出的实体天然满足）。
+pub fn copyFromAny(comptime T: type, dst: *T, src: anytype, set_dirty: bool, get_dirty: bool) !usize {
+    const T2 = @TypeOf(src);
+    var n: usize = 0;
+    inline for (T.meta.fields, 0..) |f, i| {
+        const j = comptime columnIndex(T2, f.name) orelse continue;
+        if (!get_dirty or zcode.entity.isDirty(src.dirty, j)) {
+            try dst.setColumnValue(i, src.columnValue(j));
+            if (set_dirty) zcode.entity.markDirty(&dst.dirty, i);
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// 把**另一种类型**的 `news` 合并进 `source`（对应 C# `EntityExtension.Merge<T, T2>`）。
+///
+/// 用例：按原始数据统计出 `StatRow` 列表，合并进库里已有的 `Stat` 列表
+/// （命中 → 更新、未命中 → 插入、`trim` → 删除库里多出来的）。
+///
+/// 与 `merge` 的差别只有「新数据是另一个类型」：匹配按 `keys`（两边的**列名**都要存在，
+/// 否则编译期报错），复制只走**两边都有的同名列**——`T2` 没有的列不会被清空。
+///
+/// `get_dirty = true` 时只复制 `news` 里已置脏的列（统计场景：实例化后逐个赋值）；
+/// 反序列化得到的数据（本身没有脏标记）请传 `false`。
+pub fn mergeAny(
+    dal: *zcode.Dal,
+    comptime T: type,
+    comptime T2: type,
+    a: std.mem.Allocator,
+    source: *std.ArrayListUnmanaged(T),
+    news: []const T2,
+    comptime keys: []const []const u8,
+    trim: bool,
+    get_dirty: bool,
+) !MergeReport {
+    var report = MergeReport{};
+
+    // 键必须两边都能取到（编译期校验，避免运行期静默匹配失败）
+    comptime {
+        for (keys) |k| {
+            if (columnIndex(T, k) == null) @compileError("mergeAny: 目标类型缺少键列 " ++ k);
+            if (columnIndex(T2, k) == null) @compileError("mergeAny: 源类型缺少键列 " ++ k);
+        }
+    }
+
+    var map = std.StringHashMapUnmanaged(usize).empty;
+    defer {
+        var it = map.keyIterator();
+        while (it.next()) |k| a.free(k.*);
+        map.deinit(a);
+    }
+    for (source.items, 0..) |e, i| {
+        const k = try keyOfAlloc(T, a, e, keys);
+        const gop = try map.getOrPut(a, k);
+        if (gop.found_existing) a.free(k) else gop.value_ptr.* = i;
+    }
+
+    var matched = try a.alloc(bool, source.items.len);
+    defer a.free(matched);
+    @memset(matched, false);
+
+    var updates: std.ArrayListUnmanaged(T) = .empty;
+    defer updates.deinit(a);
+    var inserts: std.ArrayListUnmanaged(T) = .empty;
+    defer inserts.deinit(a);
+
+    for (news) |n| {
+        const k = try keyOfAlloc(T2, a, n, keys);
+        defer a.free(k);
+
+        if (map.get(k)) |i| {
+            _ = try copyFromAny(T, &source.items[i], n, true, get_dirty);
+            try updates.append(a, source.items[i]);
+            matched[i] = true;
+            report.updated += 1;
+        } else {
+            // 新键：新建一个 T，再把两边同名列搬过去（含主键列，如果 T2 有的话）
+            var fresh: T = .{};
+            _ = try copyFromAny(T, &fresh, n, true, get_dirty);
+            try inserts.append(a, fresh);
+            report.inserted += 1;
+        }
+    }
+
+    if (updates.items.len > 0) try saveList(dal, T, updates.items, .upsert);
+    if (inserts.items.len > 0) try saveList(dal, T, inserts.items, .insert);
+
+    if (trim) {
+        var keep: std.ArrayListUnmanaged(T) = .empty;
+        defer keep.deinit(a);
+        for (source.items, 0..) |e, i| {
+            if (!matched[i]) try keep.append(a, e);
+        }
+        for (keep.items) |*e| {
+            var s = try dal.openSessionForTable(T.meta.table_name);
+            defer s.deinit();
+            _ = try zcode.entity.delete(dal, e, &s);
+            report.deleted += 1;
+        }
+    }
+
+    return report;
 }
 
 fn saveList(dal: *zcode.Dal, comptime T: type, list: []const T, mode: zcode.SaveModes) !void {
@@ -599,4 +710,133 @@ test "IndexBy / CSV 往返" {
     try testing.expectEqualStrings("甲", back[0].Name);
     try testing.expectEqualStrings("含,逗号", back[0].Note);
     try testing.expectEqual(@as(i32, 2), back[1].Id);
+}
+
+// ── 跨类型合并用例 ─────────────────────────────────────────
+
+/// 统计结果类型：**只有** `Name` / `Note`（没有 `Id`），模拟「统计得到的新数据集」。
+const RecNew = struct {
+    dirty: zcode.entity.DirtyBits = 0,
+    Name: []const u8 = "",
+    Note: []const u8 = "",
+
+    pub const meta = zcode.entity.EntityMeta{
+        .name = "RecNew",
+        .table_name = "RecNew",
+        .fields = &.{
+            .{ .name = "Name", .data_type = .string, .length = 4 },
+            .{ .name = "Note", .data_type = .string },
+        },
+    };
+
+    pub fn columnValue(self: @This(), i: usize) Value {
+        return switch (i) {
+            0 => .{ .text = self.Name },
+            1 => .{ .text = self.Note },
+            else => .null,
+        };
+    }
+
+    pub fn setColumnValue(self: *@This(), i: usize, v: Value) !void {
+        switch (i) {
+            0 => self.Name = if (v == .text) v.text else "",
+            1 => self.Note = if (v == .text) v.text else "",
+            else => {},
+        }
+    }
+};
+
+test "CopyFromAny：只复制两边同名的列（主键不被清掉）" {
+    var dst = Rec{ .Id = 9, .Name = "旧", .Note = "旧备注" };
+    const src = RecNew{ .Name = "新", .Note = "新备注" };
+
+    const n = try copyFromAny(Rec, &dst, src, true, false);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i32, 9), dst.Id); // 源类型没有 Id → 保持原值
+    try testing.expectEqualStrings("新", dst.Name);
+    try testing.expectEqualStrings("新备注", dst.Note);
+    // set_dirty = true：被复制的两列置脏，Id 不脏
+    try testing.expect(!zcode.entity.isDirty(dst.dirty, 0));
+    try testing.expect(zcode.entity.isDirty(dst.dirty, 1));
+}
+
+test "MergeAny：命中更新 / 未命中插入 / trim 删除多余" {
+    const Dal = zcode.Dal;
+    const a = testing.allocator;
+
+    const xml =
+        \\<EntityModel><Tables><Table Name="Rec" TableName="Rec">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Name" DataType="String" Length="4" />
+        \\    <Column Name="Note" DataType="String" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    const m = try zcode.EntityModel.parse(a, xml);
+    // 必须用**文件库**：`:memory:` 每个连接一个独立库，而 `mergeAny` 会另开会话写库
+    const db_path = try zcode.File.UniqueTempName(a, "mergeany", ".db");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{db_path});
+    defer a.free(conn);
+
+    var dal = try Dal.initWithModel(a, conn, m);
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    // 库里先有 甲 / 乙 两行
+    const table = try dal.table("Rec");
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Name", .value = .{ .text = "甲" } },
+        .{ .name = "Note", .value = .{ .text = "旧甲" } },
+    });
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Name", .value = .{ .text = "乙" } },
+        .{ .name = "Note", .value = .{ .text = "旧乙" } },
+    });
+
+    var source: std.ArrayListUnmanaged(Rec) = .empty;
+    defer source.deinit(a);
+    {
+        const rows = try table.queryRows(&s, &zcode.Query.init(a));
+        for (rows) |row| {
+            try source.append(a, try zcode.entity.fromRow(Rec, row));
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), source.items.len);
+
+    // 新数据：甲 的备注要更新；丙 是新增；乙 没出现 → trim 后应删除
+    const news = [_]RecNew{
+        .{ .Name = "甲", .Note = "新甲" },
+        .{ .Name = "丙", .Note = "新丙" },
+    };
+    const report = try mergeAny(&dal, Rec, RecNew, a, &source, &news, &.{"Name"}, true, false);
+
+    try testing.expectEqual(@as(usize, 1), report.updated);
+    try testing.expectEqual(@as(usize, 1), report.inserted);
+    try testing.expectEqual(@as(usize, 1), report.deleted);
+
+    const after = try table.queryRows(&s, &zcode.Query.init(a));
+    try testing.expectEqual(@as(usize, 2), after.len);
+
+    var found_jia = false;
+    var found_bing = false;
+    for (after) |row| {
+        const name = row.get("Name").?.asText().?;
+        const note = row.get("Note").?.asText().?;
+        if (std.mem.eql(u8, name, "甲")) {
+            found_jia = true;
+            try testing.expectEqualStrings("新甲", note);
+        }
+        if (std.mem.eql(u8, name, "丙")) {
+            found_bing = true;
+            try testing.expectEqualStrings("新丙", note);
+        }
+        try testing.expect(!std.mem.eql(u8, name, "乙"));
+    }
+    try testing.expect(found_jia and found_bing);
 }

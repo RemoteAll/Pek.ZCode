@@ -505,6 +505,209 @@ fn pkWhereFromRow(
     return w;
 }
 
+// ── 多表归档（对应 C# `DbPackage.BackupAll` / `RestoreAll`）──────────────────
+//
+// C# 的 `BackupAll` 写一个 zip：里面一份 `Model.xml` + 每表一个数据文件。
+// Zig 侧口径一致，但**归档实现下沉在 `zzig`**（`zzig.zip` 负责多条目 zip，
+// `zzig.http.gzipCompressAlloc` 负责单流 gzip），本文件只负责「哪些表、怎么命名」。
+//
+// | 扩展名 | 形态 | 说明 |
+// |---|---|---|
+// | `.zip` | 多条目 | `<表名>.zcode` + 可选 `Model.xml`；**推荐**（可单独取出某张表） |
+// | `.gz` | 单流 | 多个包文本顺序拼接后整体 gzip；解压后按 `#zcode-package 1` 切块 |
+// | 其它 | 纯文本 | 多表时同样是拼接，便于人工查看 |
+
+pub const ArchiveKind = enum { text, gz, zip };
+
+/// 模型文件在归档里的固定名（与 C# `BackupAll` 一致）
+pub const model_entry_name = "Model.xml";
+/// 每张表的数据条目后缀
+pub const entry_suffix = ".zcode";
+
+pub fn archiveKindOfPath(path: []const u8) ArchiveKind {
+    if (std.ascii.endsWithIgnoreCase(path, ".zip")) return .zip;
+    if (std.ascii.endsWithIgnoreCase(path, ".gz") or std.ascii.endsWithIgnoreCase(path, ".gzip")) return .gz;
+    return .text;
+}
+
+/// 多表导出成**一个文本**（`#zcode-package 1` 块顺序拼接，gz / 纯文本都用它）。
+pub fn exportAllAlloc(gpa: std.mem.Allocator, s: *Session, tables: []const TableRef, opts: Options) ![]u8 {
+    var b = Buf.init(gpa);
+    defer b.deinit();
+    for (tables) |t| {
+        const text = try exportAlloc(gpa, s, t, opts);
+        defer gpa.free(text);
+        try b.add(text);
+        // 块之间留一个空行，便于人工阅读；解析端按 `#zcode-package` 切块，不依赖空行
+        if (text.len > 0 and text[text.len - 1] != '\n') try b.add("\n");
+        try b.add("\n");
+    }
+    return b.toOwnedSlice();
+}
+
+/// 多表导出到归档文件（按扩展名决定 zip / gz / 纯文本），返回写入行数。
+pub fn backupAllToFile(
+    gpa: std.mem.Allocator,
+    s: *Session,
+    tables: []const TableRef,
+    model_xml: ?[]const u8,
+    path: []const u8,
+    opts: Options,
+) !Result {
+    switch (archiveKindOfPath(path)) {
+        .zip => {
+            var w = @import("zzig").zip.Writer.init(gpa);
+            defer w.deinit();
+            if (model_xml) |xml| try w.addEntry(model_entry_name, xml, .deflate);
+
+            var result = Result{};
+            for (tables) |t| {
+                const text = try exportAlloc(gpa, s, t, opts);
+                defer gpa.free(text);
+                const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ t.table_name, entry_suffix });
+                defer gpa.free(name);
+                try w.addEntry(name, text, .deflate);
+                result.rows += countDataRows(text);
+            }
+            const bytes = try w.finish();
+            defer gpa.free(bytes);
+            try File.WriteAll(path, bytes);
+            result.pages = 1;
+            return result;
+        },
+        .gz => {
+            const text = try exportAllAlloc(gpa, s, tables, opts);
+            defer gpa.free(text);
+            const zipped = try @import("zzig").Http.gzipCompressAlloc(gpa, text, std.compress.flate.Compress.Options.default);
+            defer gpa.free(zipped);
+            try File.WriteAll(path, zipped);
+            return .{ .rows = countDataRows(text), .pages = 1 };
+        },
+        .text => {
+            const text = try exportAllAlloc(gpa, s, tables, opts);
+            defer gpa.free(text);
+            try File.WriteAll(path, text);
+            return .{ .rows = countDataRows(text), .pages = 1 };
+        },
+    }
+}
+
+/// 从归档文件恢复多表（表名来自归档内条目名 / 块头 `#table`，通过 `dal.table` 解析）。
+pub fn restoreAllFromFile(
+    gpa: std.mem.Allocator,
+    s: *Session,
+    dal: *@import("dal.zig").Dal,
+    path: []const u8,
+    opts: Options,
+) !Result {
+    const bytes = try File.ReadAllAlloc(gpa, path, 1024 * 1024 * 1024);
+    defer gpa.free(bytes);
+
+    switch (archiveKindOfPath(path)) {
+        .zip => {
+            var r = try @import("zzig").zip.Reader.init(gpa, bytes);
+            defer r.deinit();
+
+            var result = Result{};
+            for (r.entries, 0..) |e, i| {
+                if (!std.ascii.endsWithIgnoreCase(e.name, entry_suffix)) continue; // 跳过 Model.xml 等
+                const table_name = e.name[0 .. e.name.len - entry_suffix.len];
+                const table = dal.table(table_name) catch |err| {
+                    std.debug.print(
+                        "[zcode] 数据包恢复：归档里的表 {s} 在模型中不存在（{s}），跳过该条目\n",
+                        .{ table_name, @errorName(err) },
+                    );
+                    continue;
+                };
+                const text = r.extractAlloc(i) catch |err| {
+                    std.debug.print("[zcode] 数据包恢复：条目 {s} 解压失败（{s}），跳过\n", .{ e.name, @errorName(err) });
+                    continue;
+                };
+                defer gpa.free(text);
+                const one = try importAlloc(gpa, s, table, text, opts);
+                result.rows += one.rows;
+                result.errors += one.errors;
+                result.skipped += one.skipped;
+                result.pages += one.pages;
+            }
+            return result;
+        },
+        .gz => {
+            const text = try @import("zzig").Http.gzipDecompressAlloc(gpa, bytes);
+            defer gpa.free(text);
+            return importAllAlloc(gpa, s, dal, text, opts);
+        },
+        .text => return importAllAlloc(gpa, s, dal, bytes, opts),
+    }
+}
+
+/// 把合并后的包文本按 `#zcode-package 1` 切成多块，逐块按 `#table <名>` 落到对应表。
+pub fn importAllAlloc(
+    gpa: std.mem.Allocator,
+    s: *Session,
+    dal: *@import("dal.zig").Dal,
+    text: []const u8,
+    opts: Options,
+) !Result {
+    var result = Result{};
+    var rest = text;
+    while (rest.len > 0) {
+        // 找到本块起点（没有块头就说明格式不对，明确报错而不是静默导入 0 行）
+        const start = std.mem.indexOf(u8, rest, package_header) orelse {
+            if (std.mem.trim(u8, rest, " \t\r\n").len == 0) break;
+            std.debug.print("[zcode] 数据包恢复：剩余内容没有 `{s}` 块头，无法解析\n", .{package_header});
+            return error.MissingPackageHeader;
+        };
+        const block_start = start;
+        // 下一块起点：从块头之后继续找
+        const after = rest[block_start + package_header.len ..];
+        const next_rel = std.mem.indexOf(u8, after, package_header);
+        const block = if (next_rel) |nr| rest[block_start .. block_start + package_header.len + nr] else rest[block_start..];
+
+        const table_name = tableNameOfBlock(block) orelse {
+            std.debug.print("[zcode] 数据包恢复：块里缺少 `#table <名>`，无法确定目标表\n", .{});
+            return error.MissingTableHeader;
+        };
+        const table = dal.table(table_name) catch |err| {
+            std.debug.print(
+                "[zcode] 数据包恢复：块头里的表 {s} 在模型中不存在（{s}）\n",
+                .{ table_name, @errorName(err) },
+            );
+            return err;
+        };
+        const one = try importAlloc(gpa, s, table, block, opts);
+        result.rows += one.rows;
+        result.errors += one.errors;
+        result.skipped += one.skipped;
+        result.pages += one.pages;
+
+        rest = if (next_rel) |nr| rest[block_start + package_header.len + nr ..] else "";
+    }
+    return result;
+}
+
+fn tableNameOfBlock(block: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, block, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (!std.mem.startsWith(u8, line, "#table ")) continue;
+        const name = std.mem.trim(u8, line["#table ".len..], " \t");
+        if (name.len == 0) return null;
+        return name;
+    }
+    return null;
+}
+
+fn countDataRows(text: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        n += 1;
+    }
+    return n;
+}
+
 // ============================ 测试 ============================
 
 const testing = std.testing;
@@ -649,4 +852,105 @@ test "数据包：insert_ignore 跳过已有主键，upsert 覆盖" {
     const row1 = (try table.findByPk(&s, &.{.{ .int = 1 }})).?;
     try testing.expectEqualStrings("new", row1.get("Name").?.text);
     try testing.expectEqual(@as(i64, 11), row1.get("Age").?.int);
+}
+
+// ── 多表归档用例（zip / gz）──────────────────────────────────
+
+const archive_model_xml =
+    \\<?xml version="1.0" encoding="utf-8"?>
+    \\<EntityModel>
+    \\  <Tables>
+    \\    <Table Name="User" TableName="User">
+    \\      <Columns>
+    \\        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    \\        <Column Name="Name" DataType="String" Length="50" Nullable="True" />
+    \\        <Column Name="Age" DataType="Int32" Nullable="True" />
+    \\        <Column Name="JoinTime" DataType="DateTime" Nullable="True" />
+    \\      </Columns>
+    \\    </Table>
+    \\    <Table Name="Role" TableName="Role">
+    \\      <Columns>
+    \\        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    \\        <Column Name="Name" DataType="String" Length="50" Nullable="True" />
+    \\      </Columns>
+    \\    </Table>
+    \\  </Tables>
+    \\</EntityModel>
+;
+
+fn archiveDal(a: std.mem.Allocator) !Dal {
+    const m = try model.EntityModel.parse(a, archive_model_xml);
+    return Dal.initWithModel(a, "Data Source=:memory:;Provider=SQLite", m);
+}
+
+fn seedTwoTables(a: std.mem.Allocator, dal: *Dal, s: *Session) !struct { users: TableRef, roles: TableRef } {
+    _ = try dal.syncSchema(s);
+    const users = try dal.table("User");
+    const roles = try dal.table("Role");
+
+    try insertOne(s, users, "甲", 20);
+    try insertOne(s, users, "乙", 30);
+    _ = try roles.insert(s, &[_]sqlbuild.Field{
+        .{ .name = "Name", .value = .{ .text = "管理员" } },
+    });
+    _ = a;
+    return .{ .users = users, .roles = roles };
+}
+
+test "数据包：zip 多表归档（含 Model.xml）往返" {
+    const a = testing.allocator;
+    var dal = try archiveDal(a);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    const refs = try seedTwoTables(a, &dal, &s);
+    try testing.expectEqual(@as(i64, 2), try refs.users.count(&s, null));
+    try testing.expectEqual(@as(i64, 1), try refs.roles.count(&s, null));
+
+    // 固定路径（`.zig-cache/tmp` 一定存在）：便于用外部工具（python zipfile / 解压软件）复检产物
+    const path = ".zig-cache/tmp/dbpackage-archive.zip";
+
+    const out = try backupAllToFile(a, &s, &.{ refs.users, refs.roles }, archive_model_xml, path, .{});
+    defer @import("zzig").File.DeleteQuiet(path);
+
+    try testing.expectEqual(@as(usize, 3), out.rows);
+
+    // 清空后从归档恢复
+    _ = try s.execute("DELETE FROM \"User\"", &.{});
+    _ = try s.execute("DELETE FROM \"Role\"", &.{});
+    try testing.expectEqual(@as(i64, 0), try refs.users.count(&s, null));
+
+    const restored = try restoreAllFromFile(a, &s, &dal, path, .{});
+    try testing.expectEqual(@as(usize, 3), restored.rows);
+
+    try testing.expectEqual(@as(i64, 2), try refs.users.count(&s, null));
+    try testing.expectEqual(@as(i64, 1), try refs.roles.count(&s, null));
+    const role = (try refs.roles.findByPk(&s, &.{.{ .int = 1 }})).?;
+    try testing.expectEqualStrings("管理员", role.get("Name").?.text);
+}
+
+test "数据包：gz 单表流归档往返（多表按块头切分）" {
+    const a = testing.allocator;
+    var dal = try archiveDal(a);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    const refs = try seedTwoTables(a, &dal, &s);
+
+    const path = try @import("zzig").File.UniqueTempName(a, "dbpackage", ".gz");
+    defer a.free(path);
+    defer @import("zzig").File.DeleteQuiet(path);
+
+    const out = try backupAllToFile(a, &s, &.{ refs.users, refs.roles }, null, path, .{});
+    try testing.expectEqual(@as(usize, 3), out.rows);
+
+    _ = try s.execute("DELETE FROM \"User\"", &.{});
+    _ = try s.execute("DELETE FROM \"Role\"", &.{});
+
+    const restored = try restoreAllFromFile(a, &s, &dal, path, .{});
+    try testing.expectEqual(@as(usize, 3), restored.rows);
+    try testing.expectEqual(@as(i64, 2), try refs.users.count(&s, null));
+    try testing.expectEqual(@as(i64, 1), try refs.roles.count(&s, null));
 }

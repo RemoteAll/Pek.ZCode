@@ -20,9 +20,23 @@
   **备份** / **反向工程**（SQLite·MySQL·PostgreSQL·SQL Server） / 代码生成。
 - 2026-11-12 第二十一~二十二轮补齐：`fieldcache` / `setting`（XCodeSetting 等价） / `sqltemplate` / `expression` /
   `batch`（BatchFinder+BatchOption） / `dbcache`（LazyConsumer+CacheInvalidator+DataCache+DbCache） /
-  `dbpackage`（表级导出·导入·跳库同步，无 zip 归档）。
-- 未实现：SQL Server（TDS）/ Oracle（OCI）、C# `DbTable` v3 二进制互通（`Db/Query` 现为 JSON 行列）。
+  `dbpackage`（表级导出·导入·跳库同步）。
+- 2026-11-13 第二十三轮补齐（原「不做」三件全部落地）：
+  - `zzig.db.tdengine` / `zzig.db.influxdb` 两个时序库驱动（REST/HTTP，带回环用例）；
+  - `dbpackage.backupAllToFile` / `restoreAllFromFile` 多表归档（`.zip` / `.gz` / 纯文本三档）；
+    **zip 实现下沉 `zzig.zip`**（store/deflate），**gzip 复用 `zzig.Http.gzip*`** —— 两者分工不要搞反：多文件用 zip，单流压缩用 gzip；
+  - `entity_ext.mergeAny` + `copyFromAny`（≂ C# `Merge<T,T2>`，键列编译期校验，只复制两边同名列）。
+- 未实现：Oracle（TNS/OCI）、MongoDB（BSON）、ClickHouse（HTTP 8123）、DuckDB（嵌入式）四家**执行驱动**；
+  C# `DbTable` v3 二进制互通（`Db/Query` 现为 JSON 行列）。
   远程服务已做：`src/dbservice.zig` + `src/dbclient.zig`（HTTP/1.1 服务端在 `zzig/src/http/server.zig`）。
+- **口径（用户 2026-11-13 明确）：迁移优先，不要以「本机无实例」为由拒绝实现**——
+  缺的方法要实现；公共能力下沉 `zzig`；**无实例的驱动用回环假服务端（`zzig/src/db/http_loopback_test.zig` 范式）守住协议**，
+  真库验证留到有条件时。
+- **执行层矩阵（2026-11-13）**：已接 6 家协议（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
+  **InfluxDB HTTP**）+ 2 组协议复用（**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
+  - InfluxDB **不是 SQL 库**：`insert`/`upsert` 走 **Line Protocol**（`dbtable.influxLineAlloc`：时间列→行尾纳秒、
+    主键→tag、其余→field），查询走 Flux（v2）或 InfluxQL（v1）；不要试图给它生成 `INSERT INTO`。
+  - TDengine REST **没有预处理语句**：`?` 必须客户端内联（`tdengine.inlineParamsAlloc`，跳过字符串/注释里的 `?`）。
 - **两级缓存已逐条对齐 C#（`docs/决策记录.md` 第（三十五）节）**：
   - `cache.Cache(T)`（`Meta.Cache`，整表）：**硬内存上限 = `MaxCacheCount` 行**，装载带 `LIMIT max_rows+1`，
     超限**一行不留** + 60s 静默期；`MaxCacheCount <= 0` 永不缓存。读路径无锁（不可变快照 + 原子发布）。

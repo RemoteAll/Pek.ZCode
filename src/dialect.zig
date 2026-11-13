@@ -1038,6 +1038,7 @@ pub const ServerVersion = struct {
         percona = 3,
         sqlite = 4,
         postgresql = 5,
+        tdengine = 6,
     };
 
     /// 解析服务端版本串。认得的形态（**均来自真库实测**）：
@@ -1101,6 +1102,7 @@ pub const ServerVersion = struct {
             .percona => " Percona",
             .sqlite => " SQLite",
             .postgresql => " PostgreSQL",
+            .tdengine => " TDengine",
         };
         return std.fmt.allocPrint(gpa, "{d}.{d}.{d}{s}", .{ self.major, self.minor, self.patch, suffix });
     }

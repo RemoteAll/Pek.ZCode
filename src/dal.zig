@@ -15,6 +15,8 @@ const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
 const postgres = @import("zzig").postgres;
 const tds = @import("zzig").tds;
+const tdengine = @import("zzig").tdengine;
+const influxdb = @import("zzig").influxdb;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -57,6 +59,15 @@ pub const ConnectionOptions = struct {
     synchronous: ?[]const u8 = null,
     /// `CacheSize=-64000`：`null` = 用库默认（负数=KB，正数=页数）
     cache_size: ?i32 = null,
+    // ── InfluxDB 专属（`Provider=InfluxDB` 时才用）───────────
+    /// v2 令牌（`Token=`；也可写 `Password=`）
+    token: []const u8 = "",
+    /// v2 组织（`Org=` / `Organization=`）
+    org: []const u8 = "",
+    /// v2 桶（`Bucket=`）。配了 bucket 就走 v2，否则走 v1 的 `Database`
+    bucket: []const u8 = "",
+    /// HTTP 驱动（TDengine / InfluxDB）的请求超时（毫秒；0 = 不限）
+    timeout_ms: u64 = 30_000,
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
     extra: []model.KeyValue = &.{},
 
@@ -68,6 +79,9 @@ pub const ConnectionOptions = struct {
         if (self.password.len > 0) gpa.free(self.password);
         if (self.database.len > 0) gpa.free(self.database);
         if (self.ssl_ca.len > 0) gpa.free(self.ssl_ca);
+        if (self.token.len > 0) gpa.free(self.token);
+        if (self.org.len > 0) gpa.free(self.org);
+        if (self.bucket.len > 0) gpa.free(self.bucket);
         if (self.extra.len > 0) gpa.free(self.extra);
         if (self.journal_mode) |v| gpa.free(v);
         if (self.synchronous) |v| gpa.free(v);
@@ -80,6 +94,9 @@ pub const ConnectionOptions = struct {
         self.database = "";
         self.ssl_ca = "";
         self.pipe_name = "";
+        self.token = "";
+        self.org = "";
+        self.bucket = "";
         self.extra = &.{};
     }
 };
@@ -90,7 +107,8 @@ pub const ConnectionOptions = struct {
 /// `Migration` / `ShowSql` / `Readonly` / `Pooling`；其余键进 `extra`。
 pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !ConnectionOptions {
     var opts = ConnectionOptions{};
-    errdefer if (opts.data_source.len > 0) gpa.free(opts.data_source);
+    // 任何中途失败都要把已复制的字段还回去（`deinit` 对空字段是安全的）
+    errdefer opts.deinit(gpa);
     var extra: std.ArrayList(model.KeyValue) = .empty;
     errdefer extra.deinit(gpa);
 
@@ -173,6 +191,16 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
                 value);
         } else if (std.ascii.eqlIgnoreCase(key, "CacheSize")) {
             opts.cache_size = std.fmt.parseInt(i32, value, 10) catch null;
+        } else if (std.ascii.eqlIgnoreCase(key, "Token")) {
+            // InfluxDB v2 令牌（`Authorization: Token xxx`）
+            opts.token = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Org") or std.ascii.eqlIgnoreCase(key, "Organization")) {
+            opts.org = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Bucket")) {
+            opts.bucket = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "Timeout") or std.ascii.eqlIgnoreCase(key, "TimeoutMs")) {
+            // HTTP 驱动（TDengine / InfluxDB）的请求超时（毫秒）
+            opts.timeout_ms = std.fmt.parseInt(u64, value, 10) catch opts.timeout_ms;
         } else {
             try extra.append(gpa, .{ .key = key, .value = value });
         }
@@ -346,7 +374,7 @@ pub const Dal = struct {
                     .strategy = readwrite.Strategy.init(gpa),
                 };
             },
-            .mysql => {
+            .mysql, .nova => {
                 // MySQL 连接串的 "host" 可能写在 Server / Data Source 任一键里
                 if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
                     opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
@@ -360,13 +388,14 @@ pub const Dal = struct {
                     .strategy = readwrite.Strategy.init(gpa),
                 };
             },
-            .postgresql => {
+            .postgresql, .kingbase, .highgo, .vastbase => {
                 if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
                     opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
                 }
                 if (opts_owned.server.len == 0) return error.NoConnection;
                 if (opts_owned.database.len == 0) return error.NoDatabase;
                 // 端口缺省以方言为准（PG 5432），不能沿用 MySQL 的 3306
+                // 金仓 / 瀚高 / 海量都是 PG 协议分支，端口同 5432
                 if (opts_owned.port == 3306) opts_owned.port = postgres.default_port;
                 return Dal{
                     .gpa = gpa,
@@ -384,6 +413,35 @@ pub const Dal = struct {
                 if (opts_owned.database.len == 0) return error.NoDatabase;
                 // 端口缺省以方言为准（SQL Server 1433）
                 if (opts_owned.port == 3306) opts_owned.port = tds.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
+            .tdengine => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                // 端口缺省以方言为准（TDengine REST 6041）
+                if (opts_owned.port == 3306) opts_owned.port = tdengine.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
+            .influxdb => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                // v2 用 bucket / v1 用 database：两者都没配就无法定位数据
+                if (opts_owned.bucket.len == 0 and opts_owned.database.len == 0) return error.NoDatabase;
+                if (opts_owned.port == 3306) opts_owned.port = influxdb.default_port;
                 return Dal{
                     .gpa = gpa,
                     .model = m,
@@ -657,7 +715,7 @@ pub const Dal = struct {
                 });
                 return Session.init(self.gpa, .sqlite, db);
             },
-            .mysql => {
+            .mysql, .nova => {
                 const conn = try mysql.Conn.open(self.gpa, .{
                     .host = opts.server,
                     .port = opts.port,
@@ -668,9 +726,9 @@ pub const Dal = struct {
                     .ssl_ca = opts.ssl_ca,
                     .compress = opts.compress,
                 });
-                return Session.initWithDriver(self.gpa, .mysql, .{ .mysql = conn });
+                return Session.initWithDriver(self.gpa, opts.provider, .{ .mysql = conn });
             },
-            .postgresql => {
+            .postgresql, .kingbase, .highgo, .vastbase => {
                 const conn = try postgres.Conn.open(self.gpa, .{
                     .host = opts.server,
                     .port = opts.port,
@@ -678,7 +736,7 @@ pub const Dal = struct {
                     .password = opts.password,
                     .database = opts.database,
                 });
-                return Session.initWithDriver(self.gpa, .postgresql, .{ .postgres = conn });
+                return Session.initWithDriver(self.gpa, opts.provider, .{ .postgres = conn });
             },
             .sqlserver => {
                 const conn = try tds.Conn.open(self.gpa, .{
@@ -690,6 +748,33 @@ pub const Dal = struct {
                     .pipe_name = opts.pipe_name,
                 });
                 return Session.initWithDriver(self.gpa, .sqlserver, .{ .sqlserver = conn });
+            },
+            .tdengine => {
+                const conn = try tdengine.Conn.open(self.gpa, .{
+                    .host = opts.server,
+                    .port = opts.port,
+                    .user = if (opts.user.len > 0) opts.user else "root",
+                    .password = opts.password,
+                    .database = opts.database,
+                    .base_url = if (std.ascii.startsWithIgnoreCase(opts.server, "http")) opts.server else "",
+                    .timeout_ms = opts.timeout_ms,
+                });
+                return Session.initWithDriver(self.gpa, .tdengine, .{ .tdengine = conn });
+            },
+            .influxdb => {
+                const use_url = std.ascii.startsWithIgnoreCase(opts.server, "http");
+                const conn = try influxdb.Conn.open(self.gpa, .{
+                    .url = if (use_url) opts.server else "",
+                    .host = if (use_url) "127.0.0.1" else opts.server,
+                    .port = opts.port,
+                    .tls = std.ascii.startsWithIgnoreCase(opts.server, "https"),
+                    .token = if (opts.token.len > 0) opts.token else opts.password,
+                    .org = opts.org,
+                    .bucket = opts.bucket,
+                    .database = opts.database,
+                    .timeout_ms = opts.timeout_ms,
+                });
+                return Session.initWithDriver(self.gpa, .influxdb, .{ .influxdb = conn });
             },
             else => return error.Unsupported,
         }
@@ -714,7 +799,7 @@ pub const Dal = struct {
     pub fn supportsPooling(self: *const Dal) bool {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
-            .mysql, .postgresql, .sqlserver => true,
+            .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .nova, .kingbase, .highgo, .vastbase => true,
             else => false,
         };
     }
@@ -1048,7 +1133,10 @@ pub const Dal = struct {
         const sql = switch (opts.provider) {
             .sqlite => "SELECT sqlite_version()",
             .mysql => "SELECT VERSION()",
-            .postgresql => "SHOW server_version",
+            .nova => "SELECT VERSION()",
+            .postgresql, .kingbase, .highgo, .vastbase => "SHOW server_version",
+            // TDengine 有服务器版本函数；InfluxDB 没有 SQL，走 `GET /ping` 的响应头（本类不探）
+            .tdengine => "SELECT SERVER_VERSION()",
             else => {
                 // SQL Server 的 `@@VERSION` 形如 `Microsoft SQL Server 2022 (RTM) - 16.0.1000.6`，
                 // 首个数字是发布年份，解析必错；它也不用这两个能力，直接保守档。
@@ -1097,8 +1185,9 @@ pub const Dal = struct {
         if (resolved.flavor == .unknown) {
             resolved.flavor = switch (opts.provider) {
                 .sqlite => .sqlite,
-                .mysql => .mysql,
-                .postgresql => .postgresql,
+                .mysql, .nova => .mysql,
+                .postgresql, .kingbase, .highgo, .vastbase => .postgresql,
+                .tdengine => .tdengine,
                 else => .unknown,
             };
         }
@@ -1986,6 +2075,33 @@ test "连接串缺 Provider 时默认 SQLite，未知 Provider 报错" {
 
     try std.testing.expectEqual(DatabaseKind.sqlite, opts.provider);
     try std.testing.expectError(error.Unsupported, parseConnectionString(a, "Data Source=x;Provider=NoSuchDb"));
+}
+
+test "连接串：时序库 / 国产库 Provider 与 InfluxDB 专属键" {
+    const a = std.testing.allocator;
+
+    var td = try parseConnectionString(a, "Provider=TDengine;Server=127.0.0.1;User=root;Password=taosdata;Database=power");
+    defer td.deinit(a);
+    try std.testing.expectEqual(DatabaseKind.tdengine, td.provider);
+    try std.testing.expectEqualStrings("root", td.user);
+
+    var inf = try parseConnectionString(a, "Provider=InfluxDB;Server=http://127.0.0.1:8086;Token=tok;Org=myorg;Bucket=mybucket;Timeout=5000");
+    defer inf.deinit(a);
+    try std.testing.expectEqual(DatabaseKind.influxdb, inf.provider);
+    try std.testing.expectEqualStrings("tok", inf.token);
+    try std.testing.expectEqualStrings("myorg", inf.org);
+    try std.testing.expectEqualStrings("mybucket", inf.bucket);
+    try std.testing.expectEqual(@as(u64, 5000), inf.timeout_ms);
+
+    // 国产库：金仓 / 瀚高 / 海量走 PG 协议，NovaDb 走 MySQL 协议（Provider 别名也要认）
+    try std.testing.expectEqual(DatabaseKind.kingbase, DatabaseKind.fromProvider("Kingbase") orelse .sqlite);
+    try std.testing.expectEqual(DatabaseKind.highgo, DatabaseKind.fromProvider("瀚高") orelse .sqlite);
+    try std.testing.expectEqual(DatabaseKind.vastbase, DatabaseKind.fromProvider("VastBase") orelse .sqlite);
+    try std.testing.expectEqual(DatabaseKind.nova, DatabaseKind.fromProvider("NovaDB") orelse .sqlite);
+
+    // 没有 bucket 也没有 database 的 InfluxDB 连接串无法定位数据 → 明确报错
+    const m = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    try std.testing.expectError(error.NoDatabase, Dal.initWithModel(a, "Provider=InfluxDB;Server=127.0.0.1", m));
 }
 
 test "sync_schema 幂等（临时文件库）" {

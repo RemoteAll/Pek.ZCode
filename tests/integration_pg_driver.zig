@@ -123,4 +123,3 @@ test "PostgreSQL 驱动：预处理语句复用（命中缓存 / DDL 后自动�
 
     _ = try conn.exec("DROP TABLE IF EXISTS zcode_pg_stmt", &.{});
 }
-

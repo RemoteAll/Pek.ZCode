@@ -43,8 +43,8 @@
 | 全局设置 | `Setting.cs` / `XCodeSetting` | — | `src/setting.zig` | ✅ 字段与默认值逐项对齐（Debug/ShowSQL/TraceSQLTime/SQLMaxLength/UseParameter/BatchSize/Migration/缓存过期…），支持 `Key=Value` 文本读写与未识别键上报；**唯一差异：`ShowSQL` 默认 `false`**（C# 发布版因 `XCode.Debug=false` 实际也是关的，本仓无 DEBUG/RELEASE 之分，直接落地「默认关、配置开」） |
 | SQL 模版 / 显示选项 | `Configuration/{SqlTemplate,ShowInOption}`、`Attributes/ModelSortMode` | — | `src/sqltemplate.zig` | ✅ `-- [方言]` 分段解析 + 回落默认；`ShowInOption` 三种写法（具名列表+宏 / 管道 5 段 / 5 字符掩码）；`ModelSortMode` 枚举 |
 | 缓存协调与表缓存 | `Cache/{CacheInvalidator,DataCache,DbCache,LazyConsumer}` | — | `src/dbcache.zig` | ✅ 分布式版本号（可插 Provider + 内存实现）联动本地失效；运行数据缓存（表行数 + 字段键值，可落文本）；**表当缓存**（Name/Value/CreateTime/ExpiredTime + 过期清理）；惰性串行消费者（空闲不占线程） |
-| 数据包 | `DataAccessLayer/DbPackage` | — | `src/dbpackage.zig` | ✅ 表级导出/导入/跨库同步（按页抽取，内存只留一页）；四种保存模式；**未做**：`.gz` / `zip` 多表归档（本仓与 zzig 都没有 zip 实现）、Actor 双线程并行 |
-| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、常见类型解码、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**、集成认证/MARS/TEXT-TEXTIMAGE/sql_variant 未做；❌ Oracle（OCI/TNS）**未做**（无 oci.dll/libclntsh 也无实例，不能验证） |
+| 数据包 | `DataAccessLayer/DbPackage` | — | `src/dbpackage.zig` | ✅ 表级导出/导入/跨库同步（按页抽取，内存只留一页）；四种保存模式；✅ **多表归档** `backupAllToFile` / `restoreAllFromFile`：`.zip`（每表一个 `<表>.zcode` 条目 + 可选 `Model.xml`，归档实现下沉 `zzig.zip`）、`.gz`（多块文本整体 gzip，`zzig.http.gz*`）、纯文本三档，按扩展名自动选择；**未做**：Actor 双线程并行（单线程流水已足够，并行需背压） |
+| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig`、`db/tdengine.zig`、`db/influxdb.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数、命名预处理语句复用；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**；✅ **TDengine（REST `/rest/sql`，6041）**：Basic 鉴权、`code/column_meta/data` 与 2.x `status/head` 两代响应、参数客户端内联、`SERVER_VERSION()` 探测；✅ **InfluxDB（HTTP）**：v2 `/api/v2/write` + `/api/v2/query`（Flux 注解 CSV）、v1 `/write` + `/query`（InfluxQL JSON）、`insert`/`upsert` 走 **Line Protocol**（列分时间/标签/字段，与 C# `BuildLineProtocol` 一致）；✅ **PG 系国产库**（金仓/瀚高/海量）复用 PostgreSQL 驱动、**NovaDb** 复用 MySQL 驱动；❌ 仍未做：Oracle（TNS/OCI 协议体量等同再造一个 TDS，且无库无实例）、MongoDB（BSON 协议）、ClickHouse（HTTP 8123 可做，待下轮）、DuckDB（嵌入式库） |
 
 ## 2. 逐项语义对齐（已实现部分）
 
@@ -82,8 +82,9 @@ DuckDB / ClickHouse / TDengine / HANA / Firebird / DB2 / 达孟（DaMeng）/ IRI
 `Access.cs` / `SqlCe.cs` / `NovaDb.cs` / `Tdengine.cs`）；自增子句与分页也按各自 `GetFieldConstraints` / `PageSplit` 实现
 （Db2 与达孟 rownum 双层、Firebird `ROWS a TO b`、Access/SqlCe 只支持首页 `TOP`、HANA/IRIS/Nova `AUTO_INCREMENT`…）。
 
-**仍未实现**：`mongodb`（文档库，无 SQL）与 `influxdb`（Line Protocol）—— 它们**不是 SQL 库**，`isImplemented()` 永远为 false，
-建表/分页一律 `error.Unsupported`。DuckDB / ClickHouse 在 C# 侧没有静态类型表（走驱动自带 schema），
+**仍未实现（SQL 方言层）**：`mongodb`（文档库，无 SQL）与 `influxdb`（Line Protocol）—— 它们**不是 SQL 库**，`isImplemented()` 永远为 false，
+建表/分页一律 `error.Unsupported`。**注（2026-11-13）**：InfluxDB 的**驱动**已接（写入 Line Protocol / 查询 Flux·InfluxQL），
+只是它们不走 SQL 建表与分页，两者不矛盾。DuckDB / ClickHouse 在 C# 侧没有静态类型表（走驱动自带 schema），
 这里的类型名按两者**原生类型名**给出（DuckDB 兼容 PG 类型名、ClickHouse 用 `Int*/String/Decimal(p, s)`）。
 
 **覆盖审计（机器可验，2026-11-12）**：`zig build audit-dialects` —— 把 19 个可实现方言逐个跑一遍
@@ -283,7 +284,7 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 | SQLite 通过 DLL 动态加载 | 不链 libc / UCRT（`-lc` 在 Win7 起不来）；也便于替换 SQLite 版本 |
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
 | `Db/Query` 默认回 JSON 行列（二进制需 `?format=packet`） | Rust 版也是 JSON；二进制模式是为 C# `DbTable.Read` 互通而加，两者并存不改变旧行为。C# 侧 `DbController.Query` 只有二进制一种形态（它的 `ToPacket` 自己标着“暂时有问题”），所以“跟 C# 一模一样”就只能二选一：默认 JSON 保持与 Rust 一致，需要 C# 互通时客户端显式要 packet |
-| Oracle 执行驱动未做 | 无 `oci.dll` / `libclntsh`、也无实例：写了也无法验证，违反“实测优先” |
+| Oracle 执行驱动**待做**（改用纯协议实现，不再依赖 `oci.dll`） | 原计划走 OCI（无 `oci.dll` / `libclntsh`、也无实例）；2026-11-13 已定口径：**按 TNS/OCI 线协议自实现**（与 MySQL/PG/TDS 同路子），排在 ClickHouse / MongoDB 之后 |
 | `TimeExtractor` 空窗时把起点推进到窗口末尾 | C# 版空窗只加倍步进、`StartTime` 不动，步进封顶到 1 天后就对同一段空区间**反复查询（原地死循环）**；这里必须能终止 |
 | `stat` 的 `avg` 直接报 `error.Unsupported` | C# 的均值由业务层「先读再算」；本库不提供假的原子实现，要求调用方自己维护 `Sum` + `Count` |
 | `StatModel.init` 不截断、`StatModel.at` 截断 | 与 C# 一致（C# 是 `Fill`/`Split` 才截断）；分开两个构造器让“要不要截断”显式化，避免静默改变时间值 |
@@ -369,12 +370,12 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `DataAccessLayer/WindowFunction` | `window.zig` | 已迁移 |
 | `DataAccessLayer/ReadWriteStrategy` | `readwrite.zig` | 已迁移 |
 | `DataAccessLayer/MetaData/*`（`DbMetaData.GetSchema`） | `reverse.zig`（SQLite / MySQL / PostgreSQL / SQL Server） | 已迁移（PG / SQL Server 的查结构 SQL 尚未在真库实测） |
-| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds}` 执行层 | 部分：SQL 生成层齐了；执行层只有 4 家驱动（其余无客户端库/无实例）。**预处理语句复用**：MySQL（2026-11-11）与 PostgreSQL（2026-11-13）均已做（PG 实测 1.64×） |
-| `DataAccessLayer/DbPackage`（数据包导入导出） | `dbpackage.zig`（表级导出/导入/跨库同步，四种保存模式） | 部分：`.gz` / `zip` 多表归档与 Actor 并行未做 |
+| `DataAccessLayer/Database/*`（25 个驱动） | `dialect.zig`（**SQL 生成层全方言**：类型/DDL/分页/占位符/引用）+ `zzig.db.{sqlite,mysql,postgres,tds,tdengine,influxdb}` 执行层 | 部分：SQL 生成层齐了；执行层已接 6 家（SQLite / MySQL / PostgreSQL / SQL Server / TDengine REST / InfluxDB HTTP），外加**PG 系国产库（金仓/瀚高/海量）复用 PG 驱动、NovaDb 复用 MySQL 驱动**。**预处理语句复用**：MySQL（2026-11-11）与 PostgreSQL（2026-11-13）均已做（PG 实测 1.64×） |
+| `DataAccessLayer/DbPackage`（数据包导入导出） | `dbpackage.zig`（表级导出/导入/跨库同步，四种保存模式；`backupAllToFile`/`restoreAllFromFile` 三档归档） | 已迁移（zip / gz / 纯文本；Actor 并行未做） |
 | `DataAccessLayer/XDbConnectionStringBuilder` | `dal.parseConnectionString` | 已迁移 |
 | `Entity/Entity*`、`EntitySession`、`IEntityPersistence` | `entity.zig`、`dbtable.zig`、`interceptor.zig` | 已迁移（按表/对象/脏更新三层） |
 | `Entity/EntityQueue`、`EntitySplit`、`EntityTransaction` | `entity_queue.zig`、`shards.zig`、`session.zig`（嵌套事务 + Scoped） | 已迁移 |
-| `Entity/EntityExtension`（71KB 扩展方法集） | `entity_ext.zig`：`hasDirty`/`clearDirty`/`dirtyCount`/`dirtyNamesAlloc`/`dirtyUnionOf*`（≂`GetDirtyColumns`）、`cloneAlloc`（≂`Clone`）、`copyFrom`（≂`CopyFrom`）、`checkRequired`（≂`Valid`）、`indexByAlloc`（≂`ToDictionary`）、`trimExtraLong`（≂`TrimExtraLong`）、`merge`（≂`Merge<T>`）、`saveCsvAlloc`/`loadCsvAlloc`（≂ CSV 导出/`LoadCsv`） | 已迁移（**未做**：跨类型 `Merge<T,T2>`；`LoadFile` 等价于调用方读文件 + `loadCsvAlloc`） |
+| `Entity/EntityExtension`（71KB 扩展方法集） | `entity_ext.zig`：`hasDirty`/`clearDirty`/`dirtyCount`/`dirtyNamesAlloc`/`dirtyUnionOf*`（≂`GetDirtyColumns`）、`cloneAlloc`（≂`Clone`）、`copyFrom`（≂`CopyFrom`）、`checkRequired`（≂`Valid`）、`indexByAlloc`（≂`ToDictionary`）、`trimExtraLong`（≂`TrimExtraLong`）、`merge`（≂`Merge<T>`）、`mergeAny` + `copyFromAny`（≂ `Merge<T,T2>`）、`saveCsvAlloc`/`loadCsvAlloc`（≂ CSV 导出/`LoadCsv`） | 已迁移（`LoadFile` 等价于调用方读文件 + `loadCsvAlloc`） |
 | `Entity/IEntityModule`（实体模块钩子：Time/User/Trace） | `interceptor.zig`（审计列补全，等价于 ThreeModule） | 等价 |
 | `Extension/数据缓存` | `cache.zig` | 已迁移 |
 | `Linq/EntityQueryProvider`（表达式树 → SQL） | `query.zig`（结构化 `Where`，无表达式树） | 不适用（Zig 无 LINQ） |
@@ -390,15 +391,17 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 | `Transform/*` | `extract.zig` | 已迁移 |
 | `Tree/EntityTree` | `tree.zig` | 已迁移 |
 | `Exceptions/*` | `root.zig` 的 `Error` 错误集 + 具体错误名 | 等价 |
-| `InfluxDB/`、`TDengine/`（时序库专用协议驱动） | — | **未做** |
+| `InfluxDB/`、`TDengine/`（时序库专用驱动） | `zzig.db.{tdengine,influxdb}`（TDengine REST `/rest/sql`；InfluxDB v1/v2 HTTP + Line Protocol）+ `dbtable.influxLineAlloc`（列分时间/标签/字段） | 已迁移（无实例；用**回环假服务端**端到端用例覆盖请求/响应协议） |
 | `XCodeTool/`（代码生成模板引擎） | `codegen.zig` + `tools/zcodegen.zig`（`Model.xml` → Zig 实体，带元数据/索引/辅助函数）+ `tools/gencheck.zig` 生成后自检 | 已迁移（Razor 模板引擎不适用：Zig 侧只需生成代码，不需要模板语言） |
 | `Setting.cs`（全局配置：`DataAccessLayer`/`Debug`/`ShowSQL` 等） | `setting.zig`（字段与默认值逐项对齐 + `Key=Value` 读写） | 已迁移（无面板元数据） |
 
-**一句话结论**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取/`Membership`）已覆盖；
-**剩余未做项 = 三件**：① `InfluxDB` / `TDengine` 两个时序库驱动（本机无实例，不能实测）；
-② `DbPackage` 的 `.gz` / `zip` 多表归档（本仓与 zzig 都没有 zip 实现）；
-③ 跨类型 `EntityExtension.Merge<T,T2>`（跨语言类型映射靠猜会错，不接）。
-**执行层仍只有 4 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server），其余 21 个方言只有 SQL 生成层（本机无实例可验证）。
+**一句话结论（2026-11-13 更新）**：ORM 主链路（模型/方言/查询/会话/表/实体/缓存/分页/事务/迁移/远程服务/统计/抽取/`Membership`）已覆盖；
+原来“不做”的三件已全部落地：① `InfluxDB` / `TDengine` 驱动（REST/HTTP，无实例 → 回环用例验证协议）；
+② `DbPackage` 的 `.gz` / `zip` 多表归档（zip 实现下沉到 `zzig.zip`，现已与 Python `zipfile`/`gzip` 互操作复检）；
+③ 跨类型 `EntityExtension.Merge<T,T2>`（`mergeAny` + `copyFromAny`）。
+**执行层 = 6 家协议 + 2 组协议复用**（SQLite / MySQL / PostgreSQL / SQL Server / TDengine / InfluxDB；金仓·瀚高·海量→PG，Nova→MySQL）。
+**真正剩下的**：Oracle（TNS/OCI）、MongoDB（BSON）、ClickHouse（HTTP 8123）、DuckDB（嵌入式）四家执行驱动，
+以及其余方言仍然只有 SQL 生成层——这些需要「协议实现 + 真库/实例」才能交付，列在下一轮排队。
 
 > 台账保鲜纪律（2026-11-13 实战教训）：这张表曾把 `Membership` 的 `UserStore`/`PinYin`/`Area` 与
 > `EntityExtension` 的 `Clone`/`CopyFrom`/`Valid`/`ToDictionary` 记成「未做」，而它们**早已实现**（见决策记录第二十五~三十节），

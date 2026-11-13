@@ -15,6 +15,8 @@ const sqlite = @import("zzig").sqlite;
 const mysql = @import("zzig").mysql;
 const postgres = @import("zzig").postgres;
 const tds = @import("zzig").tds;
+const tdengine = @import("zzig").tdengine;
+const influxdb = @import("zzig").influxdb;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const setting = @import("setting.zig");
@@ -189,12 +191,16 @@ pub const IsolationLevel = enum {
     }
 };
 
-/// 会话底层驱动（SQLite / MySQL / PostgreSQL / SQL Server；其它方言在 Dal 层已报 `error.Unsupported`）。
+/// 会话底层驱动（SQLite / MySQL / PostgreSQL / SQL Server / TDengine / InfluxDB）。
 pub const Driver = union(enum) {
     sqlite: sqlite.Db,
     mysql: mysql.Conn,
     postgres: postgres.Conn,
     sqlserver: tds.Conn,
+    /// TDengine：REST `/rest/sql`；无自增、无事务
+    tdengine: tdengine.Conn,
+    /// InfluxDB：`execute` = 写 Line Protocol，`queryRows` = Flux / InfluxQL
+    influxdb: influxdb.Conn,
 };
 
 pub const Session = struct {
@@ -249,6 +255,8 @@ pub const Session = struct {
             .mysql => |*conn| conn.deinit(),
             .postgres => |*conn| conn.deinit(),
             .sqlserver => |*conn| conn.deinit(),
+            .tdengine => |*conn| conn.deinit(),
+            .influxdb => |*conn| conn.deinit(),
         }
     }
 
@@ -445,6 +453,21 @@ pub const Session = struct {
                 };
                 return @intCast(n);
             },
+            .tdengine => |*conn| {
+                const n = conn.exec(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
+            .influxdb => |*conn| {
+                // InfluxDB 的「执行」= 写 Line Protocol（与 C# `InfluxDBSession.Insert` 一致）
+                conn.write(self.arena.allocator(), sql) catch |e| {
+                    std.debug.print("[zcode] InfluxDB 写入失败：{s}\n  数据（前 200 字节）: {s}\n  原因: {s}\n", .{ @errorName(e), sql[0..@min(sql.len, 200)], conn.lastError() });
+                    return e;
+                };
+                return 0;
+            },
         }
     }
 
@@ -529,6 +552,26 @@ pub const Session = struct {
                     .ok => &.{},
                 };
             },
+            .tdengine => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows.rows,
+                    .ok => &.{},
+                };
+            },
+            .influxdb => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  语句: {s}\n  原因: {s}\n", .{ @errorName(e), sql[0..@min(sql.len, 200)], conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows.rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -548,6 +591,9 @@ pub const Session = struct {
             .postgres => |*conn| conn.lastInsertId(),
             // SQL Server：插入后自动取 `SCOPE_IDENTITY()`
             .sqlserver => |*conn| conn.lastInsertId(),
+            // 时序库无自增语义（主键就是时间戳）
+            .tdengine => 0,
+            .influxdb => 0,
         };
     }
 
@@ -557,17 +603,21 @@ pub const Session = struct {
             .mysql => |*conn| conn.lastError(),
             .postgres => |*conn| conn.lastError(),
             .sqlserver => |*conn| conn.lastError(),
+            .tdengine => |*conn| conn.lastError(),
+            .influxdb => |*conn| conn.lastError(),
         };
     }
 
     /// 预编译语句，供批量写/游标读取复用（调用方负责 finalize）。
-    /// MySQL 侧走预处理协议但不由上层复用（每次 prepare/execute/close），故不支持。
+    /// MySQL / PG / SQL Server / TDengine / InfluxDB 不支持这条旁路（各自走驱动自己的批量 API）。
     pub fn prepare(self: *Session, sql: []const u8) !sqlite.Stmt {
         return switch (self.driver) {
             .sqlite => |*db| db.prepare(self.gpa, sql),
             .mysql => error.Unsupported,
             .postgres => error.Unsupported,
             .sqlserver => error.Unsupported,
+            .tdengine => error.Unsupported,
+            .influxdb => error.Unsupported,
         };
     }
 
@@ -583,7 +633,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres, .sqlserver => error.Unsupported,
+            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb => error.Unsupported,
         };
     }
 
@@ -646,7 +696,10 @@ pub const Session = struct {
                 }
                 _ = try self.execute("BEGIN TRANSACTION", &.{});
             },
-            else => return error.Unsupported,
+            else => {
+                std.debug.print("[zcode] 事务：{s} 不支持跨语句事务（时序/文档库无事务语义），已拒绝\n", .{self.kind.name()});
+                return error.Unsupported;
+            },
         }
         return self.tx_depth;
     }
@@ -661,7 +714,10 @@ pub const Session = struct {
         if (self.tx_depth == 0) {
             switch (self.kind) {
                 .sqlite, .mysql, .postgresql, .sqlserver => _ = try self.execute("COMMIT", &.{}),
-                else => return error.Unsupported,
+                else => {
+                    std.debug.print("[zcode] 提交：{s} 不支持事务\n", .{self.kind.name()});
+                    return error.Unsupported;
+                },
             }
         }
         return self.tx_depth;
@@ -688,7 +744,10 @@ pub const Session = struct {
                     return e;
                 };
             },
-            else => return error.Unsupported,
+            else => {
+                std.debug.print("[zcode] 回滚：{s} 不支持事务\n", .{self.kind.name()});
+                return error.Unsupported;
+            },
         }
         return 0;
     }

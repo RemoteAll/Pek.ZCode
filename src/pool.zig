@@ -235,6 +235,8 @@ fn isUsable(s: *const Session) bool {
         .mysql => |conn| !conn.closed,
         .postgres => |conn| !conn.closed,
         .sqlserver => |conn| !conn.closed,
+        // HTTP 驱动没有可探测的连接句柄：只要会话还在就视为可用（探活靠 ping，不在池路径上做）
+        .tdengine, .influxdb => true,
     };
 }
 
