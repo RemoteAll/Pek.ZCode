@@ -23,18 +23,34 @@
   `dbpackage`（表级导出·导入·跳库同步，无 zip 归档）。
 - 未实现：SQL Server（TDS）/ Oracle（OCI）、C# `DbTable` v3 二进制互通（`Db/Query` 现为 JSON 行列）。
   远程服务已做：`src/dbservice.zig` + `src/dbclient.zig`（HTTP/1.1 服务端在 `zzig/src/http/server.zig`）。
+- **两级缓存已逐条对齐 C#（`docs/决策记录.md` 第（三十五）节）**：
+  - `cache.Cache(T)`（`Meta.Cache`，整表）：**硬内存上限 = `MaxCacheCount` 行**，装载带 `LIMIT max_rows+1`，
+    超限**一行不留** + 60s 静默期；`MaxCacheCount <= 0` 永不缓存。读路径无锁（不可变快照 + 原子发布）。
+  - `cache.SingleCache(T)`（`Meta.SingleCache`，单对象）：写单行**按主键精确失效**（`invalidate_key` 钩子）、
+    条目上限 10000 批量淘汰、不缓存空值。
+  - 过期语义：`stale-while-revalidate` + 单飞（**不起后台线程、不占额外连接**）；手动清缓存分
+    `invalidate()`（可先拿旧值）/ `invalidateForced()`（阻塞到新值）。
+  - 作用域 = `conn_name + 物理表名`（`TableRef.conn_name`，分库分片取 `ShardModel.conn_name`）→ 分库同名表不串。
+  - 谓词查询：`Cache.find/findAll`；观测：`stats()`（total/success/loads/over_limit/evicted + `hitRate()`）。
+- **代码生成器**：`tools/zcodegen.zig`（`zig build` → `zig-out/bin/zcodegen.exe`），产出**双文件**：
+  `{Name}.zig`（每次生成覆盖）+ `{Name}.biz.zig`（**只在不存在时创建，手写内容永不覆盖**）；
+  `mod.zig` 导出实体与 `{Name}Biz`。用法与生成物清单见 `docs/代码生成.md`；改生成器后必跑
+  `zig build codegen '-Dmodel=examples/demo-model.xml' '-Dout=examples/entities'` +
+  `zig build gen-check '-Dgen-check=examples/entities' '-Dmodel=examples/demo-model.xml'`。
+  `build.zig` 支持 `-Dimport` / `-Dtable` / `-Ddry-run` / `-Dno-biz` / `-Dforce-biz`。
 - MySQL TLS 已支持（`SslMode` 五档，缺省 `Preferred`）：连接串认 `SslMode` / `SslCa`（`None|Disabled|Preferred|Required|VerifyCA|VerifyFull`，认不出报 `error.InvalidSslMode`）。
 - MySQL 压缩协议已支持（连接串 `Compression=True`，缺省关）：认证 OK 后所有包套一层 zlib 压缩帧，
   与 TLS 可叠加（压缩在 TLS 内层）；服务端不支持时明确打印而不是静默当成功。
   **供应商化文件 `zzig/src/db/tls_client.zig`**：std TLS 客户端副本 + 补 `CertificateRequest`（MySQL 8 默认 `ssl_ca` 必发这条，std 不处理会连不上）；
   改它前先看头部注释，std 支持后应整个删掉。
-- 测试：`zig build test`（**单元 194 项全通过**；集成 80 项，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
+- 测试：`zig build test`（**单元 195 项 + 集成 93 项全通过 / 2 SKIP**，其中 PG / MySQL 真库用例需连接串，未给时显式 SKIP）；真库另跑
   `zig build integration -Dmysql-conn="…" [-Dmysql-ca="…"]` / `-Dpg-conn="…"`；zzig 侧 **99 项**（自测 25 + XML 27 + 模块 47，含 PG 回环、MySQL LOCAL INFILE、TLS、压缩、HTTP/1.1 服务端）；`tools/regression.ps1` 已接入构建与测试。
 - 方言覆盖：`zig build audit-dialects`（**19/19 可实现方言无缺口**；不连库，纯 SQL 生成层），已进 `tools/regression.ps1`。
   改 `src/dialect.zig` 的 `else` 分支后必跑（`else =>` 默认分支是静默错误高发区）。
-- 性能：`zig build bench`（ReleaseFast）出数字，实测 insert 5.21 µs / 批量 2.46 µs 条 / 主键查 1.80 µs /
-  缓存命中 0.01 µs / 分页 11.49 µs / 分表路由 0.11 µs / 拦截器开销 +0.8 µs / 导航批量填充 170 µs。
-  **基准不进门禁**（机器抖动会误报），改热路径后手动对比。
+- 性能：`zig build bench`（ReleaseFast，SQLite 内存库）出数字：实体 insert 4.29 µs / 批量 1.95 µs 条 /
+  主键查 1.68 µs / **整表缓存命中 0.03 µs** / **单对象缓存命中 0.08 µs** / 分页 9.07 µs / 分表路由 0.16 µs /
+  拦截器 4.32 µs / 导航批量填充 130 µs / 批量脏列 UPDATE 3.83 µs 行 / insert_ignore 2.13 µs 行。
+  **基准不进门禁**（机器抖动会误报），改热路径后手动对比；跨语言绝对值不可比，只看同机相对值。
 - MySQL 带参语句已做**预处理句柄复用**（按 SQL 文本缓存，默认 32 条 FIFO）：`zig build bench-mysql` 同进程 A/B
   实测点查 **1.64×**、单行插入（同事务）**1.62×**；`setStmtCacheLimit(0)` 可关掉做对比，`stmtCacheStats()` 看命中率。
 

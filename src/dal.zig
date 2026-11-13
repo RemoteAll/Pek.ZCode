@@ -222,11 +222,18 @@ pub const Dal = struct {
         opts: ConnectionOptions,
     };
 
-    /// 缓存注册项：类型擦除的回调（表名 + 失效函数）
+    /// 缓存注册项：类型擦除的回调（连接名 + 表名 + 失效函数）。
+    ///
+    /// - `invalidate`：**整体**失效（整表缓存只能整体失效；不知道影响哪几行时也是它）
+    /// - `invalidate_key`：**精确**失效单行（单对象缓存；`null` = 该缓存不支持精确失效）
+    /// - `conn_name`：连接名（空 = 主连接），与表名一起构成缓存作用域 ——
+    ///   分库场景下不同库可能存在**同名表**，只按表名匹配会串缓存
     pub const CacheHook = struct {
         table_name: []const u8,
         ctx: *anyopaque,
         invalidate: *const fn (ctx: *anyopaque) void,
+        invalidate_key: ?*const fn (ctx: *anyopaque, key: i64) void = null,
+        conn_name: []const u8 = "",
     };
 
     /// 从 `Model.xml` 文件打开。
@@ -350,18 +357,40 @@ pub const Dal = struct {
         }
     }
 
-    /// 写后失效：只通知与该表匹配的缓存。
+    /// 写后失效：只通知与该表匹配的缓存（不带连接/主键，等价于整体失效）。
     pub fn invalidateCaches(self: *Dal, table_name: []const u8) void {
+        self.invalidateCachesOn(table_name, null, null);
+    }
+
+    /// 写后失效（带连接名与主键）。
+    ///
+    /// - `conn_name == null`：不知道连接，按表名匹配所有作用域（兼容旧调用）
+    /// - `key != null`：优先走缓存的**精确失效**（单对象缓存只删那一条，不清整表）；
+    ///   不支持精确失效的缓存（整表缓存）退回整体失效
+    pub fn invalidateCachesOn(self: *Dal, table_name: []const u8, conn_name: ?[]const u8, key: ?i64) void {
+        if (self.cache_hooks.items.len == 0) return;
+
         // 调用方给的可能是**实体名**（`Small`）也可能是**物理表名**（`BH_Small`），
         // 而 `TableRef` 的写通知一律用物理名 —— 这里归一后两种都比一次，
         // 否则「实体名 ≠ 物理名」的表在写完之后缓存永远不失效（实测踩过）。
         const phys = if (self.model.table(table_name)) |t| t.effectiveTableName() else table_name;
         for (self.cache_hooks.items) |hook| {
-            if (std.ascii.eqlIgnoreCase(hook.table_name, phys) or
-                std.ascii.eqlIgnoreCase(hook.table_name, table_name))
-            {
-                hook.invalidate(hook.ctx);
+            if (!std.ascii.eqlIgnoreCase(hook.table_name, phys) and
+                !std.ascii.eqlIgnoreCase(hook.table_name, table_name)) continue;
+
+            if (conn_name) |cn| {
+                // 钩子未声明连接名（空）= 通配，兼容不关心分库的缓存（字段缓存等）；
+                // 声明了就必须一致，否则「分库同名表」会互相串缓存。
+                if (hook.conn_name.len > 0 and !std.ascii.eqlIgnoreCase(hook.conn_name, cn)) continue;
             }
+
+            if (key) |k| {
+                if (hook.invalidate_key) |f| {
+                    f(hook.ctx, k);
+                    continue;
+                }
+            }
+            hook.invalidate(hook.ctx);
         }
     }
 
@@ -592,6 +621,8 @@ pub const Dal = struct {
         const t = self.model.table(base_table) orelse return error.TableNotFound;
         var ref = TableRef.init(self.gpa, self.opts.provider, t);
         ref.table_name = shard_model.table_name;
+        // 分库分片：表名已按分片替换，连接名也必须是**该分片所在库**，否则缓存作用域会串
+        ref.conn_name = shard_model.conn_name;
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
         ref.setInterceptorChain(self.chain);
         return ref;
@@ -887,14 +918,15 @@ pub const Dal = struct {
     pub fn table(self: *Dal, name: []const u8) !TableRef {
         const t = self.model.table(name) orelse return error.TableNotFound;
         var ref = TableRef.init(self.gpa, self.opts.provider, t);
+        ref.conn_name = self.tableConnName(t.name) catch self.connName();
         ref.setWriteNotifier(@ptrCast(self), onTableWrite);
         ref.setInterceptorChain(self.chain);
         return ref;
     }
 
-    fn onTableWrite(ctx: *anyopaque, table_name: []const u8) void {
+    fn onTableWrite(ctx: *anyopaque, table_name: []const u8, conn_name: []const u8, key: ?i64) void {
         const self: *Dal = @ptrCast(@alignCast(ctx));
-        self.invalidateCaches(table_name);
+        self.invalidateCachesOn(table_name, conn_name, key);
     }
 
     /// 实际生效的迁移档位（连接串优先，其次模型 `<Option><Migration>`，缺省 `On`）。

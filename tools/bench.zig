@@ -9,13 +9,14 @@
 
 const std = @import("std");
 const zcode = @import("zcode");
+const sqlbuild = zcode.sqlbuild;
 
 const model_xml =
     \\<?xml version="1.0" encoding="utf-8"?>
     \\<EntityModel xmlns="https://newlifex.com/Model202509.xsd">
     \\  <Option><Namespace>Bench.Entity</Namespace><ConnName>DH</ConnName></Option>
     \\  <Tables>
-    \\    <Table Name="Article" TableName="Bench_Article">
+    \\    <Table Name="Article" TableName="Bench_Article" MaxCacheCount="100000">
     \\      <Columns>
     \\        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
     \\        <Column Name="Title" DataType="String" Length="100" />
@@ -161,11 +162,13 @@ pub fn main(init: std.process.Init) !void {
         try results.append(gpa, .{ .name = "findByPk（直连库）", .total_ns = nowNs() - start, .iterations = n });
     }
 
-    // 4) 整表缓存命中
+    // 4) 整表缓存命中（不可变快照 + 原子发布：命中路径不加锁）
     {
         var c = zcode.cache.Cache(Article).init(&dal, 60);
         defer c.deinit();
         _ = try c.all(&s);
+        // 诊断输出：确认缓存真的装上了（未装载/超限时 get 会退回 SQL，数字会与 findByPk 一致）
+        std.debug.print("[bench] 整表缓存：using={} max_rows={d} 装载={d} 行\n", .{ c.usingCache(), c.max_rows, c.cachedRows() });
 
         const n = 20000;
         var i: usize = 0;
@@ -178,6 +181,25 @@ pub fn main(init: std.process.Init) !void {
         const total = nowNs() - start;
         std.mem.doNotOptimizeAway(sink);
         try results.append(gpa, .{ .name = "整表缓存 get（命中）", .total_ns = total, .iterations = n });
+    }
+
+    // 4b) 单对象缓存命中（按主键缓存单行；大表场景）
+    {
+        var sc = zcode.cache.SingleCache(Article).init(&dal, 60);
+        defer sc.deinit();
+        _ = try sc.get(&s, 1);
+
+        const n = 20000;
+        var i: usize = 0;
+        var sink: i32 = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            const pk: i64 = @intCast(@mod(i, 500) + 1);
+            if (try sc.get(&s, pk)) |e| sink +%= e.Id;
+        }
+        const total = nowNs() - start;
+        std.mem.doNotOptimizeAway(sink);
+        try results.append(gpa, .{ .name = "单对象缓存 get（命中）", .total_ns = total, .iterations = n });
     }
 
     // 5) 条件分页查询（10 行/页）
@@ -258,6 +280,113 @@ pub fn main(init: std.process.Init) !void {
             g.deinit();
         }
         try results.append(gpa, .{ .name = "导航批量填充（5 主键）", .total_ns = nowNs() - start, .iterations = n });
+    }
+
+    // 9) 脏状态探查（u256 位运算，零分配；对照 Rust `perf_guard` 的 dirty_probe）
+    {
+        const n = 2_000_000;
+        var bits: zcode.entity.DirtyBits = 0;
+        zcode.entity.markDirty(&bits, 3);
+
+        var i: usize = 0;
+        var sink: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            if (zcode.entity.isDirty(bits, @mod(i, 64))) sink += 1;
+        }
+        const total = nowNs() - start;
+        std.mem.doNotOptimizeAway(sink);
+        try results.append(gpa, .{ .name = "脏状态探查（isDirty）", .total_ns = total, .iterations = n });
+    }
+
+    // 10) update_by_pk：只写 1 个脏列（对照 Rust `update_by_pk`）
+    {
+        const n = 20_000;
+        var e = Article{ .Id = 1 };
+        var i: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            e.Score = @intCast(@mod(i, 1000));
+            e.dirty = 0;
+            zcode.entity.markDirty(&e.dirty, 3);
+            _ = try zcode.entity.update(&dal, &e, &s);
+        }
+        try results.append(gpa, .{ .name = "update_by_pk（只写 1 个脏列）", .total_ns = nowNs() - start, .iterations = n });
+    }
+
+    // 11) 批量脏列合并 UPDATE：500 行同脏列 → 一条多行 UPDATE（一次往返）
+    {
+        const n = 500;
+        const items = try aa.alloc(Article, n);
+        const ptrs = try aa.alloc(*Article, n);
+        for (items, 0..) |*e, i| {
+            e.* = .{ .Id = @intCast(i + 1), .Score = @intCast(i) };
+            zcode.entity.markDirty(&e.dirty, 3);
+            ptrs[i] = e;
+        }
+        const start = nowNs();
+        const rep = try zcode.entity.saveBatchWith(&dal, Article, ptrs, &s, .upsert);
+        const total = nowNs() - start;
+        std.debug.print("[bench] 批量脏列 UPDATE：影响 {d} 行\n", .{rep.updated});
+        try results.append(gpa, .{ .name = "批量脏列 UPDATE（500 行/1 条）", .total_ns = total, .iterations = n });
+    }
+
+    // 12) 「先查后写」vs「insert_ignore 判存」：同 2000 行、其中一半已存在
+    //     注意：模型里 Score 非空，行必须给全 NOT NULL 列，否则 SQLite 报 NOT NULL constraint failed
+    {
+        const n = 2000;
+        const half = n / 2;
+
+        const rowOf = struct {
+            fn make(a: std.mem.Allocator, title: []const u8, score: i32) ![]sqlbuild.Field {
+                const f = try a.alloc(sqlbuild.Field, 4);
+                f[0] = .{ .name = "Title", .value = .{ .text = title } };
+                f[1] = .{ .name = "Author", .value = .{ .text = "bench" } };
+                f[2] = .{ .name = "Score", .value = .{ .int = score } };
+                f[3] = .{ .name = "CreateTime", .value = .{ .datetime = zcode.DateTime.nowLocal() } };
+                return f;
+            }
+        }.make;
+
+        // 准备两批不重叠的数据（前缀区分），各自预插一半 —— 制造「一半已存在」的场景
+        const pre_a = try aa.alloc([]const sqlbuild.Field, half);
+        const pre_b = try aa.alloc([]const sqlbuild.Field, half);
+        for (0..half) |i| {
+            pre_a[i] = try rowOf(aa, try std.fmt.allocPrint(aa, "sq-{d}", .{i}), @intCast(i));
+            pre_b[i] = try rowOf(aa, try std.fmt.allocPrint(aa, "ig-{d}", .{i}), @intCast(i));
+        }
+        _ = try table.insertBatch(&s, pre_a);
+        _ = try table.insertBatch(&s, pre_b);
+
+        // A：先查后写（每条 1 次 COUNT + 未命中才 INSERT）
+        {
+            var inserted_a: usize = 0;
+            const start = nowNs();
+            for (0..n) |i| {
+                const title = try std.fmt.allocPrint(aa, "sq-{d}", .{i});
+                var w = zcode.Where.init(aa);
+                _ = try w.eq("Title", .{ .text = title });
+                if (try table.count(&s, &w) == 0) {
+                    const one = try rowOf(aa, title, @intCast(i));
+                    _ = try table.insertBatch(&s, &.{one});
+                    inserted_a += 1;
+                }
+            }
+            const total = nowNs() - start;
+            std.debug.print("[bench] 先查后写：插入 {d} / 跳过 {d}\n", .{ inserted_a, n - inserted_a });
+            try results.append(gpa, .{ .name = "先查后写（2000 行，半已存在）", .total_ns = total, .iterations = n });
+        }
+
+        // B：insert_ignore 一次批量（冲突由数据库判）
+        {
+            const rows = try aa.alloc([]const sqlbuild.Field, n);
+            for (0..n) |i| rows[i] = try rowOf(aa, try std.fmt.allocPrint(aa, "ig-{d}", .{i}), @intCast(i));
+            const start = nowNs();
+            const inserted = try table.upsertBatch(&s, rows, .insert_ignore);
+            const total = nowNs() - start;
+            std.debug.print("[bench] insert_ignore：插入 {d} / 跳过 {d}\n", .{ inserted, n - inserted });
+            try results.append(gpa, .{ .name = "insert_ignore（2000 行/1 条）", .total_ns = total, .iterations = n });
+        }
     }
 
     // ── 输出 ────────────────────────────────────────────────────────────────

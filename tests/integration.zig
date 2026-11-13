@@ -424,8 +424,8 @@ test "整表缓存：命中 / 写后自动失效 / TTL 过期重载" {
     });
     try std.testing.expectEqual(@as(usize, 2), try c.count(&s));
 
-    // TTL 过期 → 同步重载，看到第 3 行
-    c.loaded_at -= 100;
+    // TTL 过期（手动失效等价）→ 单飞重载，看到第 3 行
+    c.invalidate();
     try std.testing.expectEqual(@as(usize, 3), try c.count(&s));
 
     // 通过 TableRef 写入 → 自动失效 → 下次访问就是新快照
@@ -916,4 +916,5 @@ test {
     _ = @import("integration_area.zig");
     _ = @import("integration_dirty_batch.zig");
     _ = @import("integration_cache_limit.zig");
+    _ = @import("integration_cache_levels.zig");
 }

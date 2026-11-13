@@ -24,6 +24,8 @@ pub fn main(init: std.process.Init) !void {
     var dry_run = false;
     var verify = false;
     var import_path: []const u8 = "zcode";
+    var biz = true;
+    var force_biz = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -52,6 +54,10 @@ pub fn main(init: std.process.Init) !void {
             import_path = argv[i];
         } else if (std.mem.eql(u8, a, "--verify")) {
             verify = true;
+        } else if (std.mem.eql(u8, a, "--no-biz")) {
+            biz = false;
+        } else if (std.mem.eql(u8, a, "--force-biz")) {
+            force_biz = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             printUsage();
             return;
@@ -101,6 +107,8 @@ pub fn main(init: std.process.Init) !void {
         .table = table,
         .dry_run = dry_run,
         .import = import_path,
+        .biz = biz,
+        .force_biz = force_biz,
     });
     std.debug.print("zcodegen：生成 {d} 个实体 / {d} 个文件 → {s}{s}\n", .{
         report.tables,
@@ -108,6 +116,15 @@ pub fn main(init: std.process.Init) !void {
         od,
         if (dry_run) "（dry-run，未落盘）" else "",
     });
+    if (biz and !dry_run) {
+        std.debug.print("zcodegen：业务扩展文件 新建 {d} / 保留 {d}（已有内容不会覆盖）\n", .{ report.biz_written, report.biz_kept });
+        std.debug.print(
+            "zcodegen：接入 build.zig ——\n" ++
+                "    const entities = b.createModule(.{{ .root_source_file = b.path(\"{s}/mod.zig\") }});\n" ++
+                "    entities.addImport(\"zcode\", zcode);\n",
+            .{od},
+        );
+    }
 }
 
 fn usage() error{MissingArgument} {

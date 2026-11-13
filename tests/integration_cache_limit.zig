@@ -105,12 +105,13 @@ test "MaxCacheCount=0：禁用整表缓存，读仍走库且结果正确" {
     var cache = zcode.cache.Cache(NoCache).init(&dal, 60);
     defer cache.deinit();
 
-    try std.testing.expect(cache.disabled);
+    try std.testing.expect(cache.max_rows == 0);
+    try std.testing.expect(!cache.usingCache());
     const got = (try cache.get(&s, id)).?;
     try std.testing.expectEqualStrings("a", got.Name);
     try std.testing.expectEqual(@as(usize, 1), try cache.count(&s));
-    // 没装载过整表（items 为空 = 没进内存）
-    try std.testing.expectEqual(@as(usize, 0), cache.items.len);
+    // 没装载过整表（没有快照 = 没进内存）
+    try std.testing.expectEqual(@as(usize, 0), cache.cachedRows());
 }
 
 test "MaxCacheCount=2 但表里有 3 行：装载后放弃缓存，结果仍正确" {
@@ -131,13 +132,14 @@ test "MaxCacheCount=2 但表里有 3 行：装载后放弃缓存，结果仍正�
 
     var cache = zcode.cache.Cache(Tiny).init(&dal, 60);
     defer cache.deinit();
-    try std.testing.expect(!cache.disabled); // init 时还不知道行数
+    try std.testing.expectEqual(@as(usize, 2), cache.max_rows); // 上限来自模型
 
     const all = try cache.all(&s);
     try std.testing.expectEqual(@as(usize, 3), all.len);
-    // 超过上限 → 主动放弃缓存（内存保护）
-    try std.testing.expect(cache.disabled);
-    try std.testing.expectEqual(@as(usize, 0), cache.items.len);
+    // 超过上限 → 一行不留，进入静默期（内存保护）
+    try std.testing.expect(!cache.usingCache());
+    try std.testing.expectEqual(@as(usize, 0), cache.cachedRows());
+    try std.testing.expectEqual(@as(usize, 1), cache.stats().over_limit);
 }
 
 test "MaxCacheCount=100：正常缓存，写后自动失效" {
@@ -159,8 +161,8 @@ test "MaxCacheCount=100：正常缓存，写后自动失效" {
 
     const first = (try cache.get(&s, id)).?;
     try std.testing.expectEqualStrings("a", first.Name);
-    try std.testing.expect(!cache.disabled);
-    try std.testing.expect(cache.items.len > 0);
+    try std.testing.expect(cache.usingCache());
+    try std.testing.expect(cache.cachedRows() > 0);
 
     // 写操作 → 缓存失效 → 下次读到新值
     var e = first;

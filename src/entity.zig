@@ -188,7 +188,11 @@ pub fn update(dal: *Dal, e: anytype, s: *Session) !usize {
     }
 
     const ref = try dal.table(meta.table_name);
-    const affected = try ref.update(s, sets.items, &w);
+    // 已知单一主键 → 缓存**精确失效**该行（单对象缓存不必整表清空）
+    const affected = if (singlePkI64(meta, e)) |pk|
+        try ref.updateOne(s, sets.items, &w, pk)
+    else
+        try ref.update(s, sets.items, &w);
     e.dirty = 0;
     return affected;
 }
@@ -748,6 +752,18 @@ fn pkToI64(meta: EntityMeta, e: anytype) i64 {
     return 0;
 }
 
+/// 唯一主键且为整型时返回其值；复合主键/非整型主键返回 `null`。
+/// 用于「单行写 → 缓存按主键精确失效」：复合主键的缓存只能整体失效。
+fn singlePkI64(meta: EntityMeta, e: anytype) ?i64 {
+    var found: ?i64 = null;
+    for (meta.fields, 0..) |f, i| {
+        if (!f.primary_key) continue;
+        if (found != null) return null; // 复合主键
+        found = e.columnValue(i).asI64() orelse return null;
+    }
+    return found;
+}
+
 /// 按主键删除。
 pub fn delete(dal: *Dal, e: anytype, s: *Session) !usize {
     const T = @TypeOf(e.*);
@@ -760,7 +776,10 @@ pub fn delete(dal: *Dal, e: anytype, s: *Session) !usize {
     defer w.deinit();
 
     const ref = try dal.table(meta.table_name);
-    return ref.delete(s, &w);
+    return if (singlePkI64(meta, e)) |pk|
+        try ref.deleteOne(s, &w, pk)
+    else
+        try ref.delete(s, &w);
 }
 
 /// 按主键取一行并装载到实体。

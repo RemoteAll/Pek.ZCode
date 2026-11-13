@@ -113,6 +113,16 @@ pub fn build(b: *std.Build) void {
         gen_run.addArg("--table");
         gen_run.addArg(v);
     }
+    if (b.option([]const u8, "import", "生成代码里的 zcode 导入路径（库内自用传 ../../root.zig）")) |v| {
+        gen_run.addArg("--import");
+        gen_run.addArg(v);
+    }
+    if (b.option(bool, "no-biz", "不生成业务扩展文件（默认生成一次且不覆盖）") orelse false) {
+        gen_run.addArg("--no-biz");
+    }
+    if (b.option(bool, "force-biz", "强制重写业务扩展文件（会丢掉手写内容）") orelse false) {
+        gen_run.addArg("--force-biz");
+    }
     if (b.option(bool, "dry-run", "只打印不落盘") orelse false) {
         gen_run.addArg("--dry-run");
     }

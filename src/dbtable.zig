@@ -28,9 +28,11 @@ pub const TableRef = struct {
     table: *const TableMeta,
     /// 物理表名（分表场景由调用方传入具体表名）
     table_name: []const u8,
+    /// 连接名（空 = 主连接）：分库同名表的缓存作用域
+    conn_name: []const u8 = "",
     /// 写后失效通知（由 `Dal.table()` 注入；不引入对 dal 的循环依赖）
     write_ctx: ?*anyopaque = null,
-    write_notify: ?*const fn (ctx: *anyopaque, table_name: []const u8) void = null,
+    write_notify: ?*const fn (ctx: *anyopaque, table_name: []const u8, conn_name: []const u8, key: ?i64) void = null,
     /// 写入拦截器链（审计列自动补全；由 `Dal` 注入，可为空）
     chain: ?*@import("interceptor.zig").Chain = null,
 
@@ -38,16 +40,21 @@ pub const TableRef = struct {
         return .{ .gpa = gpa, .kind = kind, .table = table, .table_name = table.effectiveTableName() };
     }
 
-    /// 注入写后通知（Dal 用它使整表缓存失效）。
-    pub fn setWriteNotifier(self: *TableRef, ctx: *anyopaque, notify: *const fn (ctx: *anyopaque, table_name: []const u8) void) void {
+    /// 注入写后通知（Dal 用它使缓存失效）。
+    pub fn setWriteNotifier(self: *TableRef, ctx: *anyopaque, notify: *const fn (ctx: *anyopaque, table_name: []const u8, conn_name: []const u8, key: ?i64) void) void {
         self.write_ctx = ctx;
         self.write_notify = notify;
     }
 
-    fn notifyWrite(self: *const TableRef) void {
+    /// 写后通知。`key` 非空表示**本次只影响这一行**，缓存可精确失效（不用整表清空）。
+    fn notifyWriteKey(self: *const TableRef, key: ?i64) void {
         if (self.write_ctx) |ctx| {
-            if (self.write_notify) |notify| notify(ctx, self.table_name);
+            if (self.write_notify) |notify| notify(ctx, self.table_name, self.conn_name, key);
         }
+    }
+
+    fn notifyWrite(self: *const TableRef) void {
+        self.notifyWriteKey(null);
     }
 
     /// 注入写入拦截器链。
@@ -99,13 +106,27 @@ pub const TableRef = struct {
         const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
         defer sql.deinit(self.gpa);
         _ = try s.execute(sql.text, sql.params);
+        if (self.table.identity() != null) {
+            const id = s.lastInsertId();
+            // 自增主键已知 → 精确失效那一行，免得单对象缓存被整表清空（写多读多场景的关键）
+            self.notifyWriteKey(if (id > 0) id else null);
+            return id;
+        }
         self.notifyWrite();
-        if (self.table.identity() != null) return s.lastInsertId();
         return 0;
     }
 
     /// 更新（`filter` 为空即全表——调用方必须自己保证带上主键条件）。
     pub fn update(self: *const TableRef, s: *Session, sets: []const sqlbuild.Field, filter: ?*const Where) !usize {
+        return self.updateInner(s, sets, filter, null);
+    }
+
+    /// 单行更新（调用方已带主键条件且知道主键值）：缓存**精确失效**该行。
+    pub fn updateOne(self: *const TableRef, s: *Session, sets: []const sqlbuild.Field, filter: ?*const Where, pk: i64) !usize {
+        return self.updateInner(s, sets, filter, pk);
+    }
+
+    fn updateInner(self: *const TableRef, s: *Session, sets: []const sqlbuild.Field, filter: ?*const Where, pk: ?i64) !usize {
         var effective = sets;
         var owned: ?[]sqlbuild.Field = null;
         if (self.chain) |chain| {
@@ -120,7 +141,7 @@ pub const TableRef = struct {
         const sql = try sqlbuild.update(self.gpa, self.kind, self.table, self.table_name, effective, filter);
         defer sql.deinit(self.gpa);
         const affected = try s.execute(sql.text, sql.params);
-        if (affected > 0) self.notifyWrite();
+        if (affected > 0) self.notifyWriteKey(pk);
         return affected;
     }
 
@@ -145,11 +166,20 @@ pub const TableRef = struct {
 
     /// 删除（同样：`filter` 为空即清空全表，慎用）。
     pub fn delete(self: *const TableRef, s: *Session, filter: ?*const Where) !usize {
+        return self.deleteInner(s, filter, null);
+    }
+
+    /// 单行删除（知道主键）：缓存**精确失效**该行。
+    pub fn deleteOne(self: *const TableRef, s: *Session, filter: ?*const Where, pk: i64) !usize {
+        return self.deleteInner(s, filter, pk);
+    }
+
+    fn deleteInner(self: *const TableRef, s: *Session, filter: ?*const Where, pk: ?i64) !usize {
         try self.ensureWritable();
         const sql = try sqlbuild.delete(self.gpa, self.kind, self.table_name, filter);
         defer sql.deinit(self.gpa);
         const affected = try s.execute(sql.text, sql.params);
-        if (affected > 0) self.notifyWrite();
+        if (affected > 0) self.notifyWriteKey(pk);
         return affected;
     }
 
