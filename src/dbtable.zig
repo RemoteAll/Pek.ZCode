@@ -239,10 +239,28 @@ pub const TableRef = struct {
 
         const pks = try self.table.primaryKeys(self.gpa);
         defer self.gpa.free(pks);
-        if (pks.len == 0) {
-            std.debug.print("[zcode] upsertBatch：表 {s} 没有主键，无法做 {s}\n", .{ self.table_name, mode.name() });
-            return error.NoPrimaryKey;
+
+        // `insert_ignore` 是「存在就跳过」，**不需要主键也不需要冲突目标**：
+        // `INSERT OR IGNORE` / `INSERT IGNORE` / `ON CONFLICT DO NOTHING` 都是「忽略任意唯一约束」。
+        // 需要冲突目标的是 `upsert` / `replace`。
+        var conflict: ?[]const []const u8 = null;
+        if (mode != .insert_ignore) {
+            if (pks.len == 0) {
+                std.debug.print("[zcode] upsertBatch：表 {s} 没有主键，无法做 {s}\n", .{ self.table_name, mode.name() });
+                return error.NoPrimaryKey;
+            }
+            // 冲突目标（主键 → 唯一索引），只选「列都在插入列里」的
+            conflict = try self.conflictColumnsAlloc(rows[0], pks);
+            if (conflict == null and self.kind != .mysql) {
+                std.debug.print(
+                    "[zcode] upsertBatch：表 {s} 既无可用主键也无覆盖插入列的唯一索引，无法做 {s}" ++
+                        "（MySQL 除外，它不需要冲突目标）\n",
+                    .{ self.table_name, mode.name() },
+                );
+                return error.NoUniqueKey;
+            }
         }
+        defer if (conflict) |c| self.gpa.free(c);
 
         // 拦截器：与 insertBatch 一致地逐行补齐审计列
         var patched: std.ArrayList([]const sqlbuild.Field) = .empty;
@@ -264,21 +282,9 @@ pub const TableRef = struct {
         const cols = effective_rows[0].len;
         if (cols == 0) return error.Model;
 
-        // 冲突目标（主键 → 唯一索引），只选「列都在插入列里」的
-        const conflict = try self.conflictColumnsAlloc(effective_rows[0], pks);
-        defer if (conflict) |c| self.gpa.free(c);
-        if (conflict == null and self.kind != .mysql) {
-            std.debug.print(
-                "[zcode] upsertBatch：表 {s} 既无可用主键也无覆盖插入列的唯一索引，无法做 {s}" ++
-                    "（MySQL 除外，它不需要冲突目标）\n",
-                .{ self.table_name, mode.name() },
-            );
-            return error.NoUniqueKey;
-        }
-
         switch (self.kind) {
             .sqlite, .mysql, .postgresql, .kingbase, .highgo, .vastbase => {},
-            else => return self.upsertFallback(s, effective_rows, pks, mode),
+            else => return self.upsertFallback(s, effective_rows, pks, conflict, mode),
         }
 
         var per_batch: usize = 5000;
@@ -457,9 +463,46 @@ pub const TableRef = struct {
         s: *Session,
         rows: []const []const sqlbuild.Field,
         pks: []const *const ColumnMeta,
+        conflict: ?[]const []const u8,
         mode: SaveModes,
     ) !usize {
-        _ = mode;
+        // `insert_ignore` 走「一条语句判存 + 插入」：`INSERT ... SELECT ... WHERE NOT EXISTS (...)`
+        // 既不是「先查再写」的 N 次往返，也**不会覆盖已存在的行**（旧实现会先 UPDATE，语义错）。
+        if (mode == .insert_ignore) {
+            const keys = conflict orelse {
+                // 没有主键/唯一索引就没法判存：明确报错，不假装成功
+                std.debug.print(
+                    "[zcode] insert_ignore：表 {s} 没有主键也没有唯一索引，无法判断是否已存在\n",
+                    .{self.table_name},
+                );
+                return error.NoUniqueKey;
+            };
+
+            var affected_ignore: usize = 0;
+            var scoped_ignore = try Session.Scoped.begin(s);
+            errdefer scoped_ignore.rollback();
+            for (rows) |row| {
+                const sql = sqlbuild.insertIfAbsent(self.gpa, self.kind, self.table, self.table_name, row, keys) catch |e| {
+                    std.debug.print(
+                        "[zcode] insert_ignore 组装失败：表 {s}，错误 {s}\n",
+                        .{ self.table_name, @errorName(e) },
+                    );
+                    return e;
+                };
+                defer sql.deinit(self.gpa);
+                affected_ignore += s.execute(sql.text, sql.params) catch |e| {
+                    std.debug.print(
+                        "[zcode] insert_ignore 失败：表 {s}\n  SQL: {s}\n  错误: {s}；{s}\n",
+                        .{ self.table_name, sql.text, @errorName(e), s.lastError() },
+                    );
+                    return e;
+                };
+            }
+            try scoped_ignore.commit();
+            if (affected_ignore > 0) self.notifyWrite();
+            return affected_ignore;
+        }
+
         var affected: usize = 0;
         var scoped = try Session.Scoped.begin(s);
         errdefer scoped.rollback();

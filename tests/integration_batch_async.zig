@@ -499,3 +499,88 @@ test "跨库多表事务：明确报错（不静默拆成两个事务，也不�
     defer s2.deinit();
     try std.testing.expectError(error.CrossDatabaseTransaction, dal.beginTransactionForTables(&s2, &.{ "A", "L" }));
 }
+
+// ── 「存在就跳过」：一条语句、一次往返、不覆盖已存在行 ──────────────────
+
+test "insert_ignore：唯一键已存在就跳过（不更新、一次往返、返回真实插入数）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "ignore");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDal(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const t = try dal.table("Item");
+
+    // 先写一行 A
+    var r0: [2]Field = undefined;
+    const first = [_][]const Field{mk(&r0, "A", "甲")};
+    try std.testing.expectEqual(@as(usize, 1), try t.insertBatch(&s, &first));
+
+    // 再批量「存在就跳过」：A 已存在（唯一索引 Code），B/C 是新的
+    var r1: [2]Field = undefined;
+    var r2: [2]Field = undefined;
+    var r3: [2]Field = undefined;
+    const batch = [_][]const Field{
+        mk(&r1, "A", "甲改"), // 会被跳过，且**不能**把「甲」覆盖成「甲改」
+        mk(&r2, "B", "乙"),
+        mk(&r3, "C", "丙"),
+    };
+
+    const inserted = try t.upsertBatch(&s, &batch, .insert_ignore);
+    try std.testing.expectEqual(@as(usize, 2), inserted); // 跳过 1 条
+    try std.testing.expectEqual(@as(i64, 3), try t.count(&s, null));
+
+    // 关键：已存在的行没被改写（旧实现走「先 UPDATE 再 INSERT」会覆盖）
+    try std.testing.expectEqualStrings("甲", (try nameOf(a, &t, &s, "A")).?);
+
+    // 再跑一遍：全部跳过，插入 0
+    try std.testing.expectEqual(@as(usize, 0), try t.upsertBatch(&s, &batch, .insert_ignore));
+    try std.testing.expectEqual(@as(i64, 3), try t.count(&s, null));
+}
+
+test "insert_ignore：无主键表按唯一索引判存也能跳过（不需要主键）" {
+    const a = std.testing.allocator;
+    const model_no_pk =
+        \\<?xml version="1.0" encoding="utf-8"?>
+        \\<EntityModel><Option><ConnName>DH</ConnName></Option><Tables>
+        \\  <Table Name="Kv" TableName="BH_Kv">
+        \\    <Columns>
+        \\      <Column Name="Key" DataType="String" Length="50" />
+        \\      <Column Name="Val" DataType="String" Length="50" />
+        \\    </Columns>
+        \\    <Indexes><Index Unique="True" Columns="Key" /></Indexes>
+        \\  </Table>
+        \\</Tables></EntityModel>
+    ;
+
+    const path = try tempDbPath(a, "ignore-nopk");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    const m = try zcode.EntityModel.parse(a, model_no_pk);
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{path});
+    defer a.free(conn);
+    var dal = try zcode.Dal.initWithModel(a, conn, m);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const t = try dal.table("Kv");
+
+    const row = [_]Field{
+        .{ .name = "Key", .value = .{ .text = "a" } },
+        .{ .name = "Val", .value = .{ .text = "1" } },
+    };
+    const one = [_][]const Field{&row};
+    try std.testing.expectEqual(@as(usize, 1), try t.upsertBatch(&s, &one, .insert_ignore));
+
+    // 同一个 Key 再来一次 → 跳过
+    try std.testing.expectEqual(@as(usize, 0), try t.upsertBatch(&s, &one, .insert_ignore));
+    try std.testing.expectEqual(@as(i64, 1), try t.count(&s, null));
+}

@@ -252,7 +252,63 @@ pub fn updateMulti(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
-/// 组装多行 INSERT：`INSERT INTO "T" ("a","b") VALUES (?,?),(?,?)`。
+/// 「不存在才插入」：`INSERT INTO t (cols) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM t WHERE k = ?)`。
+///
+/// 用途（`insert_ignore` 在**没有 `INSERT IGNORE` 的方言**上的实现）：
+/// SQL Server / Oracle 等没有 `ON CONFLICT DO NOTHING`，而「先查再写」在批量场景是
+/// N 次往返 + 竞态窗口；这条语句把判断与插入合成**一次往返**，服务端原子执行。
+///
+/// `keys` 用来判断「已存在」（主键或唯一索引列）；都必须在 `row` 里。
+pub fn insertIfAbsent(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    row: []const Field,
+    keys: []const []const u8,
+) !Sql {
+    if (row.len == 0 or keys.len == 0) return error.Model;
+
+    var base = try insert(gpa, kind, table, table_name, row);
+    defer base.deinit(gpa);
+
+    // `INSERT INTO t ("a","b") VALUES (?, ?)` → `INSERT INTO t ("a","b") SELECT ?, ?`
+    const marker = "VALUES (";
+    const at = std.mem.indexOf(u8, base.text, marker) orelse return error.Model;
+
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+
+    try b.add(base.text[0..at]);
+    try b.add("SELECT ");
+    try b.add(base.text[at + marker.len ..]); // 保留右括号与后续内容
+    try params.appendSlice(gpa, base.params);
+
+    try b.add(" WHERE NOT EXISTS (SELECT 1 FROM ");
+    try kind.pushQuoted(&b, table_name);
+    try b.add(" WHERE ");
+    for (keys, 0..) |k, i| {
+        if (i > 0) try b.add(" AND ");
+        try kind.pushQuoted(&b, try columnName(table, k));
+        try b.add(" = ");
+        try kind.pushPlaceholder(&b, base.params.len + i);
+
+        var found: ?Value = null;
+        for (row) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, k)) found = f.value;
+        }
+        try params.append(gpa, found orelse return error.Model);
+    }
+    try b.add(")");
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
+/// 多行 INSERT：`INSERT INTO "T" ("a","b") VALUES (?,?),(?,?)`。
 ///
 /// 约束（与 XCode 批量写一致）：所有行列集合必须**完全一致**（含顺序），否则报 `error.Model`。
 /// 参数上限由调用方按 `DatabaseKind.maxStatementParams()` 分批。
