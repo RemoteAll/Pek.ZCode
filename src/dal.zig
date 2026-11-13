@@ -464,20 +464,32 @@ pub const Dal = struct {
 
     /// 从数据库统计信息取近似行数；拿不到返回 `null`（不同方言实现不同）。
     pub fn countApprox(self: *Dal, s: *Session, table_name: []const u8) !?i64 {
-        const sql: ?[]const u8 = switch (self.opts.provider) {
+        // 占位符必须按方言生成（PG 是 `$1`、SQL Server 是 `@p0`），不能硬写 `?`。
+        // 前缀走运行期切片，占位符用 `pushPlaceholder` 追加（`allocPrint` 要求格式串 comptime 已知）。
+        const prefix: ?[]const u8 = switch (self.opts.provider) {
             // stat 形如 "1234 5 3"，取第一段；多索引多行 → 取 MAX 避免重复累加
-            .sqlite => "SELECT MAX(CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER)) FROM sqlite_stat1 WHERE tbl = ?",
-            .mysql => "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-            .postgresql => "SELECT reltuples::bigint FROM pg_class WHERE relname = ? AND relkind IN ('r', 'p') ORDER BY reltuples DESC LIMIT 1",
-            .sqlserver => "SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.objects o ON p.object_id = o.object_id WHERE o.name = ? AND p.index_id IN (0, 1)",
-            .oracle => "SELECT NUM_ROWS FROM USER_TABLES WHERE TABLE_NAME = ?",
+            .sqlite => "SELECT MAX(CAST(substr(stat, 1, instr(stat || ' ', ' ') - 1) AS INTEGER)) FROM sqlite_stat1 WHERE tbl = ",
+            .mysql => "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ",
+            .postgresql => "SELECT reltuples::bigint FROM pg_class WHERE relname = ",
+            .sqlserver => "SELECT SUM(p.rows) FROM sys.partitions p JOIN sys.objects o ON p.object_id = o.object_id WHERE o.name = ",
+            .oracle => "SELECT NUM_ROWS FROM USER_TABLES WHERE TABLE_NAME = ",
             else => null,
         };
-        const text = sql orelse return null;
+        const pre = prefix orelse return null;
+
+        const Buf = @import("zzig").Buf;
+        var b = Buf.init(self.gpa);
+        defer b.deinit();
+        try b.add(pre);
+        try self.opts.provider.pushPlaceholder(&b, 0);
+        if (self.opts.provider == .postgresql) try b.add(" AND relkind IN ('r', 'p') ORDER BY reltuples DESC LIMIT 1");
+        if (self.opts.provider == .sqlserver) try b.add(" AND p.index_id IN (0, 1)");
+        const text = try b.toOwnedSlice();
+        defer self.gpa.free(text);
 
         var params: [1]Value = .{.{ .text = table_name }};
         const v = s.queryScalar(text, &params) catch |e| {
-            // 统计表不存在（SQLite 没跑过 ANALYZE 等）属正常情况，不当错误抛出
+            // 统计表不存在 / 无权限（SQLite 没跑过 ANALYZE 等）属正常情况，不当错误抛出
             std.debug.print("[zcode] 读取 {s} 的统计信息失败（{s}），按「无统计」处理\n", .{ table_name, @errorName(e) });
             return null;
         };

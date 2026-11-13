@@ -550,19 +550,25 @@ pub fn countUpTo(gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const
     switch (kind) {
         .sqlserver => {
             // 没有 LIMIT，用 TOP(n) 包一层
-            try b.add("SELECT COUNT(*) FROM (SELECT TOP (?) 1 AS zcode_x FROM ");
+            try b.add("SELECT COUNT(*) FROM (SELECT TOP (");
+            try kind.pushPlaceholder(&b, 0);
+            try b.add(") 1 AS zcode_x FROM ");
             try kind.pushQuoted(&b, table_name);
             try b.add(") AS zcode_t");
         },
         .oracle => {
             try b.add("SELECT COUNT(*) FROM (SELECT 1 FROM ");
             try kind.pushQuoted(&b, table_name);
-            try b.add(" WHERE ROWNUM <= ?) zcode_t");
+            try b.add(" WHERE ROWNUM <= ");
+            try kind.pushPlaceholder(&b, 0);
+            try b.add(") zcode_t");
         },
         .sqlite, .mysql, .postgresql => {
             try b.add("SELECT COUNT(*) FROM (SELECT 1 FROM ");
             try kind.pushQuoted(&b, table_name);
-            try b.add(" LIMIT ?) zcode_t");
+            try b.add(" LIMIT ");
+            try kind.pushPlaceholder(&b, 0);
+            try b.add(") zcode_t");
         },
         else => return error.Unsupported,
     }
