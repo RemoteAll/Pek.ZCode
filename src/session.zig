@@ -20,6 +20,7 @@ const influxdb = @import("zzig").influxdb;
 const clickhouse = @import("zzig").clickhouse;
 const mongodb = @import("zzig").mongodb;
 const duckdb = @import("zzig").duckdb;
+const oracle = @import("zzig").oracle;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const setting = @import("setting.zig");
@@ -210,6 +211,8 @@ pub const Driver = union(enum) {
     mongodb: mongodb.Conn,
     /// DuckDB：嵌入式，动态加载 `duckdb.dll`
     duckdb: duckdb.Db,
+    /// Oracle：OCI 动态加载（`oci.dll` / `libclntsh.so`）
+    oracle: oracle.Conn,
 };
 
 pub const Session = struct {
@@ -269,6 +272,7 @@ pub const Session = struct {
             .clickhouse => |*conn| conn.deinit(),
             .mongodb => |*conn| conn.deinit(),
             .duckdb => |*db| db.close(),
+            .oracle => |*conn| conn.deinit(),
         }
     }
 
@@ -507,6 +511,13 @@ pub const Session = struct {
                 };
                 return @intCast(n);
             },
+            .oracle => |*conn| {
+                const n = conn.exec(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -629,6 +640,16 @@ pub const Session = struct {
                 std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
                 return e;
             },
+            .oracle => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -654,6 +675,8 @@ pub const Session = struct {
             .clickhouse => 0,
             .mongodb => 0,
             .duckdb => |*db| db.lastInsertId(),
+            // Oracle 没有自增列（用 `SEQ_{表名}.CURRVAL` 或 `RETURNING`）
+            .oracle => |*conn| conn.lastInsertId(),
         };
     }
 
@@ -668,6 +691,7 @@ pub const Session = struct {
             .clickhouse => |*conn| conn.lastError(),
             .mongodb => |*conn| conn.lastError(),
             .duckdb => |*db| db.lastError(),
+            .oracle => |*conn| conn.lastError(),
         };
     }
 
@@ -684,6 +708,7 @@ pub const Session = struct {
             .clickhouse => error.Unsupported,
             .mongodb => error.Unsupported,
             .duckdb => error.Unsupported,
+            .oracle => error.Unsupported,
         };
     }
 
@@ -699,7 +724,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .duckdb => error.Unsupported,
+            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .duckdb, .oracle => error.Unsupported,
         };
     }
 
@@ -762,6 +787,7 @@ pub const Session = struct {
                 }
                 _ = try self.execute("BEGIN TRANSACTION", &.{});
             },
+            .oracle => try self.beginOracleTransaction(level),
             else => {
                 std.debug.print("[zcode] 事务：{s} 不支持跨语句事务（时序/文档库无事务语义），已拒绝\n", .{self.kind.name()});
                 return error.Unsupported;
@@ -769,7 +795,22 @@ pub const Session = struct {
         }
         return self.tx_depth;
     }
-
+    /// Oracle 的事务是**隐式**的：第一条 DML 就开始，不需要 `BEGIN TRANSACTION`。
+    /// 所以这里只在显式指定隔离级别时发 `SET TRANSACTION`（必须是事务里的第一条语句）。
+    fn beginOracleTransaction(self: *Session, level: IsolationLevel) !void {
+        if (level == .default) return;
+        const text = switch (level) {
+            .read_committed => "READ COMMITTED",
+            .serializable => "SERIALIZABLE",
+            else => {
+                std.debug.print("[zcode] 事务：Oracle 不支持隔离级别 {s}（只支持 READ COMMITTED / SERIALIZABLE）\n", .{@tagName(level)});
+                return error.Unsupported;
+            },
+        };
+        const sql = try std.fmt.allocPrint(self.gpa, "SET TRANSACTION ISOLATION LEVEL {s}", .{text});
+        defer self.gpa.free(sql);
+        _ = try self.execute(sql, &.{});
+    }
     /// 提交（计数减一；减到 0 时才真正 COMMIT），返回剩余计数。
     pub fn commit(self: *Session) !u32 {
         if (self.tx_depth == 0) return error.NoTransaction;
@@ -780,6 +821,10 @@ pub const Session = struct {
         if (self.tx_depth == 0) {
             switch (self.kind) {
                 .sqlite, .mysql, .postgresql, .sqlserver => _ = try self.execute("COMMIT", &.{}),
+                .oracle => switch (self.driver) {
+                    .oracle => |*conn| try conn.commit(),
+                    else => unreachable,
+                },
                 else => {
                     std.debug.print("[zcode] 提交：{s} 不支持事务\n", .{self.kind.name()});
                     return error.Unsupported;
@@ -803,6 +848,19 @@ pub const Session = struct {
         switch (self.kind) {
             .sqlite, .mysql, .postgresql, .sqlserver => {
                 _ = self.execute("ROLLBACK", &.{}) catch |e| {
+                    if (ignore_exception) {
+                        std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
+                        return 0;
+                    }
+                    return e;
+                };
+            },
+            .oracle => {
+                const conn = switch (self.driver) {
+                    .oracle => |*c| c,
+                    else => unreachable,
+                };
+                conn.rollback() catch |e| {
                     if (ignore_exception) {
                         std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
                         return 0;

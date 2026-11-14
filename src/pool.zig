@@ -239,6 +239,8 @@ fn isUsable(s: *const Session) bool {
         .tdengine, .influxdb, .clickhouse, .mongodb => true,
         // DuckDB 是嵌入式单进程库：连接池没有意义（且同名文件多开会抢锁）
         .duckdb => false,
+        // Oracle（OCI）：会话在手就可用（断线由 `lastError` + 业务重试兜底）
+        .oracle => |conn| conn.svc != null,
     };
 }
 

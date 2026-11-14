@@ -285,6 +285,8 @@ pub const Dal = struct {
     lib: ?sqlite.Lib = null,
     /// DuckDB 动态库句柄（`Provider=DuckDB` 时用；生命周期与 Dal 一致）
     duck_lib: ?@import("zzig").duckdb.Lib = null,
+    /// Oracle OCI 动态库句柄（`Provider=Oracle` 时用；生命周期与 Dal 一致）
+    oracle_lib: ?@import("zzig").oracle.Lib = null,
     /// 整表实体缓存注册表（写操作后按表名使缓存失效）
     cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
     /// 读写分离策略（忽略表 / 全局切主库）
@@ -503,6 +505,30 @@ pub const Dal = struct {
                 };
                 return d;
             },
+            .oracle => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                // service name 就是库名（连接串里的 Database）；端口缺省以方言为准（Oracle 1521）
+                if (opts_owned.port == 3306) opts_owned.port = @import("zzig").oracle.default_port;
+                if (opts_owned.database.len == 0) return error.NoDatabase;
+                var d = Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+                d.oracle_lib = @import("zzig").oracle.Lib.load(gpa) catch |e| {
+                    std.debug.print(
+                        "[zcode] Oracle 不可用（{s}）：需要 Oracle Instant Client（Basic 包），" ++
+                            "把 oci.dll / libclntsh.so 放到 exe 同目录或 PATH\n",
+                        .{@errorName(e)},
+                    );
+                    return e;
+                };
+                return d;
+            },
             else => return error.Unsupported,
         }
     }
@@ -528,6 +554,7 @@ pub const Dal = struct {
         self.connections.deinit(self.gpa);
         if (self.lib) |*lib| lib.deinit();
         if (self.duck_lib) |*lib| lib.module.close(self.gpa);
+        if (self.oracle_lib) |*lib| lib.module.close(self.gpa);
         self.opts.deinit(self.gpa);
         self.model.deinit();
     }
@@ -862,6 +889,23 @@ pub const Dal = struct {
                 const db = try @import("zzig").duckdb.Db.open(self.gpa, lib, .{ .path = opts.data_source });
                 return Session.initWithDriver(self.gpa, .duckdb, .{ .duckdb = db });
             },
+            .oracle => {
+                const lib = if (self.oracle_lib) |*l| l else return error.Unsupported;
+                // 两种写法都支持：
+                // 1) Server=host + Database=SERVICE_NAME（常规）
+                // 2) Server 直接给完整 DSN（`//host:1521/svc` 或 `(DESCRIPTION=(...))`）
+                const looks_like_dsn = std.mem.indexOf(u8, opts.server, "//") != null or
+                    std.mem.indexOf(u8, opts.server, "(") != null;
+                const conn = try @import("zzig").oracle.Conn.open(self.gpa, lib, .{
+                    .host = if (looks_like_dsn) "127.0.0.1" else opts.server,
+                    .port = opts.port,
+                    .user = opts.user,
+                    .password = opts.password,
+                    .service = if (looks_like_dsn) "" else opts.database,
+                    .dsn = if (looks_like_dsn) opts.server else "",
+                });
+                return Session.initWithDriver(self.gpa, .oracle, .{ .oracle = conn });
+            },
             else => return error.Unsupported,
         }
     }
@@ -886,6 +930,7 @@ pub const Dal = struct {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
             .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .nova, .kingbase, .highgo, .vastbase => true,
+            .oracle => true,
             else => false,
         };
     }
@@ -2206,6 +2251,31 @@ test "连接串：时序库 / 国产库 Provider 与 InfluxDB 专属键" {
         dal_ok.deinit(); // 本机装了 duckdb.dll：能建就好，随后正常释放
     } else |e| {
         try std.testing.expectEqual(@import("zzig").duckdb.Error.DuckDbNotAvailable, e);
+    }
+}
+
+test "Oracle：连接串解析 + 缺客户端库时立即报 OracleNotAvailable" {
+    const a = std.testing.allocator;
+
+    // Provider 认得出，端口缺省按方言（1521），Database 当 service name
+    var opts = try parseConnectionString(a, "Provider=Oracle;Server=127.0.0.1;Database=ORCL;UserID=scott;Password=tiger");
+    defer opts.deinit(a);
+    try std.testing.expectEqual(DatabaseKind.oracle, opts.provider);
+    try std.testing.expectEqualStrings("ORCL", opts.database);
+    try std.testing.expectEqualStrings("scott", opts.user);
+
+    // 缺 service name 直接拒绝（Oracle 必须有 service/SID 才能定位容器库）
+    const m1 = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    try std.testing.expectError(error.NoDatabase, Dal.initWithModel(a, "Provider=Oracle;Server=127.0.0.1;UserID=x;Password=y", m1));
+
+    // 有连接串后：缺 oci.dll 时**立即**报错（不拖到第一次查询）；装了 Instant Client 则建好即可
+    const m2 = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    const ora = Dal.initWithModel(a, "Provider=Oracle;Server=127.0.0.1;Database=ORCL;UserID=scott;Password=tiger", m2);
+    if (ora) |d| {
+        var dal_ok = d;
+        dal_ok.deinit(); // 本机有 Oracle 客户端库：能建就好，随后正常释放
+    } else |e| {
+        try std.testing.expectEqual(@import("zzig").oracle.Error.OracleNotAvailable, e);
     }
 }
 

@@ -32,8 +32,8 @@
 - **口径（用户 2026-11-13 明确）：迁移优先，不要以「本机无实例」为由拒绝实现**——
   缺的方法要实现；公共能力下沉 `zzig`；**无实例的驱动用回环假服务端（`zzig/src/db/http_loopback_test.zig` 范式）守住协议**，
   真库验证留到有条件时。
-- **执行层矩阵（2026-11-14）**：已接 **9 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
-  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG** / **DuckDB 嵌入式**）+ 2 组协议复用
+- **执行层矩阵（2026-11-14）**：已接 **10 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
+  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG** / **DuckDB 嵌入式** / **Oracle OCI 动态加载**）+ 2 组协议复用
   （**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
   - InfluxDB **不是 SQL 库**：`insert`/`upsert` 走 **Line Protocol**（`dbtable.influxLineAlloc`：时间列→行尾纳秒、
     主键→tag、其余→field），查询走 Flux（v2）或 InfluxQL（v1）；不要试图给它生成 `INSERT INTO`。
@@ -43,6 +43,15 @@
   - **MongoDB 是文档库**：`Session.execute`/`queryRows` 对其明确 `error.Unsupported`，
     文档操作走 `Session.mongodbConn()`（`insert`/`findAlloc`/`update`/`delete`/`runCommandAlloc`），与 C# 同口径；
     OP_MSG 只发 kind 0；鉴权只实现 SCRAM-SHA-256（不做静默降级）。
+  - **Oracle 走 OCI 动态加载**（不链 `libclntsh`）：`zzig.db.oracle` 只绑 18 个入口，句柄全不透明指针，
+    **列值统一按 `SQLT_STR` 取文本**（不碰 `OCIDate`/`OCINumber` 编解码），缓冲区按 `ATTR_DATA_SIZE*4` 夹在 `[64, 32767]`；
+    缺 `oci.dll`/`libclntsh.so` 报 `error.OracleNotAvailable`（**不是 panic**），目标机需放 Instant Client。
+    常量（`DTYPE_PARAM=53`、`ATTR_NAME=4`、`ATTR_SERVER=6`、`ATTR_ROW_COUNT=9`、`ATTR_PARAM_COUNT=18` 等）
+    已与 `oracle/odpi` 的 `DPI_OCI_*` 核对过，**有写死数字的用例守着，不要随手改**。
+    Oracle **事务是隐式的**：`beginTransaction` 不发 `BEGIN`，只在显式隔离级别时发 `SET TRANSACTION`；
+    `lastInsertId` 恒 0（用 `SEQ_{表名}.CURRVAL` / `RETURNING`）。
+  - **未验证真库成功路径**：DuckDB（需 `duckdb.dll`）、Oracle（需 Instant Client + 实例）；失败路径都有用例守着，
+    有条件时优先补这两个的真库用例——**汇报时不得把“已接线”说成“已实测”**。
 - **两级缓存已逐条对齐 C#（`docs/决策记录.md` 第（三十五）节）**：
   - `cache.Cache(T)`（`Meta.Cache`，整表）：**硬内存上限 = `MaxCacheCount` 行**，装载带 `LIMIT max_rows+1`，
     超限**一行不留** + 60s 静默期；`MaxCacheCount <= 0` 永不缓存。读路径无锁（不可变快照 + 原子发布）。

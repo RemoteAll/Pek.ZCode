@@ -44,7 +44,7 @@
 | SQL 模版 / 显示选项 | `Configuration/{SqlTemplate,ShowInOption}`、`Attributes/ModelSortMode` | — | `src/sqltemplate.zig` | ✅ `-- [方言]` 分段解析 + 回落默认；`ShowInOption` 三种写法（具名列表+宏 / 管道 5 段 / 5 字符掩码）；`ModelSortMode` 枚举 |
 | 缓存协调与表缓存 | `Cache/{CacheInvalidator,DataCache,DbCache,LazyConsumer}` | — | `src/dbcache.zig` | ✅ 分布式版本号（可插 Provider + 内存实现）联动本地失效；运行数据缓存（表行数 + 字段键值，可落文本）；**表当缓存**（Name/Value/CreateTime/ExpiredTime + 过期清理）；惰性串行消费者（空闲不占线程） |
 | 数据包 | `DataAccessLayer/DbPackage` | — | `src/dbpackage.zig` | ✅ 表级导出/导入/跨库同步（按页抽取，内存只留一页）；四种保存模式；✅ **多表归档** `backupAllToFile` / `restoreAllFromFile`：`.zip`（每表一个 `<表>.zcode` 条目 + 可选 `Model.xml`，归档实现下沉 `zzig.zip`）、`.gz`（多块文本整体 gzip，`zzig.http.gz*`）、纯文本三档，按扩展名自动选择；**未做**：Actor 双线程并行（单线程流水已足够，并行需背压） |
-| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig`、`db/tdengine.zig`、`db/influxdb.zig`、`db/clickhouse.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数、命名预处理语句复用；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**；✅ **TDengine（REST `/rest/sql`，6041）**：Basic 鉴权、`code/column_meta/data` 与 2.x `status/head` 两代响应、参数客户端内联、`SERVER_VERSION()` 探测；✅ **InfluxDB（HTTP）**：v2 `/api/v2/write` + `/api/v2/query`（Flux 注解 CSV）、v1 `/write` + `/query`（InfluxQL JSON）、`insert`/`upsert` 走 **Line Protocol**（列分时间/标签/字段，与 C# `BuildLineProtocol` 一致）；✅ **ClickHouse（HTTP 8123）**：`default_format=JSONCompact` 一次请求拿结构化的行列、`X-ClickHouse-User/Key` 头鉴权、64 位整数按字符串回时按列类型解析回整数、`Nullable/LowCardinality/SimpleAggregateFunction` 外壳剥离、`GET /ping` 探活、`version()` 探测；✅ **MongoDB（OP_MSG + BSON + SCRAM-SHA-256）**：`hello` 握手、`insert`/`find`/`update`/`delete`/`count`/任意命令、ObjectId/日期/子文档映射，**文档库不走 SQL**（`Session.mongodbConn()` 入口，与 C# 同口径）；✅ **PG 系国产库**（金仓/瀚高/海量）复用 PostgreSQL 驱动、**NovaDb** 复用 MySQL 驱动；✅ **DuckDB（嵌入式）**：动态加载 `duckdb.dll`/`libduckdb.so`（不链 C 库，缺库时 `Lib.load` 明确报 `DuckDbNotAvailable` 而非 panic），`duckdb_result` 按 duckdb.h 布局声明、列值按 `duckdb_type` 还原（整数族/浮点/Decimal/时间/BLOB）；❌ 仍未接（排队中，不写“不做”）：Oracle（TNS/OCI） |
+| 其它执行驱动 | `DH.NCode.{SqlServer,PostgreSQL,Oracle,…}` | `mssql/postgres/oracle/odbc/…` | `zzig`：`db/postgres.zig`、`db/tds.zig`、`db/tdengine.zig`、`db/influxdb.zig`、`db/clickhouse.zig` | ✅ **PostgreSQL**：协议 3.0，Trust/Cleartext/MD5/SCRAM-SHA-256 鉴权、简单查询与扩展查询（参数 text 格式）、文本结果解码、影响行数、命名预处理语句复用；✅ **SQL Server（TDS 7.4）**：PRELOGIN/LOGIN7（SQL 认证）、SQL 批处理、RPC `sp_executesql` 带参、COLMETADATA/ROW/NBCROW/DONE/ERROR 令牌、`SCOPE_IDENTITY()` 回写；**TLS(ENCRYPTION=ON/REQ) 明确报 `TlsRequired`**；✅ **TDengine（REST `/rest/sql`，6041）**：Basic 鉴权、`code/column_meta/data` 与 2.x `status/head` 两代响应、参数客户端内联、`SERVER_VERSION()` 探测；✅ **InfluxDB（HTTP）**：v2 `/api/v2/write` + `/api/v2/query`（Flux 注解 CSV）、v1 `/write` + `/query`（InfluxQL JSON）、`insert`/`upsert` 走 **Line Protocol**（列分时间/标签/字段，与 C# `BuildLineProtocol` 一致）；✅ **ClickHouse（HTTP 8123）**：`default_format=JSONCompact` 一次请求拿结构化的行列、`X-ClickHouse-User/Key` 头鉴权、64 位整数按字符串回时按列类型解析回整数、`Nullable/LowCardinality/SimpleAggregateFunction` 外壳剥离、`GET /ping` 探活、`version()` 探测；✅ **MongoDB（OP_MSG + BSON + SCRAM-SHA-256）**：`hello` 握手、`insert`/`find`/`update`/`delete`/`count`/任意命令、ObjectId/日期/子文档映射，**文档库不走 SQL**（`Session.mongodbConn()` 入口，与 C# 同口径）；✅ **PG 系国产库**（金仓/瀚高/海量）复用 PostgreSQL 驱动、**NovaDb** 复用 MySQL 驱动；✅ **DuckDB（嵌入式）**：动态加载 `duckdb.dll`/`libduckdb.so`（不链 C 库，缺库时 `Lib.load` 明确报 `DuckDbNotAvailable` 而非 panic），`duckdb_result` 按 duckdb.h 布局声明、列值按 `duckdb_type` 还原（整数族/浮点/Decimal/时间/BLOB）；✅ **Oracle（OCI 动态加载，2026-11-14）**：不链 `libclntsh`，运行期加载 `oci.dll`/`libclntsh.so`（复用 `zzig.dyn`），只绑 18 个入口；句柄全不透明指针，**列值统一按 `SQLT_STR` 取成文本**（不碰 `OCIDate`/`OCINumber` 编解码）；缺客户端库时 `error.OracleNotAvailable` + 提示 dll 位置（不 panic）。**执行层已达 10 家，无「未接」项** |
 
 ## 2. 逐项语义对齐（已实现部分）
 
@@ -284,7 +284,7 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 | SQLite 通过 DLL 动态加载 | 不链 libc / UCRT（`-lc` 在 Win7 起不来）；也便于替换 SQLite 版本 |
 | 值不拥有内存（借用 + 会话 arena） | 避免每行一次堆分配；调用方需保证生命周期 |
 | `Db/Query` 默认回 JSON 行列（二进制需 `?format=packet`） | Rust 版也是 JSON；二进制模式是为 C# `DbTable.Read` 互通而加，两者并存不改变旧行为。C# 侧 `DbController.Query` 只有二进制一种形态（它的 `ToPacket` 自己标着“暂时有问题”），所以“跟 C# 一模一样”就只能二选一：默认 JSON 保持与 Rust 一致，需要 C# 互通时客户端显式要 packet |
-| Oracle 执行驱动**待做**（改用纯协议实现，不再依赖 `oci.dll`） | 原计划走 OCI（无 `oci.dll` / `libclntsh`、也无实例）；2026-11-13 已定口径：**按 TNS/OCI 线协议自实现**（与 MySQL/PG/TDS 同路子），排在 ClickHouse / MongoDB 之后 |
+| Oracle 执行驱动走 **OCI 动态加载**（2026-11-14 定案，改掉 11-13 的「纯 TNS 自实现」） | 两条路都拿不到真库验证（本机无实例、也无 `oci.dll`/`libclntsh`），那就选**首连成功率最高**的：OCI 的 ABI 公开稳定、句柄全不透明指针、值统一 `SQLT_STR`；TNS/TTC 是无规范私有协议，几千行写出来只能「看着像能跑」。代价是目标机要放一份 Instant Client（免费），缺库时明确报 `OracleNotAvailable` |
 | `TimeExtractor` 空窗时把起点推进到窗口末尾 | C# 版空窗只加倍步进、`StartTime` 不动，步进封顶到 1 天后就对同一段空区间**反复查询（原地死循环）**；这里必须能终止 |
 | `stat` 的 `avg` 直接报 `error.Unsupported` | C# 的均值由业务层「先读再算」；本库不提供假的原子实现，要求调用方自己维护 `Sum` + `Count` |
 | `StatModel.init` 不截断、`StatModel.at` 截断 | 与 C# 一致（C# 是 `Fill`/`Split` 才截断）；分开两个构造器让“要不要截断”显式化，避免静默改变时间值 |
@@ -399,10 +399,13 @@ ZCode 侧的转出（方便消费方少一个依赖）：`zcode.Decimal` / `zcod
 原来“不做”的三件已全部落地：① `InfluxDB` / `TDengine` 驱动（REST/HTTP，无实例 → 回环用例验证协议）；
 ② `DbPackage` 的 `.gz` / `zip` 多表归档（zip 实现下沉到 `zzig.zip`，现已与 Python `zipfile`/`gzip` 互操作复检）；
 ③ 跨类型 `EntityExtension.Merge<T,T2>`（`mergeAny` + `copyFromAny`）。
-**执行层 = 9 家驱动 + 2 组协议复用**（SQLite / MySQL / PostgreSQL / SQL Server / TDengine / InfluxDB / **ClickHouse** / **MongoDB** / **DuckDB**；
+**执行层 = 10 家驱动 + 2 组协议复用**（SQLite / MySQL / PostgreSQL / SQL Server / TDengine / InfluxDB / **ClickHouse** / **MongoDB** / **DuckDB** / **Oracle**；
 金仓·瀚高·海量→PG，Nova→MySQL）。
-**真正剩下的**：Oracle（TNS/OCI 纯协议）一家执行驱动，
-以及其余方言仍然只有 SQL 生成层——这些需要「协议实现 + 真库/实例」才能交付，按顺序排队（不写“不做”）。
+**执行驱动已无欠账**：Oracle 走 OCI 动态加载（需目标机放 Instant Client，缺库明确报错），
+其余方言仍然只有 SQL 生成层（DuckDB 之外的四家非主流方言、Access/SqlCe/HANA 等）——
+这些属于「方言有、协议无」的历史边界，按顺序排队（不写“不做”）。
+**未验证清单（诚实台账）**：DuckDB（需 `duckdb.dll`）、Oracle（需 Instant Client + 实例）——
+两者的**失败路径**都有用例守住，但**真库成功路径一次都没跑过**，有条件时优先补这两个。
 
 > 台账保鲜纪律（2026-11-13 实战教训）：这张表曾把 `Membership` 的 `UserStore`/`PinYin`/`Area` 与
 > `EntityExtension` 的 `Clone`/`CopyFrom`/`Valid`/`ToDictionary` 记成「未做」，而它们**早已实现**（见决策记录第二十五~三十节），
