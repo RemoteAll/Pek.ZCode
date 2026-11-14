@@ -76,6 +76,8 @@ pub const simulation = @import("simulation.zig");
 pub const search = @import("search.zig");
 /// 按 key 串行化（条带锁，对应 C# `KeyedLocker`；`entity.getOrAdd` 靠它防并发重复插入）
 pub const keyed_lock = @import("keyed_lock.zig");
+/// 数据字典 HTML 生成（模型 → 表/字段清单，对应 C# `HtmlBuilder.BuildDataDictionary`）
+pub const datadict = @import("datadict.zig");
 /// 整表实体缓存（Blocking 一致性 + 写后自动失效）
 pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
@@ -195,6 +197,7 @@ test {
     _ = @import("simulation.zig");
     _ = @import("search.zig");
     _ = @import("keyed_lock.zig");
+    _ = @import("datadict.zig");
     _ = @import("entity_ext.zig");
     _ = @import("extends.zig");
     _ = @import("fieldcache.zig");
