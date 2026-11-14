@@ -1100,6 +1100,61 @@ test "深分页倒序优化：倒序取尾部再翻回来，结果与正序分�
     try std.testing.expectEqual(@as(usize, 2), deep_n.rows.len);
 }
 
+test "大表护栏：配了 MaxQueryRows 后，全量查询超限直接报错（不是 OOM）" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "guard");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    const now = zcode.DateTime.nowLocal();
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const code = try std.fmt.allocPrint(a, "g{d}", .{i + 1});
+        defer a.free(code);
+        _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = code } },
+            .{ .name = "Title", .value = .{ .text = "t" } },
+            .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("1.0000") } },
+            .{ .name = "Ok", .value = .{ .boolean = true } },
+            .{ .name = "CreateTime", .value = .{ .datetime = now } },
+        });
+    }
+
+    const old = zcode.setting.snapshot();
+    defer zcode.setting.restore(old);
+
+    var q = zcode.Query.init(a);
+    defer q.deinit();
+
+    // 上限 5，表里 6 行 → 必须明确报 TooManyRows（而不是悄悄吃掉内存）
+    var limited = zcode.setting.Setting{ .max_query_rows = 5, .max_query_rows_warn = 0 };
+    zcode.setting.setCurrent(limited);
+    try std.testing.expectError(error.TooManyRows, table.queryRows(&s, &q));
+
+    // 上限放到 10 → 正常返回 6 行
+    limited.max_query_rows = 10;
+    zcode.setting.setCurrent(limited);
+    const rows = try table.queryRows(&s, &q);
+    try std.testing.expectEqual(@as(usize, 6), rows.len);
+
+    // 默认（不限）——确认默认不会误伤既有调用方
+    zcode.setting.restore(old);
+    const rows2 = try table.queryRows(&s, &q);
+    try std.testing.expectEqual(@as(usize, 6), rows2.len);
+}
+
 // 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
 test {
     _ = @import("integration_features.zig");

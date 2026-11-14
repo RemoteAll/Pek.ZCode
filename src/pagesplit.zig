@@ -644,7 +644,8 @@ test "深分页倒序：三条门槛（偏移 / 总数 / 过半）与尾部偏�
     try std.testing.expectEqual(@as(?usize, 1), small.plan(7, 2, 10));
 }
 
-test "多列排序：topNotIn 明确拒绝，doubleTop 正常反向" {    const a = std.testing.allocator;
+test "多列排序：topNotIn 明确拒绝，doubleTop 正常反向" {
+    const a = std.testing.allocator;
     var spec = sample;
     spec.order_by = "Id Desc, Name";
 

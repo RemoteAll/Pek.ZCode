@@ -542,10 +542,17 @@ pub const Session = struct {
 
     /// 查询（返回行集，含列名）。
     pub fn queryRows(self: *Session, sql: []const u8, params: []const Value) ![]const Row {
-        if (!self.sqlTimingNeeded()) return self.queryRowsInner(sql, params);
+        if (!self.sqlTimingNeeded()) {
+            const rows = try self.queryRowsInner(sql, params);
+            // 大表护栏：`queryRows` 是**全量**语义。表名取不到（裸 SQL）就传空串，
+            // 告警里仍然有行数，足够定位。
+            try @import("setting.zig").current().checkRowCount("", rows.len);
+            return rows;
+        }
         const t0 = clock.nowNs();
         const rows = try self.queryRowsInner(sql, params);
         self.logSql(sql, params, clock.nsToMs(clock.nowNs() - t0));
+        try @import("setting.zig").current().checkRowCount("", rows.len);
         return rows;
     }
 

@@ -149,7 +149,37 @@ pub const Setting = struct {
     /// 数据包 / 抽取等大吞吐场景每页行数（0 = 用 `batch_size`）
     page_size: i32 = 0,
 
-    /// 批大小（`<= 0` 时回落到 5000，与 C# `DAL.GetBatchSize` 同口径）。
+    // ---- 大表护栏 ----
+    /// 单次查询返回行数的**告警**阈值：超过就打印一条带表名/行数的告警（0 = 不告警），默认 100_000。
+    ///
+    /// 背景：`queryRows` 是**全量**语义（结果全进会话 arena）。亿级表上一次误用就是 OOM，
+    /// 而调用方往往“没意识到自己拿的是全量”。默认只在 10 万行时告警、不改变行为；
+    /// 要真正拦住就把 `max_query_rows` 也配上。
+    max_query_rows_warn: i32 = 100_000,
+    /// 单次查询返回行数的**硬上限**：超限直接报 `error.TooManyRows`（0 = 不限），默认 0。
+    max_query_rows: i32 = 0,
+
+    /// 大表护栏：行数超过配的告警阈值就打印一条，超过硬上限直接报 `error.TooManyRows`。
+    ///
+    /// 用“告警 + 可选硬限”而不是一律报错：现有代码大量在用 `queryRows`，
+    /// 直接报错会让存量调用方一启动就炸；默认只告警，要更严格就在配置里把 `MaxQueryRows` 配上。
+    pub fn checkRowCount(self: Setting, table_name: []const u8, rows: usize) error{TooManyRows}!void {
+        if (self.max_query_rows > 0 and rows > @as(usize, @intCast(self.max_query_rows))) {
+            std.debug.print(
+                "[zcode] 查询返回 {d} 行，超过配置的硬上限 MaxQueryRows={d}（表 {s}）：\n" ++
+                    "        全量取数会直接把结果全进会话 arena，大表请用 extract.* 分页抽取，或给查询加 take()/分页\n",
+                .{ rows, self.max_query_rows, table_name },
+            );
+            return error.TooManyRows;
+        }
+        if (self.max_query_rows_warn > 0 and rows >= @as(usize, @intCast(self.max_query_rows_warn))) {
+            std.debug.print(
+                "[zcode] 警告：一次查询返回 {d} 行（表 {s}），已达告警阈值 MaxQueryRowsWarn={d}；\n" ++
+                    "        大表遍历请用 extract.IdExtractor / TimeExtractor（游标分页）而不是全量 queryRows\n",
+                .{ rows, table_name, self.max_query_rows_warn },
+            );
+        }
+    }
     pub fn effectiveBatchSize(self: Setting) usize {
         if (self.batch_size > 0) return @intCast(self.batch_size);
         return 5_000;
@@ -230,6 +260,8 @@ pub const Setting = struct {
         if (std.ascii.eqlIgnoreCase(key, "ExtendExpire")) return setI32(&self.extend_expire, value);
         if (std.ascii.eqlIgnoreCase(key, "FieldCacheExpire")) return setI32(&self.field_cache_expire, value);
         if (std.ascii.eqlIgnoreCase(key, "PageSize")) return setI32(&self.page_size, value);
+        if (std.ascii.eqlIgnoreCase(key, "MaxQueryRowsWarn")) return setI32(&self.max_query_rows_warn, value);
+        if (std.ascii.eqlIgnoreCase(key, "MaxQueryRows")) return setI32(&self.max_query_rows, value);
         return false;
     }
 
@@ -261,6 +293,8 @@ pub const Setting = struct {
         try b.fmt("ExtendExpire={d}\n", .{self.extend_expire});
         try b.fmt("FieldCacheExpire={d}\n", .{self.field_cache_expire});
         try b.fmt("PageSize={d}\n", .{self.page_size});
+        try b.fmt("MaxQueryRowsWarn={d}\n", .{self.max_query_rows_warn});
+        try b.fmt("MaxQueryRows={d}\n", .{self.max_query_rows});
         return b.toOwnedSlice();
     }
 };
@@ -330,6 +364,32 @@ pub fn resetToDefaults() void {
 // ============================ 测试 ============================
 
 const testing = std.testing;
+
+test "大表护栏：默认只告警不报错；配了 MaxQueryRows 超限报 TooManyRows" {
+    // 默认：告警阈值 10 万、硬上限 0（不限）→ 大规模结果也不报错
+    const def = Setting{};
+    try testing.expectEqual(@as(i32, 100_000), def.max_query_rows_warn);
+    try testing.expectEqual(@as(i32, 0), def.max_query_rows);
+    try def.checkRowCount("Big", 200_000);
+
+    // 配了硬上限：超一行就报错（用例不关心告警阈值）
+    var s = Setting{ .max_query_rows = 5, .max_query_rows_warn = 0 };
+    try s.checkRowCount("Big", 5);
+    try testing.expectError(error.TooManyRows, s.checkRowCount("Big", 6));
+
+    // 配置解析与回写
+    var parsed = Setting{};
+    try testing.expect(parsed.apply("MaxQueryRows", "1000"));
+    try testing.expect(parsed.apply("MaxQueryRowsWarn", "100"));
+    try testing.expectEqual(@as(i32, 1000), parsed.max_query_rows);
+    try testing.expectEqual(@as(i32, 100), parsed.max_query_rows_warn);
+
+    const a = testing.allocator;
+    const text = try parsed.writeAlloc(a);
+    defer a.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "MaxQueryRows=1000") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "MaxQueryRowsWarn=100") != null);
+}
 
 test "默认值（SQL 输出默认为关，对齐 C# 发布版行为）" {
     const s = Setting{};

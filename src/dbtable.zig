@@ -345,6 +345,9 @@ pub const TableRef = struct {
         const sql = try sqlbuild.select(self.gpa, self.kind, self.table, self.table_name, q);
         defer sql.deinit(self.gpa);
         const raw = try s.queryRows(sql.text, sql.params);
+        // 大表护栏：queryRows 是**全量**语义，亿级表误用就是 OOM。
+        // 默认只在 10 万行时告警；配了 MaxQueryRows 则直接报错（见 Setting.checkRowCount）。
+        try @import("setting.zig").current().checkRowCount(self.table.name, raw.len);
         return self.normalizeRows(s, raw);
     }
 
