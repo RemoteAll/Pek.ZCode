@@ -149,5 +149,7 @@ fn sampleValue(dt: zcode.DataType, idx: usize) zcode.Value {
         .datetime => .{ .datetime = zcode.DateTime.nowLocal() },
         .string, .json => .{ .text = "zcheck" },
         .binary => .{ .blob = "zcheck" },
+        // Guid 列由拦截器/业务给值；自检里给一个固定合法 GUID，保证建表/写入/读回全链路走一遍
+        .guid => .{ .text = "00000000-0000-4000-8000-00000000000" ++ "1" },
     };
 }
