@@ -148,6 +148,16 @@ fn hasColumn(table: *const TableMeta, name: []const u8) bool {
     return false;
 }
 
+/// 是否存在指定名字的**字符串**列（对应 C# `OnInit` 里的 `fi.Type == typeof(String)`）。
+///
+/// `CreateIP` / `UpdateIP` 是字符串列才处理；同名的整数列（误建）不应被写入 IP 文本。
+fn hasStringColumn(table: *const TableMeta, name: []const u8) bool {
+    for (table.columns) |*c| {
+        if (std.ascii.eqlIgnoreCase(table.effectiveColumnName(c), name) and c.data_type == .string) return true;
+    }
+    return false;
+}
+
 // ───────────────────────── 内置拦截器 ─────────────────────────
 
 /// 时间拦截器：插入填 `CreateTime` / `UpdateTime`，更新刷新 `UpdateTime`。
@@ -277,6 +287,113 @@ pub const TraceInterceptor = struct {
     }
 };
 
+/// IP 拦截器：插入填 `CreateIP` / `UpdateIP`，更新刷新 `UpdateIP`（对应 C# `IPModule` / `IPInterceptor`）。
+///
+/// 口径逐条照 C#：
+/// - 只对**存在** `CreateIP` / `UpdateIP` 列的表生效（对应 `OnInit`）；
+/// - 插入时用「默认值才覆盖」的 `SetItem` 语义，更新时用「调用方没传才补」的 `SetNoDirtyItem` 语义；
+/// - **只在插入时**回退到本机 IP（C# 注释：更新时回退会把原来的更新 IP 覆盖成本机 IP）；
+/// - IP 带协议前缀（`http://host:port`）时**剥掉前缀**再落库；
+/// - `allow_empty = false` 且确实没 IP 时**什么都不做**（C# 的 `else if (AllowEmpty)`）；
+/// - `delete` 一律不处理。
+///
+/// 与 C# 的差异：C# 直接调 `NetHelper.MyIP()` 探测本机网卡，Zig 侧改为**由调用方注入 `fallback_fn`**——
+/// 库不主动做网络/网卡探测（亿级场景下隐式 IO 是大忌），要这个行为由接入方传进来。
+pub const IpInterceptor = struct {
+    /// 当前请求 IP（空 = 无 IP 信息）
+    ip: []const u8 = "",
+    /// 无 IP 时是否允许把 `UpdateIP` 写成空（对应 C# `AllowEmpty`）
+    allow_empty: bool = true,
+    /// 插入且无 IP 时的兜底取值（对应 C# 的 `NetHelper.MyIP()`，默认不探测）
+    fallback_fn: ?*const fn (gpa: std.mem.Allocator) ?[]const u8 = null,
+
+    pub fn interceptor(self: *IpInterceptor) Interceptor {
+        return .{ .ctx = @ptrCast(self), .apply = applyImpl, .name = "IpInterceptor" };
+    }
+
+    fn applyImpl(ctx: *anyopaque, method: Method, table: *const TableMeta, fields: Fields) anyerror!bool {
+        const self: *IpInterceptor = @ptrCast(@alignCast(ctx));
+        if (method == .delete) return false;
+
+        const has_create = hasStringColumn(table, "CreateIP");
+        const has_update = hasStringColumn(table, "UpdateIP");
+        if (!has_create and !has_update) return false;
+
+        var ip = self.ip;
+        if (ip.len == 0 and method == .insert) {
+            if (self.fallback_fn) |f| {
+                if (f(fields.gpa)) |v| ip = v;
+            }
+        }
+
+        if (ip.len > 0) {
+            ip = stripScheme(ip);
+            var touched = false;
+            switch (method) {
+                .insert => {
+                    if (has_create) {
+                        if (try fields.setIfDefault("CreateIP", .{ .text = ip })) touched = true;
+                    }
+                    if (has_update) {
+                        if (try fields.setIfDefault("UpdateIP", .{ .text = ip })) touched = true;
+                    }
+                },
+                .update => {
+                    if (has_update) {
+                        if (try fields.setIfAbsent("UpdateIP", .{ .text = ip })) touched = true;
+                    }
+                },
+                .delete => {},
+            }
+            return touched;
+        }
+
+        // 没有 IP：只有明确允许清空时才动 UpdateIP（C# `else if (AllowEmpty) SetNoDirtyItem(...)`）
+        if (self.allow_empty and has_update) {
+            return try fields.setIfAbsent("UpdateIP", .{ .text = "" });
+        }
+        return false;
+    }
+};
+
+/// 剥掉 `scheme://` 前缀（C# `IPModule`：`ip.IndexOf("://")` 之后的部分）
+fn stripScheme(ip: []const u8) []const u8 {
+    const p = std.mem.indexOf(u8, ip, "://") orelse return ip;
+    return ip[p + 3 ..];
+}
+
+/// 标准审计链（对应 C# 代码生成器给每个实体加的那四行 `Meta.Interceptors.Add(...)`）。
+///
+/// C# 的 `{Name}.Biz.cs` 静态构造里固定注册 `UserInterceptor` / `TimeInterceptor` /
+/// `IPInterceptor` / `TraceInterceptor` 四个，这里是同口径的一体化封装：
+///
+/// ```zig
+/// var std = zcode.interceptor.Standard{ .user = .{ .user_id = 7, .user_name = "alice" } };
+/// defer std.deinit();
+/// try std.addTo(&chain);   // User → Time → IP → Trace（与 C# 注册顺序一致）
+/// ```
+///
+/// 拦截器实例**存在 `Standard` 内部**（链只持有指针），所以 `Standard` 的生命周期必须长于链。
+pub const Standard = struct {
+    user: UserInterceptor = .{},
+    time: TimeInterceptor = .{},
+    ip: IpInterceptor = .{},
+    trace: TraceInterceptor = .{},
+
+    /// 按 C# 的顺序挂到链上。
+    pub fn addTo(self: *Standard, chain: *Chain) !void {
+        try chain.add(self.user.interceptor());
+        try chain.add(self.time.interceptor());
+        try chain.add(self.ip.interceptor());
+        try chain.add(self.trace.interceptor());
+    }
+
+    /// 目前四个拦截器都不持有需要释放的资源；保留 `deinit` 是为了以后加字段时不破坏调用方。
+    pub fn deinit(self: *Standard) void {
+        _ = self;
+    }
+};
+
 // ───────────────────────────── 测试 ─────────────────────────────
 
 test "默认值判定" {
@@ -397,4 +514,168 @@ fn fieldsValue(items: []const Field, name: []const u8) ?Value {
         if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
     }
     return null;
+}
+
+test "IP 拦截器：插入补 CreateIP/UpdateIP，更新只刷 UpdateIP，协议前缀剥掉" {
+    const a = std.testing.allocator;
+    var m = try model.EntityModel.parse(a,
+        \\<EntityModel><Tables><Table Name="Order" TableName="DH_Order">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="CreateIP" DataType="String" Length="50" />
+        \\    <Column Name="UpdateIP" DataType="String" Length="50" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    );
+    defer m.deinit();
+
+    var ii = IpInterceptor{ .ip = "http://10.0.0.9:8080", .allow_empty = false };
+    var chain = Chain.init(a);
+    defer chain.deinit();
+    try chain.add(ii.interceptor());
+
+    // 插入：两列都补，且剥掉 `http://`
+    var items: std.ArrayList(Field) = .empty;
+    defer items.deinit(a);
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items });
+    try std.testing.expectEqualStrings("10.0.0.9:8080", fieldsValue(items.items, "CreateIP").?.asText().?);
+    try std.testing.expectEqualStrings("10.0.0.9:8080", fieldsValue(items.items, "UpdateIP").?.asText().?);
+
+    // 调用方显式传了 CreateIP → 插入不覆盖（SetItem 只覆盖默认值）
+    var items2: std.ArrayList(Field) = .empty;
+    defer items2.deinit(a);
+    try items2.append(a, .{ .name = "CreateIP", .value = .{ .text = "1.2.3.4" } });
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items2 });
+    try std.testing.expectEqualStrings("1.2.3.4", fieldsValue(items2.items, "CreateIP").?.asText().?);
+
+    // 更新：只补 UpdateIP，不动 CreateIP
+    var sets: std.ArrayList(Field) = .empty;
+    defer sets.deinit(a);
+    try chain.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &sets });
+    try std.testing.expectEqual(@as(usize, 1), sets.items.len);
+    try std.testing.expectEqualStrings("UpdateIP", sets.items[0].name);
+    try std.testing.expectEqualStrings("10.0.0.9:8080", sets.items[0].value.asText().?);
+
+    // 更新时调用方已传 UpdateIP → 不覆盖
+    var sets2: std.ArrayList(Field) = .empty;
+    defer sets2.deinit(a);
+    try sets2.append(a, .{ .name = "UpdateIP", .value = .{ .text = "5.6.7.8" } });
+    try chain.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &sets2 });
+    try std.testing.expectEqual(@as(usize, 1), sets2.items.len);
+    try std.testing.expectEqualStrings("5.6.7.8", sets2.items[0].value.asText().?);
+
+    // delete 一律不处理
+    var dels: std.ArrayList(Field) = .empty;
+    defer dels.deinit(a);
+    try chain.applyTo(.delete, &m.tables[0], .{ .gpa = a, .items = &dels });
+    try std.testing.expectEqual(@as(usize, 0), dels.items.len);
+}
+
+test "IP 拦截器：无 IP 时 allow_empty 决定是否清空 UpdateIP；插入可用注入的兜底探测" {
+    const a = std.testing.allocator;
+    var m = try model.EntityModel.parse(a,
+        \\<EntityModel><Tables><Table Name="Order" TableName="DH_Order">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" PrimaryKey="True" />
+        \\    <Column Name="UpdateIP" DataType="String" Length="50" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    );
+    defer m.deinit();
+
+    // allow_empty = false：没 IP 就不动
+    var strict = IpInterceptor{ .allow_empty = false };
+    var chain = Chain.init(a);
+    defer chain.deinit();
+    try chain.add(strict.interceptor());
+
+    var items: std.ArrayList(Field) = .empty;
+    defer items.deinit(a);
+    try chain.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &items });
+    try std.testing.expectEqual(@as(usize, 0), items.items.len);
+
+    // allow_empty = true：把 UpdateIP 写成空（C# `SetNoDirtyItem(UpdateIP, ip)` 且 ip 为空）
+    var loose = IpInterceptor{ .allow_empty = true };
+    var chain2 = Chain.init(a);
+    defer chain2.deinit();
+    try chain2.add(loose.interceptor());
+
+    var items2: std.ArrayList(Field) = .empty;
+    defer items2.deinit(a);
+    try chain2.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &items2 });
+    try std.testing.expectEqualStrings("", fieldsValue(items2.items, "UpdateIP").?.asText().?);
+
+    // 插入时的兜底探测（对应 C# `NetHelper.MyIP()`，这里由调用方注入）
+    var with_fallback = IpInterceptor{ .fallback_fn = &fakeMyIp };
+    var chain3 = Chain.init(a);
+    defer chain3.deinit();
+    try chain3.add(with_fallback.interceptor());
+
+    var items3: std.ArrayList(Field) = .empty;
+    defer items3.deinit(a);
+    try chain3.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items3 });
+    try std.testing.expectEqualStrings("192.168.1.10", fieldsValue(items3.items, "UpdateIP").?.asText().?);
+
+    // 更新时**不**走兜底（否则会把原来的更新 IP 覆盖成本机 IP，C# 注释明确这一点）
+    // 注意：这里必须 `allow_empty = false`，否则按 C# 的 `else if (AllowEmpty)` 会把 UpdateIP 写成空
+    var with_fallback2 = IpInterceptor{ .fallback_fn = &fakeMyIp, .allow_empty = false };
+    var chain4 = Chain.init(a);
+    defer chain4.deinit();
+    try chain4.add(with_fallback2.interceptor());
+
+    var items4: std.ArrayList(Field) = .empty;
+    defer items4.deinit(a);
+    try chain4.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &items4 });
+    try std.testing.expectEqual(@as(usize, 0), items4.items.len);
+}
+
+fn fakeMyIp(gpa: std.mem.Allocator) ?[]const u8 {
+    _ = gpa;
+    return "192.168.1.10";
+}
+
+test "标准审计链：一次挂上 User/Time/IP/Trace，四个审计列都补齐" {
+    const a = std.testing.allocator;
+    var m = try model.EntityModel.parse(a,
+        \\<EntityModel><Tables><Table Name="Order" TableName="DH_Order">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="CreateTime" DataType="DateTime" />
+        \\    <Column Name="UpdateTime" DataType="DateTime" />
+        \\    <Column Name="CreateUserID" DataType="Int32" />
+        \\    <Column Name="CreateUser" DataType="String" Length="50" />
+        \\    <Column Name="UpdateUserID" DataType="Int32" />
+        \\    <Column Name="UpdateUser" DataType="String" Length="50" />
+        \\    <Column Name="CreateIP" DataType="String" Length="50" />
+        \\    <Column Name="UpdateIP" DataType="String" Length="50" />
+        \\    <Column Name="TraceId" DataType="String" Length="100" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    );
+    defer m.deinit();
+
+    var std_chain = Standard{
+        .user = .{ .user_id = 7, .user_name = "alice", .allow_empty = false },
+        .time = .{ .now_fn = &fixedNow },
+        .ip = .{ .ip = "10.0.0.9", .allow_empty = false },
+        .trace = .{ .trace_id = "t1" },
+    };
+    defer std_chain.deinit();
+
+    var chain = Chain.init(a);
+    defer chain.deinit();
+    try std_chain.addTo(&chain);
+    try std.testing.expectEqual(@as(usize, 4), chain.list.items.len);
+
+    var items: std.ArrayList(Field) = .empty;
+    defer items.deinit(a);
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items });
+
+    try std.testing.expectEqual(@as(i32, 2024), findDt(items.items, "CreateTime").?.year);
+    try std.testing.expectEqual(@as(i32, 2024), findDt(items.items, "UpdateTime").?.year);
+    try std.testing.expectEqual(@as(i64, 7), fieldsValue(items.items, "CreateUserID").?.asI64().?);
+    try std.testing.expectEqualStrings("alice", fieldsValue(items.items, "CreateUser").?.asText().?);
+    try std.testing.expectEqualStrings("10.0.0.9", fieldsValue(items.items, "CreateIP").?.asText().?);
+    try std.testing.expectEqualStrings("10.0.0.9", fieldsValue(items.items, "UpdateIP").?.asText().?);
+    try std.testing.expectEqualStrings("t1", fieldsValue(items.items, "TraceId").?.asText().?);
 }

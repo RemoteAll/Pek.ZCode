@@ -94,11 +94,29 @@ pub const EntityMeta = struct {
 };
 
 pub fn markDirty(bits: *DirtyBits, index: usize) void {
+    // 生成代码里的下标来自模型声明顺序，`checkMeta` 已在编译期挡住 > 256 列的表；
+    // 这里再断一次，避免手写调用把位移溢出变成未定义行为。
+    std.debug.assert(index < max_fields);
     bits.* |= (@as(DirtyBits, 1) << @intCast(index));
 }
 
 pub fn isDirty(bits: DirtyBits, index: usize) bool {
+    std.debug.assert(index < max_fields);
     return (bits & (@as(DirtyBits, 1) << @intCast(index))) != 0;
+}
+
+/// 编译期校验模型能不能装进实体的脏位图，并原样返回（生成代码写 `pub const meta = checkMeta(.{...});`）。
+///
+/// 为什么要在编译期卡：`DirtyBits = u256`，超宽列数会让 `1 << index` 位移溢出（ReleaseFast 下是 UB），
+/// 而这种表（宽表 / 几百列的采集表）真的会出现，必须在**生成/编译**阶段就报清楚，不拖到运行期。
+pub fn checkMeta(comptime meta: EntityMeta) EntityMeta {
+    if (meta.fields.len > max_fields) {
+        @compileError(std.fmt.comptimePrint(
+            "实体 {s} 有 {d} 列，超过脏位图宽度 {d}：请拆表，或调整 zcode.entity.max_fields / DirtyBits",
+            .{ meta.name, meta.fields.len, max_fields },
+        ));
+    }
+    return meta;
 }
 
 fn fieldIndex(meta: EntityMeta, name: []const u8) ?usize {

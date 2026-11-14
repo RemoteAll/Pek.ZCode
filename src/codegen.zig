@@ -149,7 +149,9 @@ pub fn generateTableAllocOpt(gpa: std.mem.Allocator, t: *const TableMeta, opts: 
     try b.add("\n");
 
     // meta
-    try b.add("    pub const meta = zcode.entity.EntityMeta{\n");
+    // 用 `checkMeta(...)` 包起来：列数超过脏位图宽度（256）时在**编译期**报错，
+    // 不要拖到运行期由 `markDirty` 的位移溢出暴露（ReleaseFast 下是 UB）。
+    try b.add("    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{\n");
     try b.fmt("        .name = \"{s}\",\n", .{t.name});
     try b.fmt("        .table_name = \"{s}\",\n", .{t.effectiveTableName()});
     try b.add("        .fields = &.{\n");
@@ -172,7 +174,7 @@ pub fn generateTableAllocOpt(gpa: std.mem.Allocator, t: *const TableMeta, opts: 
         }
         try b.add(" },\n");
     }
-    try b.add("        },\n    };\n\n");
+    try b.add("        },\n    });\n\n");
 
     // 列名常量（对应 C# 生成物里的 `__` 内部类）：业务代码不要再手写列名字符串。
     // 用 `@"..."` 形式，列名是关键字或含空格也能用。

@@ -20,7 +20,7 @@ pub const Article = struct {
     /// 创建时间
     @"CreateTime": zcode.DateTime = .{},
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Article",
         .table_name = "ZCode_Article",
         .fields = &.{
@@ -31,7 +31,7 @@ pub const Article = struct {
             .{ .name = "Ok", .data_type = .boolean, .description = "是否有效" },
             .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {
