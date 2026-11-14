@@ -18,6 +18,8 @@ const std = @import("std");
 const Buf = @import("zzig").Buf;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
+const model = @import("model.zig");
+const DataType = @import("types.zig").DataType;
 
 /// 渲染可能返回的错误（`Buf` 返回 `OutOfMemory` / `WriteFailed`，字面量化可能返回 `NoSpaceLeft`）。
 pub const RenderError = error{ OutOfMemory, WriteFailed, NoSpaceLeft };
@@ -148,12 +150,330 @@ pub fn renderFormatParam(
     try pushFormatted(b, self.format, quoted, ph.slice());
 }
 
+// ── 模糊匹配（≂ C# `LikeExpression`）────────────────────────────────────
+
+/// 模糊匹配的四种模式（≂ C# `FieldItem` 的 `Contains` / `NotContains` / `StartsWith` / `EndsWith`）。
+pub const LikeMode = enum {
+    contains,
+    not_contains,
+    starts_with,
+    ends_with,
+
+    /// 格式串（与 C# `FieldItem` 里写死的完全一致；`{0}` 列名、`{1}` 值）
+    pub fn format(self: LikeMode) []const u8 {
+        return switch (self) {
+            .contains => "{0} Like '%{1}%'",
+            .not_contains => "{0} Not Like '%{1}%'",
+            .starts_with => "{0} Like '{1}%'",
+            .ends_with => "{0} Like '%{1}'",
+        };
+    }
+};
+
+pub const LikeError = error{ EmptyLikeValue, LikeOnNonStringColumn };
+
+/// 模糊匹配表达式（≂ C# `LikeExpression`）。
+///
+/// **与 C# 的差异（显式写下，不偷偷改断言）**：
+/// - 值一律**内联**（`'` → `''`、`%` → `\%`、`_` → `\_`，与 C# `FormatLike` 同一套转义），
+///   **不提供参数化**：C# 的参数化分支输出 `'%@Name%'`（命名参数被写进引号里），
+///   实际执行时不会被替换成值 —— 那是个已知坑，Zig 不复刻；
+/// - 空值：C# 抛 `ArgumentNullException` → 这里 `error.EmptyLikeValue`；
+///   非字符串列：C# 抛 `NotSupportedException` → 这里 `error.LikeOnNonStringColumn`。
+pub const LikeExpression = struct {
+    /// 物理列名
+    column: []const u8,
+    format: []const u8,
+    value: []const u8,
+
+    pub fn isEmpty(self: LikeExpression) bool {
+        return self.column.len == 0 or std.mem.trim(u8, self.format, " \t\r\n").len == 0;
+    }
+
+    pub fn renderInto(
+        self: LikeExpression,
+        gpa: std.mem.Allocator,
+        kind: DatabaseKind,
+        params: ?*std.ArrayList(Value),
+        b: *Buf,
+    ) !void {
+        // 见类型注释：LIKE 值一律内联，不走参数
+        _ = params;
+        if (self.isEmpty()) return;
+
+        const quoted = try kind.quoteAlloc(gpa, self.column);
+        defer gpa.free(quoted);
+        const escaped = try escapeLikeAlloc(gpa, self.value);
+        defer gpa.free(escaped);
+        try pushFormatted(b, self.format, quoted, escaped);
+    }
+};
+
+/// 构造模糊匹配表达式（列必须是字符串列、值不能为空 —— 与 C# 的异常口径对齐）。
+pub fn like(col: *const model.ColumnMeta, mode: LikeMode, value: []const u8) LikeError!LikeExpression {
+    if (value.len == 0) return LikeError.EmptyLikeValue;
+    if (col.data_type != .string) return LikeError.LikeOnNonStringColumn;
+    return .{ .column = col.name, .format = mode.format(), .value = value };
+}
+
+/// LIKE 转义（≂ C# `DbBase.FormatLike`）。
+///
+/// C# 只在值里出现 `'` / `%` / `_` 时才处理，处理顺序是 `'→''`、`%→\%`、`_→\_`；
+/// 单趟逐字符替换与「连续三次 Replace」结果相同（插入的字符不会被再次扫描）。
+pub fn escapeLikeAlloc(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
+    if (std.mem.indexOfAny(u8, value, "'%_") == null) return gpa.dupe(u8, value);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.ensureTotalCapacity(gpa, value.len + 8);
+    for (value) |c| {
+        switch (c) {
+            '\'' => try out.appendSlice(gpa, "''"),
+            '%' => try out.appendSlice(gpa, "\\%"),
+            '_' => try out.appendSlice(gpa, "\\_"),
+            else => try out.append(gpa, c),
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+// ── 集合匹配（≂ C# `InExpression`）──────────────────────────────────────
+
+/// `In` 的右值形态（≂ C# `InExpression.Value` 的三种来源）。
+pub const InSource = union(enum) {
+    /// 值列表（C# `In(IEnumerable)`）；**只剩一项时按 C# 语义退化成 `=` / `<>`**
+    values: []const Value,
+    /// 逗号分隔文本（C# `In(String)`，C# 注释自己都写着「可能有注入风险」）
+    text: []const u8,
+    /// 子查询 SQL 文本（C# `In(SelectBuilder)`；本仓传 `sqlbuild` 渲染好的 SQL）
+    subquery: []const u8,
+};
+
+pub const InError = error{ EmptyInValues, EmptyInText };
+
+/// 集合匹配表达式（≂ C# `InExpression`）。
+///
+/// 口径（逐条照 C#）：
+/// - 值列表**去重且保序**；去重后只剩一项 → 退化成 `列 = 值` / `列 <> 值`（C# `_In` 的行为）；
+/// - 文本形态按 `,` 切分，**丢掉空段与含 `%` 的段**（C# 为兼容 `in("a,b")` 与 `like "%,x,%"` 混写），
+///   切完仍多于一项才逐项格式化，否则**整段当一个值**（C# 就是 `FormatValue(column, Value)`）；
+/// - 值按**列类型**格式化：字符串/日期/二进制加引号（`''` 双写），数值型原样输出。
+///
+/// 差异：Zig 对每段做 `trim`（C# 不 trim，`"a, b"` 会得到字面量 `' b'`）。
+pub const InExpression = struct {
+    /// 物理列名
+    column: []const u8,
+    column_type: DataType = .string,
+    negate: bool = false,
+    source: InSource,
+
+    pub fn isEmpty(self: InExpression) bool {
+        return self.column.len == 0 or switch (self.source) {
+            .values => |v| v.len == 0,
+            .text => |t| std.mem.trim(u8, t, " \t").len == 0,
+            .subquery => |s| std.mem.trim(u8, s, " \t\r\n").len == 0,
+        };
+    }
+
+    /// 渲染。`params == null` 表示非参数化（值内联为字面量）。
+    ///
+    /// 只有 `.values` 形态支持参数化（C# 同样如此：文本与子查询不走参数）。
+    pub fn renderInto(
+        self: InExpression,
+        gpa: std.mem.Allocator,
+        kind: DatabaseKind,
+        params: ?*std.ArrayList(Value),
+        b: *Buf,
+    ) !void {
+        if (self.isEmpty()) return;
+
+        const quoted = try kind.quoteAlloc(gpa, self.column);
+        defer gpa.free(quoted);
+
+        switch (self.source) {
+            .values => |values| {
+                // 只有一项 → 等于/不等于（C# `_In` 的行为）
+                if (values.len == 1) {
+                    try b.add(quoted);
+                    try b.add(if (self.negate) " <> " else " = ");
+                    try pushValue(gpa, kind, params, b, values[0]);
+                    return;
+                }
+                try b.add(quoted);
+                try b.add(if (self.negate) " Not In(" else " In(");
+                for (values, 0..) |v, i| {
+                    if (i > 0) try b.add(",");
+                    try pushValue(gpa, kind, params, b, v);
+                }
+                try b.add(")");
+            },
+            .text => |text| {
+                try b.add(quoted);
+                try b.add(if (self.negate) " Not In(" else " In(");
+                try pushInText(gpa, self.column_type, b, text);
+                try b.add(")");
+            },
+            .subquery => |sql| {
+                try b.add(quoted);
+                try b.add(if (self.negate) " Not In(" else " In(");
+                try b.add(sql);
+                try b.add(")");
+            },
+        }
+    }
+};
+
+/// 构造值列表形态（去重保序；空列表报错，对应 C# 抛 `ArgumentNullException`）。
+pub fn inValues(
+    a: std.mem.Allocator,
+    col: *const model.ColumnMeta,
+    values: []const Value,
+    negate: bool,
+) !InExpression {
+    if (values.len == 0) return InError.EmptyInValues;
+
+    var list: std.ArrayList(Value) = .empty;
+    errdefer list.deinit(a);
+    try list.ensureTotalCapacity(a, values.len);
+    for (values) |v| {
+        var dup = false;
+        for (list.items) |seen| {
+            if (valueEql(seen, v)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) list.appendAssumeCapacity(v);
+    }
+    return .{
+        .column = col.name,
+        .column_type = col.data_type,
+        .negate = negate,
+        .source = .{ .values = try list.toOwnedSlice(a) },
+    };
+}
+
+/// 构造文本形态（空串报错，对应 C# 抛 `ArgumentNullException`）。
+pub fn inText(col: *const model.ColumnMeta, text: []const u8, negate: bool) InError!InExpression {
+    if (std.mem.trim(u8, text, " \t").len == 0) return InError.EmptyInText;
+    return .{
+        .column = col.name,
+        .column_type = col.data_type,
+        .negate = negate,
+        .source = .{ .text = text },
+    };
+}
+
+/// 构造子查询形态（空串报错）。
+pub fn inSubquery(col: *const model.ColumnMeta, sql: []const u8, negate: bool) InError!InExpression {
+    if (std.mem.trim(u8, sql, " \t\r\n").len == 0) return InError.EmptyInText;
+    return .{
+        .column = col.name,
+        .column_type = col.data_type,
+        .negate = negate,
+        .source = .{ .subquery = sql },
+    };
+}
+
+/// 两个值是否相等（去重用；数值型之间允许跨类型相等，如 `1` 与 `1.0`）。
+fn valueEql(x: Value, y: Value) bool {
+    if (std.meta.activeTag(x) != std.meta.activeTag(y)) {
+        if (isNumericValue(x) and isNumericValue(y)) {
+            const xf = x.asF64() orelse return false;
+            const yf = y.asF64() orelse return false;
+            return xf == yf;
+        }
+        return false;
+    }
+    return switch (x) {
+        .null => true,
+        .boolean => |v| v == y.boolean,
+        .int => |v| v == y.int,
+        .float => |v| v == y.float,
+        .decimal => |v| v.eql(y.decimal),
+        .text => |v| std.mem.eql(u8, v, y.text),
+        .blob => |v| std.mem.eql(u8, v, y.blob),
+        .datetime => |v| v.eql(y.datetime),
+    };
+}
+
+fn isNumericValue(v: Value) bool {
+    return switch (v) {
+        .boolean, .int, .float, .decimal => true,
+        else => false,
+    };
+}
+
+/// 输出一个值：参数化时进参数列表并写占位符，否则内联字面量。
+fn pushValue(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    params: ?*std.ArrayList(Value),
+    b: *Buf,
+    v: Value,
+) !void {
+    if (params) |list| {
+        var ph = Buf.init(gpa);
+        defer ph.deinit();
+        try kind.pushPlaceholder(&ph, list.items.len);
+        try b.add(ph.slice());
+        try list.append(gpa, v);
+        return;
+    }
+    const lit = try v.toSqlLiteralAlloc(gpa);
+    defer gpa.free(lit);
+    try b.add(lit);
+}
+
+/// 文本形态：按 `,` 切分 → 丢空段与含 `%` 的段 → 多于一项才逐项格式化，否则整段当一个值。
+fn pushInText(gpa: std.mem.Allocator, col_type: DataType, b: *Buf, text: []const u8) !void {
+    var pieces: std.ArrayList([]const u8) = .empty;
+    defer pieces.deinit(gpa);
+
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " \t");
+        if (p.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, p, '%') != null) continue;
+        try pieces.append(gpa, p);
+    }
+
+    if (pieces.items.len > 1) {
+        for (pieces.items, 0..) |p, i| {
+            if (i > 0) try b.add(",");
+            try pushColumnValue(gpa, col_type, b, p);
+        }
+        return;
+    }
+    try pushColumnValue(gpa, col_type, b, text);
+}
+
+/// 按列类型输出一个文本片段：数值型原样（能解析成数字时），其余加引号。
+fn pushColumnValue(gpa: std.mem.Allocator, col_type: DataType, b: *Buf, text: []const u8) !void {
+    const t = std.mem.trim(u8, text, " \t");
+    const numeric = switch (col_type) {
+        .boolean, .byte, .int16, .int32, .int64, .single, .double, .decimal => true,
+        else => false,
+    };
+    if (numeric and t.len > 0) {
+        if (std.fmt.parseFloat(f64, t)) |_| {
+            try b.add(t);
+            return;
+        } else |_| {}
+    }
+    const lit = try (Value{ .text = t }).toSqlLiteralAlloc(gpa);
+    defer gpa.free(lit);
+    try b.add(lit);
+}
+
 /// 表达式联合：便于把不同类型的表达式放进同一个列表。
 pub const Any = union(enum) {
     empty,
     raw: Expression,
     field: FieldExpression,
     format: FormatExpression,
+    like: LikeExpression,
+    in_list: InExpression,
     concat: *const ConcatExpression,
 
     pub fn isEmpty(self: Any) bool {
@@ -162,6 +482,8 @@ pub const Any = union(enum) {
             .raw => |e| e.isEmpty(),
             .field => |e| e.isEmpty(),
             .format => |e| e.isEmpty(),
+            .like => |e| e.isEmpty(),
+            .in_list => |e| e.isEmpty(),
             .concat => |c| c.isEmpty(),
         };
     }
@@ -182,6 +504,8 @@ pub const Any = union(enum) {
             .raw => |e| try e.renderInto(b),
             .field => |e| try e.renderInto(kind, b),
             .format => |e| try e.renderInto(gpa, kind, params, b),
+            .like => |e| try e.renderInto(gpa, kind, params, b),
+            .in_list => |e| try e.renderInto(gpa, kind, params, b),
             .concat => |c| try c.renderInto(gpa, kind, params, b),
         }
     }
