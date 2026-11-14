@@ -18,6 +18,7 @@ const tds = @import("zzig").tds;
 const tdengine = @import("zzig").tdengine;
 const influxdb = @import("zzig").influxdb;
 const clickhouse = @import("zzig").clickhouse;
+const mongodb = @import("zzig").mongodb;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -67,6 +68,8 @@ pub const ConnectionOptions = struct {
     org: []const u8 = "",
     /// v2 桶（`Bucket=`）。配了 bucket 就走 v2，否则走 v1 的 `Database`
     bucket: []const u8 = "",
+    /// MongoDB 鉴权库（`AuthSource=`；空 = 用 `Database`，惯例是 `admin`）
+    auth_source: []const u8 = "",
     /// HTTP 驱动（TDengine / InfluxDB）的请求超时（毫秒；0 = 不限）
     timeout_ms: u64 = 30_000,
     /// 未识别的键值（原样保留，便于诊断/向前兼容）
@@ -83,6 +86,7 @@ pub const ConnectionOptions = struct {
         if (self.token.len > 0) gpa.free(self.token);
         if (self.org.len > 0) gpa.free(self.org);
         if (self.bucket.len > 0) gpa.free(self.bucket);
+        if (self.auth_source.len > 0) gpa.free(self.auth_source);
         if (self.extra.len > 0) gpa.free(self.extra);
         if (self.journal_mode) |v| gpa.free(v);
         if (self.synchronous) |v| gpa.free(v);
@@ -98,6 +102,7 @@ pub const ConnectionOptions = struct {
         self.token = "";
         self.org = "";
         self.bucket = "";
+        self.auth_source = "";
         self.extra = &.{};
     }
 };
@@ -199,6 +204,9 @@ pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !Conn
             opts.org = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Bucket")) {
             opts.bucket = try gpa.dupe(u8, value);
+        } else if (std.ascii.eqlIgnoreCase(key, "AuthSource")) {
+            // MongoDB 鉴权库（缺省用 Database，惯例 admin）
+            opts.auth_source = try gpa.dupe(u8, value);
         } else if (std.ascii.eqlIgnoreCase(key, "Timeout") or std.ascii.eqlIgnoreCase(key, "TimeoutMs")) {
             // HTTP 驱动（TDengine / InfluxDB）的请求超时（毫秒）
             opts.timeout_ms = std.fmt.parseInt(u64, value, 10) catch opts.timeout_ms;
@@ -457,6 +465,20 @@ pub const Dal = struct {
                 if (opts_owned.server.len == 0) return error.NoConnection;
                 // 端口缺省以方言为准（ClickHouse HTTP 8123）
                 if (opts_owned.port == 3306) opts_owned.port = clickhouse.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
+            .mongodb => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                // 端口缺省以方言为准（MongoDB 27017）
+                if (opts_owned.port == 3306) opts_owned.port = mongodb.default_port;
                 return Dal{
                     .gpa = gpa,
                     .model = m,
@@ -805,6 +827,18 @@ pub const Dal = struct {
                 });
                 return Session.initWithDriver(self.gpa, .clickhouse, .{ .clickhouse = conn });
             },
+            .mongodb => {
+                // 连接串可写 `mongodb://host:port/db`（Server 键直接给 URL）或分散键
+                const conn = try mongodb.Conn.open(self.gpa, .{
+                    .host = opts.server,
+                    .port = opts.port,
+                    .user = opts.user,
+                    .password = opts.password,
+                    .database = if (opts.database.len > 0) opts.database else "test",
+                    .auth_source = opts.auth_source,
+                });
+                return Session.initWithDriver(self.gpa, .mongodb, .{ .mongodb = conn });
+            },
             else => return error.Unsupported,
         }
     }
@@ -828,7 +862,7 @@ pub const Dal = struct {
     pub fn supportsPooling(self: *const Dal) bool {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
-            .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .clickhouse, .nova, .kingbase, .highgo, .vastbase => true,
+            .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .nova, .kingbase, .highgo, .vastbase => true,
             else => false,
         };
     }
@@ -2128,6 +2162,13 @@ test "连接串：时序库 / 国产库 Provider 与 InfluxDB 专属键" {
     try std.testing.expectEqual(DatabaseKind.highgo, DatabaseKind.fromProvider("瀚高") orelse .sqlite);
     try std.testing.expectEqual(DatabaseKind.vastbase, DatabaseKind.fromProvider("VastBase") orelse .sqlite);
     try std.testing.expectEqual(DatabaseKind.nova, DatabaseKind.fromProvider("NovaDB") orelse .sqlite);
+
+    // MongoDB：文档库，鉴权库用 AuthSource（缺省 admin）
+    var mg = try parseConnectionString(a, "Provider=MongoDB;Server=127.0.0.1;User=u;Password=p;Database=app;AuthSource=admin");
+    defer mg.deinit(a);
+    try std.testing.expectEqual(DatabaseKind.mongodb, mg.provider);
+    try std.testing.expectEqualStrings("app", mg.database);
+    try std.testing.expectEqualStrings("admin", mg.auth_source);
 
     // 没有 bucket 也没有 database 的 InfluxDB 连接串无法定位数据 → 明确报错
     const m = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
