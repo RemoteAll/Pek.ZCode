@@ -19,6 +19,7 @@ const tdengine = @import("zzig").tdengine;
 const influxdb = @import("zzig").influxdb;
 const clickhouse = @import("zzig").clickhouse;
 const mongodb = @import("zzig").mongodb;
+const duckdb = @import("zzig").duckdb;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const setting = @import("setting.zig");
@@ -207,6 +208,8 @@ pub const Driver = union(enum) {
     clickhouse: clickhouse.Conn,
     /// MongoDB：**文档库**，SQL 路径不适用；用 `Session.mongodbConn()` 走文档 API
     mongodb: mongodb.Conn,
+    /// DuckDB：嵌入式，动态加载 `duckdb.dll`
+    duckdb: duckdb.Db,
 };
 
 pub const Session = struct {
@@ -265,6 +268,7 @@ pub const Session = struct {
             .influxdb => |*conn| conn.deinit(),
             .clickhouse => |*conn| conn.deinit(),
             .mongodb => |*conn| conn.deinit(),
+            .duckdb => |*db| db.close(),
         }
     }
 
@@ -496,6 +500,13 @@ pub const Session = struct {
                 std.debug.print("[zcode] MongoDB 是文档库，不支持 SQL 执行：{s}\n  请用 `Session.mongodbConn()` 走文档 API（insert/find/update/delete）\n", .{sql[0..@min(sql.len, 120)]});
                 return error.Unsupported;
             },
+            .duckdb => |*db| {
+                const n = db.exec(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -614,6 +625,10 @@ pub const Session = struct {
                 std.debug.print("[zcode] MongoDB 是文档库，不支持 SQL 查询：{s}\n  请用 `Session.mongodbConn()` 走 `findAlloc`\n", .{sql[0..@min(sql.len, 120)]});
                 return error.Unsupported;
             },
+            .duckdb => |*db| return db.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, db.lastError() });
+                return e;
+            },
         }
     }
 
@@ -638,6 +653,7 @@ pub const Session = struct {
             .influxdb => 0,
             .clickhouse => 0,
             .mongodb => 0,
+            .duckdb => |*db| db.lastInsertId(),
         };
     }
 
@@ -651,6 +667,7 @@ pub const Session = struct {
             .influxdb => |*conn| conn.lastError(),
             .clickhouse => |*conn| conn.lastError(),
             .mongodb => |*conn| conn.lastError(),
+            .duckdb => |*db| db.lastError(),
         };
     }
 
@@ -666,6 +683,7 @@ pub const Session = struct {
             .influxdb => error.Unsupported,
             .clickhouse => error.Unsupported,
             .mongodb => error.Unsupported,
+            .duckdb => error.Unsupported,
         };
     }
 
@@ -681,7 +699,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb => error.Unsupported,
+            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .duckdb => error.Unsupported,
         };
     }
 

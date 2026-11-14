@@ -283,6 +283,8 @@ pub const Dal = struct {
     opts: ConnectionOptions,
     /// SQLite 动态库句柄（`Provider=MySQL` 时为 null，MySQL 走纯协议不需外部库）
     lib: ?sqlite.Lib = null,
+    /// DuckDB 动态库句柄（`Provider=DuckDB` 时用；生命周期与 Dal 一致）
+    duck_lib: ?@import("zzig").duckdb.Lib = null,
     /// 整表实体缓存注册表（写操作后按表名使缓存失效）
     cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
     /// 读写分离策略（忽略表 / 全局切主库）
@@ -486,6 +488,21 @@ pub const Dal = struct {
                     .strategy = readwrite.Strategy.init(gpa),
                 };
             },
+            .duckdb => {
+                if (opts_owned.data_source.len == 0) return error.NoConnection;
+                // 嵌入式：先把库找好（缺库就立即报，不拖到第一次查询）
+                var d = Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+                d.duck_lib = @import("zzig").duckdb.Lib.load(gpa) catch |e| {
+                    std.debug.print("[zcode] DuckDB 不可用（{s}）：请把 duckdb.dll 放到 exe 同目录或 PATH\n", .{@errorName(e)});
+                    return e;
+                };
+                return d;
+            },
             else => return error.Unsupported,
         }
     }
@@ -510,6 +527,7 @@ pub const Dal = struct {
         }
         self.connections.deinit(self.gpa);
         if (self.lib) |*lib| lib.deinit();
+        if (self.duck_lib) |*lib| lib.module.close(self.gpa);
         self.opts.deinit(self.gpa);
         self.model.deinit();
     }
@@ -838,6 +856,11 @@ pub const Dal = struct {
                     .auth_source = opts.auth_source,
                 });
                 return Session.initWithDriver(self.gpa, .mongodb, .{ .mongodb = conn });
+            },
+            .duckdb => {
+                const lib = if (self.duck_lib) |*l| l else return error.Unsupported;
+                const db = try @import("zzig").duckdb.Db.open(self.gpa, lib, .{ .path = opts.data_source });
+                return Session.initWithDriver(self.gpa, .duckdb, .{ .duckdb = db });
             },
             else => return error.Unsupported,
         }
@@ -1201,6 +1224,7 @@ pub const Dal = struct {
             // TDengine 有服务器版本函数；ClickHouse 有 `version()`；InfluxDB 没有 SQL（本类不探）
             .tdengine => "SELECT SERVER_VERSION()",
             .clickhouse => "SELECT version()",
+            .duckdb => "SELECT version()",
             else => {
                 // SQL Server 的 `@@VERSION` 形如 `Microsoft SQL Server 2022 (RTM) - 16.0.1000.6`，
                 // 首个数字是发布年份，解析必错；它也不用这两个能力，直接保守档。
@@ -2173,6 +2197,16 @@ test "连接串：时序库 / 国产库 Provider 与 InfluxDB 专属键" {
     // 没有 bucket 也没有 database 的 InfluxDB 连接串无法定位数据 → 明确报错
     const m = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
     try std.testing.expectError(error.NoDatabase, Dal.initWithModel(a, "Provider=InfluxDB;Server=127.0.0.1", m));
+
+    // DuckDB：嵌入式，缺 duckdb 动态库时**立即**报错（不拖到第一次查询）
+    const m2 = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    const duck = Dal.initWithModel(a, "Data Source=:memory:;Provider=DuckDB", m2);
+    if (duck) |d| {
+        var dal_ok = d;
+        dal_ok.deinit(); // 本机装了 duckdb.dll：能建就好，随后正常释放
+    } else |e| {
+        try std.testing.expectEqual(@import("zzig").duckdb.Error.DuckDbNotAvailable, e);
+    }
 }
 
 test "sync_schema 幂等（临时文件库）" {

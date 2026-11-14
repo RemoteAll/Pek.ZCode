@@ -237,6 +237,8 @@ fn isUsable(s: *const Session) bool {
         .sqlserver => |conn| !conn.closed,
         // HTTP 驱动没有可探测的连接句柄：只要会话还在就视为可用（探活靠 ping，不在池路径上做）
         .tdengine, .influxdb, .clickhouse, .mongodb => true,
+        // DuckDB 是嵌入式单进程库：连接池没有意义（且同名文件多开会抢锁）
+        .duckdb => false,
     };
 }
 

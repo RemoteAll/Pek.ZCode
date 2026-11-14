@@ -32,8 +32,9 @@
 - **口径（用户 2026-11-13 明确）：迁移优先，不要以「本机无实例」为由拒绝实现**——
   缺的方法要实现；公共能力下沉 `zzig`；**无实例的驱动用回环假服务端（`zzig/src/db/http_loopback_test.zig` 范式）守住协议**，
   真库验证留到有条件时。
-- **执行层矩阵（2026-11-14）**：已接 **8 家协议**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
-  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG**）+ 2 组协议复用（**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
+- **执行层矩阵（2026-11-14）**：已接 **9 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
+  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG** / **DuckDB 嵌入式**）+ 2 组协议复用
+  （**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
   - InfluxDB **不是 SQL 库**：`insert`/`upsert` 走 **Line Protocol**（`dbtable.influxLineAlloc`：时间列→行尾纳秒、
     主键→tag、其余→field），查询走 Flux（v2）或 InfluxQL（v1）；不要试图给它生成 `INSERT INTO`。
   - TDengine REST 与 ClickHouse HTTP **都没有预处理语句**：`?` 必须客户端内联（`zzig.db.inline`，两家共用）。
