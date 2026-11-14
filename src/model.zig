@@ -862,7 +862,8 @@ test "Guid 列：Model.xml 里 DataType=\"Guid\" 能解析（以前直接 error.
     try std.testing.expect(std.mem.indexOf(u8, out, "DataType=\"Guid\"") != null);
 }
 
-test "视图识别：IsView 与 # 前缀" {    const xml =
+test "视图识别：IsView 与 # 前缀" {
+    const xml =
         \\<EntityModel><Tables>
         \\<Table Name="V1" IsView="True"><Columns><Column Name="Id" DataType="Int32" /></Columns></Table>
         \\<Table Name="#V2"><Columns><Column Name="Id" DataType="Int32" /></Columns></Table>

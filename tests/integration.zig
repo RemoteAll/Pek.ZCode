@@ -965,6 +965,61 @@ test "Guid 列：建表 → 写入 → 读回（SQLite uniqueidentifier 存文�
     for (read_back) |c| try std.testing.expect(!std.ascii.isUpper(c));
 }
 
+test "聚合取最值：maxValue/minValue 带条件，空表返回 null" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "agg");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+
+    // 空表：没有数据 → null（不是 0）
+    try std.testing.expect((try table.maxValue(&s, "Id", null)) == null);
+
+    const now = zcode.DateTime.nowLocal();
+    for ([_][]const u8{ "a", "b", "c" }, 0..) |code, i| {
+        _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = code } },
+            .{ .name = "Title", .value = .{ .text = "t" } },
+            .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("1.0000") } },
+            .{ .name = "Ok", .value = .{ .boolean = i != 1 } },
+            .{ .name = "CreateTime", .value = .{ .datetime = now } },
+        });
+    }
+
+    // 全表最值
+    try std.testing.expectEqual(@as(i64, 3), (try table.maxValue(&s, "Id", null)).?.asI64().?);
+    try std.testing.expectEqual(@as(i64, 1), (try table.minValue(&s, "Id", null)).?.asI64().?);
+    // 字符串列也能取最值（a < c）
+    try std.testing.expectEqualStrings("c", (try table.maxValue(&s, "Code", null)).?.asText().?);
+
+    // 带条件：只有 Ok = false 的行（中间那条，Id=2）—— 与全表最大值 3 不同，能真正验证 WHERE 生效
+    var w = zcode.Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Ok", .{ .boolean = false });
+    try std.testing.expectEqual(@as(i64, 2), (try table.maxValue(&s, "Id", &w)).?.asI64().?);
+
+    // 条件命中不到任何行 → null
+    var w2 = zcode.Where.init(a);
+    defer w2.deinit();
+    _ = try w2.eq("Id", .{ .int = 99 });
+    try std.testing.expect((try table.maxValue(&s, "Id", &w2)) == null);
+
+    // COUNT 走同一聚合通道（忽略列名）
+    try std.testing.expectEqual(@as(i64, 0), (try table.aggregateValue(&s, .count, "", &w2)).?.asI64().?);
+}
+
 // 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
 test {
     _ = @import("integration_features.zig");

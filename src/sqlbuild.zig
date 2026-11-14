@@ -626,8 +626,73 @@ pub fn count(
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
 }
 
-/// 「至多 N 行」的计数：`min(实际行数, limit)`。
+/// 聚合函数（对应 C# `Entity.FindMax` / `FindMin` 这类「取一列的最值」需求）。
+pub const AggFunc = enum {
+    max,
+    min,
+    sum,
+    avg,
+    count,
+
+    pub fn text(self: AggFunc) []const u8 {
+        return switch (self) {
+            .max => "MAX",
+            .min => "MIN",
+            .sum => "SUM",
+            .avg => "AVG",
+            .count => "COUNT",
+        };
+    }
+};
+
+/// 组装聚合查询：`SELECT MAX("col") FROM "t" WHERE ...`。
 ///
+/// 与 C# 的差异（有意）：C# `FindMin/FindMax` 是「按该列排序取第 1 行，再把整行字段转 decimal」，
+/// 空表返回 `0`；本仓直接发**聚合**语句 —— 只回一个值（不带整行）、空表回 `NULL`（调用方用 `?Value`
+/// 区分「没有数据」和「值就是 0」，增量同步/取最新时间正是需要这个区分）。
+///
+/// `func == .count` 时忽略 `column`，生成 `COUNT(*)`；其余函数要求 `column` 在模型里存在
+/// （外部传入的列名必须校验，否则就是注入面）。
+pub fn aggregate(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    func: AggFunc,
+    column: []const u8,
+    filter: ?*const Where,
+) !Sql {
+    var b = Buf.init(gpa);
+    defer b.deinit();
+
+    var params: std.ArrayList(Value) = .empty;
+    errdefer params.deinit(gpa);
+
+    try b.add("SELECT ");
+    try b.add(func.text());
+    try b.add("(");
+    if (func == .count) {
+        try b.add("*");
+    } else {
+        const quoted = try kind.quoteAlloc(gpa, try columnName(table, column));
+        defer gpa.free(quoted);
+        try b.add(quoted);
+    }
+    try b.add(") FROM ");
+    try kind.pushQuoted(&b, table_name);
+
+    if (filter) |f| {
+        if (!f.isEmpty()) {
+            try b.add(" WHERE ");
+            try f.renderInto(gpa, kind, &params, &b);
+        }
+    }
+
+    const text = try b.toOwnedSlice();
+    return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
+/// 「至多 N 行」的计数：`min(实际行数, limit)`。///
 /// 用于**恒定成本**地判定「这张表是否超过缓存上限」——不会像 `COUNT(*)` 那样扫全表，
 /// 亿级表上也只读 `limit` 行。各方言尽量用子查询 + 行数限制实现。
 pub fn countUpTo(gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const u8, limit: u64) !Sql {
@@ -1166,6 +1231,33 @@ test "显式插入自增列：SQL Server 包 IDENTITY_INSERT，PG 系加 OVERRID
     const pg_batch = try insertMultiWith(a, .postgresql, &t, "DH_Order", &batch, .{ .allow_identity = true });
     defer pg_batch.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, pg_batch.text, " OVERRIDING SYSTEM VALUE VALUES ") != null);
+}
+
+test "聚合查询：MAX/MIN 带条件；COUNT(*) 忽略列；未知列报错" {
+    const a = std.testing.allocator;
+    const t = testTable();
+
+    var w = Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Status", .{ .int = 1 });
+
+    const mx = try aggregate(a, .sqlite, &t, "DH_Order", .max, "Code", &w);
+    defer mx.deinit(a);
+    try std.testing.expectEqualStrings("SELECT MAX(\"Code\") FROM \"DH_Order\" WHERE (\"Status\" = ?)", mx.text);
+    try std.testing.expectEqual(@as(usize, 1), mx.params.len);
+
+    // 不同方言的引用风格
+    const mx_ss = try aggregate(a, .sqlserver, &t, "DH_Order", .min, "Code", null);
+    defer mx_ss.deinit(a);
+    try std.testing.expectEqualStrings("SELECT MIN([Code]) FROM [DH_Order]", mx_ss.text);
+
+    // COUNT 不看列名（列名传空也行）
+    const cnt = try aggregate(a, .postgresql, &t, "DH_Order", .count, "", null);
+    defer cnt.deinit(a);
+    try std.testing.expectEqualStrings("SELECT COUNT(*) FROM \"DH_Order\"", cnt.text);
+
+    // 外部传入的列名必须按模型校验
+    try std.testing.expectError(error.ColumnNotFound, aggregate(a, .sqlite, &t, "DH_Order", .max, "nope", null));
 }
 
 // ── JOIN（对应 C# `SelectBuilder` 的 join 能力）─────────────────────────────

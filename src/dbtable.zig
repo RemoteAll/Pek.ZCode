@@ -932,7 +932,39 @@ pub const TableRef = struct {
         return rows[0];
     }
 
-    /// 按模型列类型规整值：读到的时间/小数/布尔都转成规范表示。
+    /// 取一列的最大值（对应 C# `Entity.FindMax` 的用途：增量同步要「最大 ID / 最新时间」）。
+    ///
+    /// 空表 / 无匹配行返回 `null`（C# 返回 0，无法区分「没有数据」和「值就是 0」；
+    /// 这里用 `?Value` 把这个区分留给调用方）。
+    pub fn maxValue(self: *const TableRef, s: *Session, column: []const u8, filter: ?*const Where) !?Value {
+        return self.aggregateValue(s, .max, column, filter);
+    }
+
+    /// 取一列的最小值（语义同 `maxValue`）。
+    pub fn minValue(self: *const TableRef, s: *Session, column: []const u8, filter: ?*const Where) !?Value {
+        return self.aggregateValue(s, .min, column, filter);
+    }
+
+    /// 聚合取单值；`func == .count` 时忽略 `column`。
+    pub fn aggregateValue(
+        self: *const TableRef,
+        s: *Session,
+        func: sqlbuild.AggFunc,
+        column: []const u8,
+        filter: ?*const Where,
+    ) !?Value {
+        const sql = try sqlbuild.aggregate(self.gpa, self.kind, self.table, self.table_name, func, column, filter);
+        defer sql.deinit(self.gpa);
+
+        const rows = try s.queryRows(sql.text, sql.params);
+        if (rows.len == 0 or rows[0].values.len == 0) return null;
+        const v = rows[0].values[0];
+        return switch (v) {
+            .null => null,
+            else => v,
+        };
+    }
+
     /// 按模型列类型规整值：读到的时间/小数/布尔都转成规范表示。
     ///
     /// 分配口径（性能相关）：直接 `arena.alloc` 一次拿到结果数组、每行一次 `alloc` 拿到值数组，

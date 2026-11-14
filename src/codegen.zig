@@ -577,7 +577,8 @@ test "生成实体：Guid 列生成 []const u8 + .text 包装（不引入单独�
     try std.testing.expect(std.mem.indexOf(u8, src, "switch (v) { .text => |t| self.@\"Token\" = t") != null);
 }
 
-test "生成实体：双文件契约（基础文件 + 业务扩展模板）" {    const xml =
+test "生成实体：双文件契约（基础文件 + 业务扩展模板）" {
+    const xml =
         \\<EntityModel><Tables><Table Name="Article" TableName="ZCode_Article" MaxCacheCount="500">
         \\  <Columns>
         \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
