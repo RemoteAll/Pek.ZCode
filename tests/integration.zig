@@ -1159,6 +1159,11 @@ test "大表护栏：配了 MaxQueryRows 后，全量查询超限直接报错（
 test {
     _ = @import("integration_features.zig");
 }
+
+// 高并发用例（多线程 + 多连接 + 同一库文件；正确性验证，规模压小以便进回归门禁）
+test {
+    _ = @import("integration_concurrency.zig");
+}
 // PostgreSQL 接线用例（协议层由 zzig 回环假服务端覆盖）
 test {
     _ = @import("integration_pg.zig");
