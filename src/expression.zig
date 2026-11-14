@@ -474,6 +474,7 @@ pub const Any = union(enum) {
     format: FormatExpression,
     like: LikeExpression,
     in_list: InExpression,
+    where_expr: *const WhereExpression,
     concat: *const ConcatExpression,
 
     pub fn isEmpty(self: Any) bool {
@@ -484,6 +485,7 @@ pub const Any = union(enum) {
             .format => |e| e.isEmpty(),
             .like => |e| e.isEmpty(),
             .in_list => |e| e.isEmpty(),
+            .where_expr => |e| e.isEmpty(),
             .concat => |c| c.isEmpty(),
         };
     }
@@ -506,6 +508,7 @@ pub const Any = union(enum) {
             .format => |e| try e.renderInto(gpa, kind, params, b),
             .like => |e| try e.renderInto(gpa, kind, params, b),
             .in_list => |e| try e.renderInto(gpa, kind, params, b),
+            .where_expr => |e| try e.renderInto(gpa, kind, params, b),
             .concat => |c| try c.renderInto(gpa, kind, params, b),
         }
     }
@@ -575,8 +578,204 @@ pub const ConcatExpression = struct {
     }
 };
 
-// ============================ 内部辅助 ============================
+// ============================ 组合条件（≂ C# WhereExpression） ============================
 
+/// 逻辑运算符（≂ C# `Operator`）。
+///
+/// **数值顺序参与括号判定**（C# 用 `where.Operator > Operator` 决定子节点是否加括号），
+/// 所以 `and_ = 0 < or_ = 1 < space = 2` 这个顺序就是语义的一部分，不要调。
+pub const WhereOp = enum(u8) {
+    and_ = 0,
+    or_ = 1,
+    space = 2,
+
+    /// 拼接时写在两个子表达式之间的文本
+    pub fn text(self: WhereOp) []const u8 {
+        return switch (self) {
+            .and_ => " And ",
+            .or_ => " Or ",
+            .space => " ",
+        };
+    }
+};
+
+/// 组合条件表达式（≂ C# `WhereExpression` 与 `operator &` / `operator |` / `operator +`）。
+///
+/// 括号规则逐条对齐 C#：子节点也是组合表达式、且其运算符**数值更大**时才加括号
+/// （`Or` 套在 `And` 下要加，`Space` 套在 `Or` 下要加，反之不加）。
+///
+/// 差异：C# 构造时 `Flatten` 会把「只有一边」的子组合替换成那一边，从而少一对括号；
+/// 这里不 flatten（多一对括号，语义相同）。
+pub const WhereExpression = struct {
+    op: WhereOp,
+    left: ?*const Any = null,
+    right: ?*const Any = null,
+
+    pub fn isEmpty(self: *const WhereExpression) bool {
+        return (self.left == null or self.left.?.isEmpty()) and
+            (self.right == null or self.right.?.isEmpty());
+    }
+
+    pub fn renderInto(
+        self: *const WhereExpression,
+        gpa: std.mem.Allocator,
+        kind: DatabaseKind,
+        params: ?*std.ArrayList(Value),
+        b: *Buf,
+    ) RenderError!void {
+        if (self.isEmpty()) return;
+
+        const start = b.slice().len;
+        try renderWhereChild(gpa, kind, params, b, self.left, self.op);
+
+        var tmp = Buf.init(gpa);
+        defer tmp.deinit();
+        try renderWhereChild(gpa, kind, params, &tmp, self.right, self.op);
+
+        if (b.slice().len > start and tmp.slice().len > 0) try b.add(self.op.text());
+        try b.add(tmp.slice());
+    }
+};
+
+fn renderWhereChild(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    params: ?*std.ArrayList(Value),
+    b: *Buf,
+    exp: ?*const Any,
+    parent_op: WhereOp,
+) RenderError!void {
+    const e = exp orelse return;
+    if (e.isEmpty()) return;
+
+    var bracket = false;
+    switch (e.*) {
+        .where_expr => |w| {
+            if (@backingInt(w.op) > @backingInt(parent_op)) bracket = true;
+        },
+        else => {},
+    }
+
+    if (bracket) try b.add("(");
+    try e.renderInto(gpa, kind, params, b);
+    if (bracket) try b.add(")");
+}
+
+/// 组合两个表达式（`a And b`），返回新节点（调用方持有 `a` 内存）。
+pub fn andAlloc(a: std.mem.Allocator, left: ?*const Any, right: ?*const Any) !*WhereExpression {
+    const node = try a.create(WhereExpression);
+    node.* = .{ .op = .and_, .left = left, .right = right };
+    return node;
+}
+
+/// 组合两个表达式（`a Or b`）。
+pub fn orAlloc(a: std.mem.Allocator, left: ?*const Any, right: ?*const Any) !*WhereExpression {
+    const node = try a.create(WhereExpression);
+    node.* = .{ .op = .or_, .left = left, .right = right };
+    return node;
+}
+
+/// 用空格连接两个表达式（对应 C# `operator +`，如 `Not {0} Is Null` 之外的拼接场景）。
+pub fn spaceAlloc(a: std.mem.Allocator, left: ?*const Any, right: ?*const Any) !*WhereExpression {
+    const node = try a.create(WhereExpression);
+    node.* = .{ .op = .space, .left = left, .right = right };
+    return node;
+}
+
+// ============================ 字段级条件（≂ C# FieldItem 的运算方法） ============================
+
+/// 字段级条件构造（≂ C# `FieldItem` 的 `Equal` / `NotEqual` / `IsNull` / `IsNullOrEmpty` /
+/// `IsTrue` / `IsFalse` 与 `>` `>=` `<` `<=` 重载）。
+///
+/// 格式串**逐字照 C#**（注意 `=` 与 `<>` 两侧**没有空格**）：`{0}='{1}'` 那套由
+/// `FormatExpression` 负责，值按 `Value` 的字面量规则内联或走占位符。
+pub const field = struct {
+    /// `{0} = {1}`（C# `Equal`）
+    pub fn equal(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}={1}", .value = value };
+    }
+
+    /// `{0} <> {1}`（C# `NotEqual`，注意 C# 用的是 `<>` 不是 `!=`）
+    pub fn notEqual(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}<>{1}", .value = value };
+    }
+
+    /// `{0} Is Null`
+    pub fn isNull(col: *const model.ColumnMeta) FormatExpression {
+        return .{ .column = col.name, .format = "{0} Is Null", .value = null };
+    }
+
+    /// `Not {0} Is Null`
+    pub fn notIsNull(col: *const model.ColumnMeta) FormatExpression {
+        return .{ .column = col.name, .format = "Not {0} Is Null", .value = null };
+    }
+
+    /// `大于`
+    pub fn gt(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}>{1}", .value = value };
+    }
+
+    /// `大于等于`
+    pub fn gte(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}>={1}", .value = value };
+    }
+
+    /// `小于`
+    pub fn lt(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}<{1}", .value = value };
+    }
+
+    /// `小于等于`
+    pub fn lte(col: *const model.ColumnMeta, value: Value) FormatExpression {
+        return .{ .column = col.name, .format = "{0}<={1}", .value = value };
+    }
+
+    /// `{0} Is Null Or {0}=''`（C# `IsNullOrEmpty` = `IsNull() | Equal("")`）
+    pub fn isNullOrEmpty(a: std.mem.Allocator, col: *const model.ColumnMeta) !*Any {
+        return combineAlloc(a, .or_, isNull(col), equal(col, .{ .text = "" }));
+    }
+
+    /// `Not {0} Is Null And {0}<>''`（C# `NotIsNullOrEmpty` = `NotIsNull() & NotEqual("")`）
+    pub fn notIsNullOrEmpty(a: std.mem.Allocator, col: *const model.ColumnMeta) !*Any {
+        return combineAlloc(a, .and_, notIsNull(col), notEqual(col, .{ .text = "" }));
+    }
+
+    /// `flag == null` → `null`（C# 返回 `null`，即该条件不参与拼接）；
+    /// `true` → `{0}=1`；`false` → `{0}<>1 Or {0} Is Null`。
+    pub fn isTrue(a: std.mem.Allocator, col: *const model.ColumnMeta, flag: ?bool) !?*Any {
+        const f = flag orelse return null;
+        if (f) return wrapAlloc(a, .{ .format = equal(col, .{ .boolean = true }) });
+        return combineAlloc(a, .or_, notEqual(col, .{ .boolean = true }), isNull(col));
+    }
+
+    /// `flag == null` → `null`；`false` → `{0}=0`；`true` → `{0}<>0 Or {0} Is Null`。
+    pub fn isFalse(a: std.mem.Allocator, col: *const model.ColumnMeta, flag: ?bool) !?*Any {
+        const f = flag orelse return null;
+        if (!f) return wrapAlloc(a, .{ .format = equal(col, .{ .boolean = false }) });
+        return combineAlloc(a, .or_, notEqual(col, .{ .boolean = false }), isNull(col));
+    }
+
+    fn wrapAlloc(a: std.mem.Allocator, exp: Any) !*Any {
+        const node = try a.create(Any);
+        node.* = exp;
+        return node;
+    }
+
+    fn combineAlloc(
+        a: std.mem.Allocator,
+        op: WhereOp,
+        left: FormatExpression,
+        right: FormatExpression,
+    ) !*Any {
+        const l = try wrapAlloc(a, .{ .format = left });
+        const r = try wrapAlloc(a, .{ .format = right });
+        const w = try a.create(WhereExpression);
+        w.* = .{ .op = op, .left = l, .right = r };
+        return wrapAlloc(a, .{ .where_expr = w });
+    }
+};
+
+// ============================ 内部辅助 ============================
 /// 是否含独立单词 `Or`（等价 C# 正则 `\bOr\b`，忽略大小写）。
 pub fn containsWordOr(text: []const u8) bool {
     if (text.len < 2) return false;

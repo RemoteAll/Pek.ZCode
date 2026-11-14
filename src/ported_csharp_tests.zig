@@ -223,6 +223,18 @@ const expr_table = struct {
             .columns = &[_]model.ColumnMeta{
                 .{ .name = "Id", .data_type = .int32, .identity = true, .primary_key = true },
                 .{ .name = "Category", .data_type = .string, .length = 50 },
+                .{ .name = "Success", .data_type = .boolean },
+            },
+        };
+    }
+
+    fn area() model.TableMeta {
+        return .{
+            .name = "Area",
+            .table_name = "Area",
+            .columns = &[_]model.ColumnMeta{
+                .{ .name = "Id", .data_type = .int32, .identity = true, .primary_key = true },
+                .{ .name = "Level", .data_type = .int32 },
             },
         };
     }
@@ -473,4 +485,289 @@ test "C# Like：空值与非字符串列的异常口径（C# 抛 ArgumentNullExc
     const t = expr_table.user();
     try std.testing.expectError(expr.LikeError.EmptyLikeValue, expr.like(t.column("Name").?, .contains, ""));
     try std.testing.expectError(expr.LikeError.LikeOnNonStringColumn, expr.like(t.column("RoleID").?, .contains, "dmi"));
+}
+
+// ── Model/FieldNormalTests.cs ──────────────────────────────────────────────
+//
+// 期望值照抄 C#，只有标识符引用不同（C# `FormatName` 只在保留字时加引号，本仓一律引用）。
+
+test "C# Equal / Equal2：Category='登录'" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    const col = t.column("Category").?;
+
+    try expectRender(a, expr.field.equal(col, .{ .text = "登录" }), "\"Category\"='登录'");
+}
+
+test "C# Equal2WithParameter：参数化 → 列=占位符，值进参数表" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    const col = t.column("Category").?;
+
+    var params: std.ArrayList(Value) = .empty;
+    defer params.deinit(a);
+    const sql = try renderAny(a, expr.field.equal(col, .{ .text = "登录" }), &params);
+    defer a.free(sql);
+
+    // C# 期望 `Category=@Category`；本仓用方言位置占位符（SQLite `?`）
+    try std.testing.expectEqualStrings("\"Category\"=?", sql);
+    try std.testing.expectEqual(@as(usize, 1), params.items.len);
+    try std.testing.expectEqualStrings("登录", params.items[0].text);
+}
+
+test "C# NotEqual / NotEqual2：Category<>'登录'（C# 用 <> 不是 !=）" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    const col = t.column("Category").?;
+
+    try expectRender(a, expr.field.notEqual(col, .{ .text = "登录" }), "\"Category\"<>'登录'");
+}
+
+test "C# NotEqual2WithParameter：参数化 → Category<>占位符" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    const col = t.column("Category").?;
+
+    var params: std.ArrayList(Value) = .empty;
+    defer params.deinit(a);
+    const sql = try renderAny(a, expr.field.notEqual(col, .{ .text = "登录" }), &params);
+    defer a.free(sql);
+
+    try std.testing.expectEqualStrings("\"Category\"<>?", sql);
+    try std.testing.expectEqual(@as(usize, 1), params.items.len);
+}
+
+test "C# IsNull：Category Is Null" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    try expectRender(a, expr.field.isNull(t.column("Category").?), "\"Category\" Is Null");
+}
+
+test "C# NotIsNull：Not Category Is Null" {
+    const a = std.testing.allocator;
+    const t = expr_table.log();
+    try expectRender(a, expr.field.notIsNull(t.column("Category").?), "Not \"Category\" Is Null");
+}
+
+test "C# IsNullOrEmpty：Category Is Null Or Category=''" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = expr_table.log();
+    const e = try expr.field.isNullOrEmpty(a, t.column("Category").?);
+    try expectRender(a, e, "\"Category\" Is Null Or \"Category\"=''");
+}
+
+test "C# NotIsNullOrEmpty：Not Category Is Null And Category<>''" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = expr_table.log();
+    const e = try expr.field.notIsNullOrEmpty(a, t.column("Category").?);
+    try expectRender(a, e, "Not \"Category\" Is Null And \"Category\"<>''");
+}
+
+test "C# IsTrue：true → =1；false → <>1 Or Is Null；null → 不生成条件" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = expr_table.log();
+    const col = t.column("Success").?;
+
+    const yes = (try expr.field.isTrue(a, col, true)).?;
+    try expectRender(a, yes, "\"Success\"=1");
+
+    const no = (try expr.field.isTrue(a, col, false)).?;
+    try expectRender(a, no, "\"Success\"<>1 Or \"Success\" Is Null");
+
+    try std.testing.expect((try expr.field.isTrue(a, col, null)) == null);
+}
+
+test "C# IsFalse：false → =0；true → <>0 Or Is Null；null → 不生成条件" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = expr_table.log();
+    const col = t.column("Success").?;
+
+    const no = (try expr.field.isFalse(a, col, false)).?;
+    try expectRender(a, no, "\"Success\"=0");
+
+    const yes = (try expr.field.isFalse(a, col, true)).?;
+    try expectRender(a, yes, "\"Success\"<>0 Or \"Success\" Is Null");
+
+    try std.testing.expect((try expr.field.isFalse(a, col, null)) == null);
+}
+
+test "C# LargerThen / LargerOrEqual / LessThen / LessOrEqual：> >= < <=" {
+    const a = std.testing.allocator;
+    const t = expr_table.area();
+    const col = t.column("Level").?;
+
+    try expectRender(a, expr.field.gt(col, .{ .int = 1 }), "\"Level\">1");
+    try expectRender(a, expr.field.gte(col, .{ .int = 2 }), "\"Level\">=2");
+    try expectRender(a, expr.field.lt(col, .{ .int = 3 }), "\"Level\"<3");
+    try expectRender(a, expr.field.lte(col, .{ .int = 2 }), "\"Level\"<=2");
+}
+
+test "C# WhereExpression：Or 套在 And 下加括号，And 套在 Or 下不加" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = expr_table.area();
+    const col = t.column("Level").?;
+
+    // (Level>1 Or Level<9) And Level=5  ← 子节点 Or(1) > 父 And(0) → 加括号
+    const or_node = try a.create(expr.Any);
+    or_node.* = .{ .where_expr = try expr.orAlloc(
+        a,
+        try wrapFmt(a, expr.field.gt(col, .{ .int = 1 })),
+        try wrapFmt(a, expr.field.lt(col, .{ .int = 9 })),
+    ) };
+    const both = try a.create(expr.Any);
+    both.* = .{ .where_expr = try expr.andAlloc(a, or_node, try wrapFmt(a, expr.field.equal(col, .{ .int = 5 }))) };
+    try expectRender(a, both, "(\"Level\">1 Or \"Level\"<9) And \"Level\"=5");
+
+    // (Level>1 And Level<9) Or Level=5  ← 子节点 And(0) 不大于父 Or(1) → 不加括号
+    const and_node = try a.create(expr.Any);
+    and_node.* = .{ .where_expr = try expr.andAlloc(
+        a,
+        try wrapFmt(a, expr.field.gt(col, .{ .int = 1 })),
+        try wrapFmt(a, expr.field.lt(col, .{ .int = 9 })),
+    ) };
+    const either = try a.create(expr.Any);
+    either.* = .{ .where_expr = try expr.orAlloc(a, and_node, try wrapFmt(a, expr.field.equal(col, .{ .int = 5 }))) };
+    try expectRender(a, either, "\"Level\">1 And \"Level\"<9 Or \"Level\"=5");
+}
+
+/// 把格式化表达式包成 `Any` 节点（组合条件需要 `*const Any`）。
+fn wrapFmt(a: std.mem.Allocator, f: expr.FormatExpression) !*expr.Any {
+    const node = try a.create(expr.Any);
+    node.* = .{ .format = f };
+    return node;
+}
+
+// ── DataAccessLayer/WindowFunctionTests.cs ────────────────────────────────
+//
+// C# 的 `SelectBuilder.Window` 在本仓对应「把 `window.*Alloc` 的片段塞进 `Query.select`」。
+// 差异：C# 输出 `Select ... From ...`（首字母大写、标识符不加引号），
+// 本仓输出 `SELECT ... FROM "..."`。片段本身（函数名 / OVER 子句 / 缺省别名）逐字一致。
+
+const window = @import("window.zig");
+
+test "C# SelectBuilder_Window_Injected：Window 注入 SELECT → SELECT *, ROW_NUMBER()..." {
+    const a = std.testing.allocator;
+    const t = expr_table.role();
+
+    var q = @import("query.zig").Query.init(a);
+    defer q.deinit();
+
+    const win = try window.rowNumberAlloc(a, "ID", "RowNum");
+    defer a.free(win);
+    _ = try q.column("*");
+    _ = try q.column(win);
+
+    const sql = try sqlbuild.select(a, .sqlite, &t, "Role", &q);
+    defer sql.deinit(a);
+
+    try std.testing.expectEqualStrings(
+        "SELECT *, ROW_NUMBER() OVER(ORDER BY ID) AS RowNum FROM \"Role\"",
+        sql.text,
+    );
+}
+
+test "C# SelectBuilder_Window_WithColumn：Select ID, Name, RANK() ..." {
+    const a = std.testing.allocator;
+    const t = expr_table.role();
+
+    var q = @import("query.zig").Query.init(a);
+    defer q.deinit();
+
+    const rank = try window.rankAlloc(a, null, "Name", "Rank");
+    defer a.free(rank);
+    _ = try q.column("Id");
+    _ = try q.column("Name");
+    _ = try q.column(rank);
+
+    const sql = try sqlbuild.select(a, .sqlite, &t, "Role", &q);
+    defer sql.deinit(a);
+
+    try std.testing.expectEqualStrings(
+        "SELECT \"Id\", \"Name\", RANK() OVER(ORDER BY Name) AS Rank FROM \"Role\"",
+        sql.text,
+    );
+}
+
+test "C# SelectBuilder_Window_Null_NoComma：没有窗口时不多出逗号" {
+    const a = std.testing.allocator;
+    const t = expr_table.role();
+
+    var q = @import("query.zig").Query.init(a);
+    defer q.deinit();
+
+    const sql = try sqlbuild.select(a, .sqlite, &t, "Role", &q);
+    defer sql.deinit(a);
+
+    try std.testing.expectEqualStrings("SELECT * FROM \"Role\"", sql.text);
+    try std.testing.expect(std.mem.indexOf(u8, sql.text, ", ") == null);
+}
+
+test "C# RowNumber_WithAlias / Aggregate_Count_NoPartition：别名与缺省别名" {
+    const a = std.testing.allocator;
+
+    const rn = try window.rowNumberAlloc(a, "CreateTime", "Rn");
+    defer a.free(rn);
+    try std.testing.expectEqualStrings("ROW_NUMBER() OVER(ORDER BY CreateTime) AS Rn", rn);
+
+    const cnt = try window.aggregateAlloc(a, "COUNT", "*", null, null);
+    defer a.free(cnt);
+    try std.testing.expectEqualStrings("COUNT(*) OVER() AS COUNT_*", cnt);
+
+    const sum = try window.aggregateAlloc(a, "SUM", "Amount", "DeptID", null);
+    defer a.free(sum);
+    try std.testing.expectEqualStrings("SUM(Amount) OVER(PARTITION BY DeptID) AS SUM_Amount", sum);
+
+    const avg = try window.aggregateAlloc(a, "AVG", "Score", "ClassID", "AvgScore");
+    defer a.free(avg);
+    try std.testing.expectEqualStrings("AVG(Score) OVER(PARTITION BY ClassID) AS AvgScore", avg);
+}
+
+// ── Statistics/StatLevelsTests.cs + Statistics/StatModelTests.cs ──────────
+//
+// 这两组用例的语义（枚举落库值、`GetDate` 截断、`ToString` 格式化、`Split`）本仓 `stat.zig`
+// 早已实现并有等价用例（`src/stat.zig` 第 325 / 359 / 385 行起），这里只补两处**逐字对齐**
+// 的断言：`StatModes` 的数值（本仓原为隐式 0..4，C# 是 1..5 —— 只用于内部 switch，
+// 不落库，但既然 C# 用例钉了值，Zig 也钉住，避免以后接入序列化时出错）与 `quarter` 返回值。
+
+test "C# StatLevels：枚举落库值与 C# 完全一致（All=0 … Minute=5，Quarter=11）" {
+    const stat = @import("stat.zig");
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(stat.Levels.all));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(stat.Levels.year));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(stat.Levels.month));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(stat.Levels.day));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(stat.Levels.hour));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(stat.Levels.minute));
+    try std.testing.expectEqual(@as(u8, 11), @backingInt(stat.Levels.quarter));
+}
+
+test "C# StatModes：数值与 C# 一致（Max=1 … Count=5）" {
+    const stat = @import("stat.zig");
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(stat.Mode.max));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(stat.Mode.min));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(stat.Mode.avg));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(stat.Mode.sum));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(stat.Mode.count));
+}
+
+test "C# StatModel：GetDate_Unknown 返回原时间（quarter 不截断）与 ToString_Unknown 返回级别名" {
+    const stat = @import("stat.zig");
+    const dt = @import("zzig").DateTime{ .year = 2025, .month = 6, .day = 15, .hour = 14, .minute = 30, .second = 45 };
+    const m = stat.StatModel.init(dt, .quarter);
+
+    try std.testing.expect(m.getDate(.quarter).eql(dt));
+
+    const a = std.testing.allocator;
+    const s = try m.formatAlloc(a);
+    defer a.free(s);
+    try std.testing.expectEqualStrings("Quarter", s);
 }

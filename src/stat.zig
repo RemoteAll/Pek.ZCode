@@ -167,12 +167,16 @@ pub const StatModel = struct {
 };
 
 /// 累加方式（对应 C# `StatModes`）。
-pub const Mode = enum {
-    max,
-    min,
-    avg,
-    sum,
-    count,
+///
+/// **数值与 C# 一致（1..5），不要改成从 0 开始**：C# 侧 `StatModes.Max = 1`，
+/// 一旦将来把 `Mode` 写进配置/协议/库表，从 0 开始就会整体错位。
+/// 现在只用于内部 `switch`，但值已经钉住并有用例守着（`ported_csharp_tests`）。
+pub const Mode = enum(u8) {
+    max = 1,
+    min = 2,
+    avg = 3,
+    sum = 4,
+    count = 5,
 
     /// 映射到 SQL 累加模式；`avg` 无法用单条 SQL 原子累加 → 明确报错。
     pub fn toAccumulate(self: Mode) error{Unsupported}!sqlbuild.Accumulate {
