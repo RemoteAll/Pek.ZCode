@@ -294,6 +294,8 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 | `Common/DataSimulation`、`Code/SearchBuilder` 不迁移 ~~已推翻~~ **已迁移（2026-11-14）** | `simulation.zig`（按列类型造数，尊重列长度、种子可复现）+ `search.zig`（索引列/枚举整数/布尔开关/时间列 → 参数计划） |
 | ~~`Membership` 未移植~~ **已更正（2026-11-14 审计）** | `membership.zig` + `src/membership/*`（enums/password/datascope/log/rules/area/provider/entities）已实现；`XCodeTool` 的模板引擎能力由 `tools/zcodegen.zig`（`zig build codegen`）承担 |
 | `Code/HtmlBuilder.BuildDataDictionary`（数据字典 HTML）**仍缺** | 下一轮补 `datadict.zig`：模型 → HTML 表格（表/列/类型/长度/可空/注释/索引），用模型快照做黄金断言 |
+| ~~`Common/KeyedLocker` 不适用~~ **已更正（2026-11-14 二次核对）** | 它支撑的是 `Entity.GetOrAdd`（防并发重复插入）——本仓原本**没有** `getOrAdd`。已补 `keyed_lock.zig`（8 条带锁）+ `entity.getOrAdd`（无锁查→加锁→二次查→事务内插） |
+| ~~`DataRowEntityAccessor` 不适用~~ **已更正（2026-11-14 二次核对）** | 它支撑的是「任意表格数据 → 实体列表」；本仓原本只有单行 `fromRow`，已补 `entity.fromRows`（含字符串/二进制深拷贝） |
 | 20+ 种小众方言（Access/ClickHouse/TDengine/DuckDB/Hana/Firebird/DB2/达梦/IRIS/MongoDB/NovaDb…）未实现 | ~~枚举与连接串可识别，但类型映射/DDL 明确 `error.Unsupported`~~ **已推翻（2026-11-12）**：19 家 SQL 方言全量实现并由 `zig build audit-dialects` 守住；只有 MongoDB（文档库）/ InfluxDB（Line Protocol）保持 `error.Unsupported` |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）

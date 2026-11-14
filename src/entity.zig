@@ -40,6 +40,7 @@ const Dal = dal_mod.Dal;
 const dbtable_mod = @import("dbtable.zig");
 const TableRef = dbtable_mod.TableRef;
 const shards = @import("shards.zig");
+const keyed_lock = @import("keyed_lock.zig");
 
 /// 单表实体支持的最大列数（脏位图宽度）。
 pub const max_fields = 256;
@@ -817,6 +818,87 @@ pub fn fromRow(comptime T: type, row: session_mod.Row) !T {
     return e;
 }
 
+/// 行集 → 实体列表（对应 C# `DataRowEntityAccessor.LoadData<T>`）。
+///
+/// 用途：把**任意来源**的表格数据（查询结果、协议包解出来的行、CSV 读出来的行）
+/// 一次转成实体列表，不必自己写循环。内存归 `arena`（会话结果缓冲出了作用域就失效，
+/// 所以实体里的字符串必须先深拷贝一份——与 `queryRows` 同口径）。
+pub fn fromRows(comptime T: type, a: std.mem.Allocator, rows: []const session_mod.Row) ![]T {
+    var out: std.ArrayList(T) = .empty;
+    try out.ensureTotalCapacity(a, rows.len);
+    for (rows) |row| {
+        var e = try fromRow(T, row);
+        // 字符串列深拷贝：`Row` 里的切片借用结果集缓冲
+        for (T.meta.fields, 0..) |_, i| {
+            const v = e.columnValue(i);
+            if (v == .text) {
+                try e.setColumnValue(i, .{ .text = try a.dupe(u8, v.text) });
+            } else if (v == .blob) {
+                try e.setColumnValue(i, .{ .blob = try a.dupe(u8, v.blob) });
+            }
+        }
+        e.dirty = 0;
+        out.appendAssumeCapacity(e);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// get-or-create 的结果。
+pub fn GetOrAddResult(comptime T: type) type {
+    return struct {
+        entity: T,
+        /// true = 本次新建并已插入；false = 命中已有记录
+        created: bool,
+    };
+}
+
+/// 进程内按 key 串行化的条带锁（对应 C# `KeyedLocker<TEntity>`；8 条带与 C# 一致）。
+var get_or_add_locks: keyed_lock.KeyedLock = .{};
+
+/// 「有就取、没有就建」——对应 C# `Entity<T>.GetOrAdd(key)`。
+///
+/// 并发语义（C# 用的是同一套）：先无锁查一次；没有则**按主键值加锁**再查一次（双重检查），
+/// 仍未命中才在事务里创建并插入。没有这把锁，两个线程会各插一条，唯一索引上直接炸。
+///
+/// `create` 由调用方提供（Zig 没有闭包捕获，用 `ctx` + 函数指针；返回值是**未插入**的实体，
+/// 本函数负责插入并把自增 ID 回写）。
+pub fn getOrAdd(
+    dal: *Dal,
+    comptime T: type,
+    s: *Session,
+    pk_values: []const Value,
+    ctx: *anyopaque,
+    create: *const fn (ctx: *anyopaque) anyerror!T,
+) !GetOrAddResult(T) {
+    if (try findByPk(dal, T, s, pk_values)) |e| return .{ .entity = e, .created = false };
+
+    // 锁 key = 主键值（拼接带分隔符，避免不同主键拼出同一个 key）
+    const key = try keyed_lock.keyOfAlloc(dal.gpa, pk_values);
+    defer dal.gpa.free(key);
+
+    var guard = get_or_add_locks.lock(key);
+    defer guard.release();
+
+    // 双重检查：别的线程可能刚插完
+    if (try findByPk(dal, T, s, pk_values)) |e| return .{ .entity = e, .created = false };
+
+    // 事务：保证「插入 + 后续读」一致（调用方已经在事务里就复用，不嵌套）
+    const own_tx = !s.inTransaction();
+    var tx: Session.Scoped = undefined;
+    if (own_tx) tx = try Session.Scoped.begin(s);
+
+    var e = try create(ctx);
+    _ = try insert(dal, &e, s);
+
+    if (own_tx) {
+        tx.commit() catch |err| {
+            tx.deinit();
+            return err;
+        };
+    }
+    return .{ .entity = e, .created = true };
+}
+
 fn pkWhere(gpa: std.mem.Allocator, t: *const TableMeta, meta: EntityMeta, e: anytype) !Where {
     var w = Where.init(gpa);
     errdefer w.deinit();
@@ -828,4 +910,126 @@ fn pkWhere(gpa: std.mem.Allocator, t: *const TableMeta, meta: EntityMeta, e: any
     }
     if (n == 0) return error.NoPrimaryKey;
     return w;
+}
+
+// ── 用例：getOrAdd / fromRows（SQLite 内存库）────────────────────────────────
+
+const TestUser = struct {
+    Code: []const u8 = "",
+    Name: []const u8 = "",
+    dirty: DirtyBits = 0,
+
+    /// 用**业务主键**（字符串 Code）建模：`getOrAdd` 的语义是「按业务键取或建」，
+    /// 自增主键那种表用不上它（新行的主键由数据库生成，锁 key 无从预先给出）。
+    pub const meta = EntityMeta{
+        .name = "GaoUser",
+        .table_name = "Gao_User",
+        .fields = &.{
+            .{ .name = "Code", .data_type = .string, .primary_key = true },
+            .{ .name = "Name", .data_type = .string },
+        },
+    };
+
+    pub fn columnValue(self: @This(), i: usize) Value {
+        return switch (i) {
+            0 => .{ .text = self.Code },
+            1 => .{ .text = self.Name },
+            else => .null,
+        };
+    }
+
+    pub fn setColumnValue(self: *@This(), i: usize, v: Value) !void {
+        switch (i) {
+            0 => self.Code = v.asText() orelse "",
+            1 => self.Name = v.asText() orelse "",
+            else => return error.ColumnNotFound,
+        }
+    }
+};
+
+fn openGaoDal(a: std.mem.Allocator) !Dal {
+    const xml =
+        \\<EntityModel><Tables><Table Name="GaoUser" TableName="Gao_User">
+        \\  <Columns>
+        \\    <Column Name="Code" DataType="String" Length="20" PrimaryKey="True" />
+        \\    <Column Name="Name" DataType="String" Length="50" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    const m = try model.EntityModel.parse(a, xml);
+    return Dal.initWithModel(a, "Data Source=:memory:;Provider=SQLite", m);
+}
+
+/// 造实体用的上下文（Zig 没有闭包捕获，用 ctx + 函数指针）
+const CreateCtx = struct {
+    code: []const u8,
+    name: []const u8,
+    calls: usize = 0,
+};
+
+fn createOne(ctx: *anyopaque) anyerror!TestUser {
+    const c: *CreateCtx = @ptrCast(@alignCast(ctx));
+    c.calls += 1;
+    return .{ .Code = c.code, .Name = c.name };
+}
+
+test "getOrAdd：第一次新建、第二次命中已有（不重复插入）" {
+    const a = std.testing.allocator;
+    var dal = openGaoDal(a) catch {
+        std.debug.print("[SKIP] 无法加载 SQLite\n", .{});
+        return;
+    };
+    defer dal.deinit();
+    var s = dal.openSession() catch {
+        std.debug.print("[SKIP] 无法加载 SQLite\n", .{});
+        return;
+    };
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    var ctx = CreateCtx{ .code = "c1", .name = "alice" };
+    const pk = [_]Value{.{ .text = "c1" }};
+
+    const r1 = try getOrAdd(&dal, TestUser, &s, &pk, @ptrCast(&ctx), createOne);
+    try std.testing.expect(r1.created);
+    try std.testing.expectEqualStrings("c1", r1.entity.Code);
+    try std.testing.expectEqualStrings("alice", r1.entity.Name);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+
+    // 第二次：业务键已存在 → 命中，不再调用 create
+    const r2 = try getOrAdd(&dal, TestUser, &s, &pk, @ptrCast(&ctx), createOne);
+    try std.testing.expect(!r2.created);
+    try std.testing.expectEqualStrings("alice", r2.entity.Name);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+
+    const t = try dal.table("GaoUser");
+    try std.testing.expectEqual(@as(i64, 1), try t.count(&s, null));
+}
+
+test "fromRows：行集批量转实体（字符串深拷贝，不借用结果缓冲）" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var names = [_][]const u8{ "Code", "Name" };
+    var v1 = [_]Value{ .{ .text = "k1" }, .{ .text = "a" } };
+    var v2 = [_]Value{ .{ .text = "k2" }, .{ .text = "b" } };
+    const rows = [_]session_mod.Row{
+        .{ .names = &names, .values = &v1 },
+        .{ .names = &names, .values = &v2 },
+    };
+
+    var owned = std.heap.ArenaAllocator.init(a);
+    defer owned.deinit();
+
+    const list = try fromRows(TestUser, owned.allocator(), &rows);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("k1", list[0].Code);
+    try std.testing.expectEqualStrings("a", list[0].Name);
+    try std.testing.expectEqualStrings("k2", list[1].Code);
+    try std.testing.expectEqualStrings("b", list[1].Name);
+    // 不置脏：转进来的实体应当可以原样 update（不会因 dirty 位误写）
+    try std.testing.expectEqual(@as(DirtyBits, 0), list[0].dirty);
+    _ = aa;
 }
