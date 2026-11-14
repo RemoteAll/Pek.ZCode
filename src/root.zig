@@ -80,6 +80,8 @@ pub const keyed_lock = @import("keyed_lock.zig");
 pub const datadict = @import("datadict.zig");
 /// 契约清单（C# 接口文本 / JSON 契约，对应 C# `InterfaceBuilder`）
 pub const contract = @import("contract.zig");
+/// 条件表达式构建（字符串条件 → 条件树 + 内存求值，对应 C# `WhereBuilder`）
+pub const where_builder = @import("where_builder.zig");
 /// 整表实体缓存（Blocking 一致性 + 写后自动失效）
 pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
@@ -201,6 +203,7 @@ test {
     _ = @import("keyed_lock.zig");
     _ = @import("datadict.zig");
     _ = @import("contract.zig");
+    _ = @import("where_builder.zig");
     _ = @import("ported_csharp_tests.zig");
     _ = @import("entity_ext.zig");
     _ = @import("extends.zig");
