@@ -201,6 +201,7 @@ test {
     _ = @import("keyed_lock.zig");
     _ = @import("datadict.zig");
     _ = @import("contract.zig");
+    _ = @import("ported_csharp_tests.zig");
     _ = @import("entity_ext.zig");
     _ = @import("extends.zig");
     _ = @import("fieldcache.zig");

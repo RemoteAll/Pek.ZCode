@@ -583,7 +583,7 @@ pub fn countUpTo(gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const
 /// - 分页：`page_index >= 1 && page_size > 0` 时启用
 /// - 分页/取前 N/跳行场景未显式排序时，按主键兜底，保证结果稳定
 /// JOIN 类型（对应 C# `SelectBuilder` 的 Join 语义）。
-pub const JoinKind = enum { inner, left, right, full, cross };
+pub const JoinKind = enum { inner, left, right, full, cross, raw };
 
 /// 一个 JOIN：表名 + 别名 + ON 条件。
 ///
@@ -671,12 +671,19 @@ fn selectImpl(
 
     // JOIN：顺序拼在 FROM 之后（ON 是原样片段，不做引用改写）
     for (joins) |j| {
+        if (j.kind == .raw) {
+            // C# `SelectBuilder.Join` 就是一个字符串：多表/特殊语法原样拼
+            try b.add(" ");
+            try b.add(j.table);
+            continue;
+        }
         try b.add(switch (j.kind) {
             .inner => " INNER JOIN ",
             .left => " LEFT JOIN ",
             .right => " RIGHT JOIN ",
             .full => " FULL JOIN ",
             .cross => " CROSS JOIN ",
+            .raw => unreachable,
         });
         try b.add(j.table);
         if (j.alias.len > 0) {
@@ -746,6 +753,87 @@ fn selectImpl(
     }
 
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
+}
+
+/// 排序串的两种用法（对应 C# `PageParameter.Sort` 与 `OrderBy`）。
+pub const BuildOrderMode = enum {
+    /// 结构化排序串：`Name desc, Code`，可带 `asc`/`desc` 后缀；没写方向时用 `default_desc`
+    sort,
+    /// 原样排序串：直接返回（C# 口径：`OrderBy` 优先且 `Desc` 不生效）
+    order_by,
+};
+
+/// 把排序串解析成 `ORDER BY` 内容（**不含** `ORDER BY` 关键字）。
+///
+/// 直译 C# `SqlBuilder.BuildOrder`（用例见 `XUnitTest.XCode/Common/SqlBuilderTests.cs`）：
+/// - 按 `,` 分段，`\n` / `\r` / `\t` / 空格都会清掉（前端常把多行塞进 `sort`）；
+/// - 每段可带 `asc` / `desc` 后缀（忽略大小写）；**没写后缀时用 `default_desc`**
+///   （`asc` 段不写后缀，`desc` 段写 ` Desc`）；
+/// - 列名按表校验（忽略大小写），输出**模型里的规范列名**（`name` → `Name`）；
+///   校验不过报 `error.UnknownSortField` 并打印「表 X 不包含排序字段 Y」——
+///   绝不把用户输入原样拼进 SQL（这是注入面）。
+///
+/// 输出**不加引号**（与 C# 一致，方便直接拼进 ORDER BY）；要带引号请用 `Query.orderBy`。
+pub fn buildOrderAlloc(
+    gpa: std.mem.Allocator,
+    table: *const TableMeta,
+    spec: []const u8,
+    default_desc: bool,
+    mode: BuildOrderMode,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    if (mode == .order_by or trimmed.len == 0) return gpa.dupe(u8, trimmed);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    var it = std.mem.splitScalar(u8, trimmed, ',');
+    var first = true;
+    while (it.next()) |raw_item| {
+        // 清掉换行/制表（C# 用 String.Trim 同理，但这里连内部换行也压掉）
+        var item_buf: [256]u8 = undefined;
+        var n: usize = 0;
+        for (raw_item) |c| {
+            if (c == '\n' or c == '\r' or c == '\t') continue;
+            if (n >= item_buf.len) return error.NameTooLong;
+            item_buf[n] = c;
+            n += 1;
+        }
+        const item = std.mem.trim(u8, item_buf[0..n], " ");
+        if (item.len == 0) continue;
+
+        // 取方向后缀
+        var name = item;
+        var desc = default_desc;
+        if (endsWithIgnoreCase(item, " desc")) {
+            name = std.mem.trimEnd(u8, item[0 .. item.len - 5], " ");
+            desc = true;
+        } else if (endsWithIgnoreCase(item, " asc")) {
+            name = std.mem.trimEnd(u8, item[0 .. item.len - 4], " ");
+            desc = false;
+        }
+        if (name.len == 0) continue;
+
+        // 按表校验并取规范列名（大小写不敏感）
+        const col = table.column(name) orelse {
+            std.debug.print(
+                "[zcode] 排序字段非法：表 {s} 不包含字段 {s}（可用字段见模型；该串来自外部输入，已拒绝）\n",
+                .{ table.effectiveTableName(), name },
+            );
+            return error.UnknownSortField;
+        };
+
+        if (!first) try out.append(gpa, ',');
+        first = false;
+        try out.appendSlice(gpa, col.name);
+        if (desc) try out.appendSlice(gpa, " Desc");
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[haystack.len - needle.len ..], needle);
 }
 
 fn renderOrder(out: *Buf, kind: DatabaseKind, table: *const TableMeta, orders: []const query.OrderBy) !void {
