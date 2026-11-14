@@ -332,6 +332,14 @@ pub const Session = struct {
         _ = self.arena.reset(.retain_capacity);
     }
 
+    /// 结果集 arena 当前占用字节数（诊断用）。
+    ///
+    /// 用途：观察长生命周期会话的内存。**大表遍历必须能看到它不随页数增长**——
+    /// 分页抽取器每次 `next()` 会回收上一页，堆占用应停在「一两页」的量级。
+    pub fn resultBytes(self: *const Session) usize {
+        return self.arena.queryCapacity();
+    }
+
     // ── SQL 输出开关（对应 C# `IDbSession.ShowSQL` / `SetShowSql`）──────
 
     /// 本会话是否输出 SQL：会话级显式设置优先，否则看全局 `Setting.show_sql`

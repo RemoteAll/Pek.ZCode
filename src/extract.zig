@@ -26,6 +26,8 @@ const Session = session_mod.Session;
 const Row = session_mod.Row;
 const Query = @import("query.zig").Query;
 const Where = @import("query.zig").Where;
+const model = @import("model.zig");
+const Dal = @import("dal.zig").Dal;
 
 /// 抽取参数（对应 C# `ExtractSetting`）。
 pub const Setting = struct {
@@ -85,8 +87,13 @@ pub const IdExtractor = struct {
     }
 
     /// 取下一批；`null` 表示抽完。
+    ///
+    /// **内存契约**：上一批的行会在下一次 `next()` 开头被回收（`Session.resetResults`），
+    /// 所以「取一批 → 处理 → 再取」是内存有界的；**不要把多批行攒起来一起用**。
     pub fn next(self: *IdExtractor, s: *Session) !?[]Row {
         if (self.done) return null;
+        // 亿级表遍历的关键：不回收的话，每页都累积在会话 arena 里，内存直线上升
+        if (self.total > 0) s.resetResults();
 
         const gpa = self.table.gpa;
         var w = Where.init(gpa);
@@ -134,9 +141,10 @@ pub const PagingExtractor = struct {
         return .{ .table = table, .order_by = order_by };
     }
 
-    /// 取下一批；`null` 表示抽完。
+    /// 取下一批；`null` 表示抽完。内存契同 `IdExtractor.next`（上一批在下次调用时回收）。
     pub fn next(self: *PagingExtractor, s: *Session) !?[]Row {
         if (self.done) return null;
+        if (self.total > 0) s.resetResults();
 
         const gpa = self.table.gpa;
         var q = Query.init(gpa);
@@ -208,9 +216,10 @@ pub const TimeExtractor = struct {
         return rowColumnTime(rows[0], self.column);
     }
 
-    /// 取下一批；`null` 表示抽完。
+    /// 取下一批；`null` 表示抽完。内存契同 `IdExtractor.next`（上一批在下次调用时回收）。
     pub fn next(self: *TimeExtractor, s: *Session) !?[]Row {
         if (self.done) return null;
+        if (self.total > 0) s.resetResults();
 
         if (self.start == null) {
             const first = try self.findFirst(s) orelse {
@@ -313,4 +322,72 @@ test "时间加减秒（跨天/跨月）" {
     const march = addSeconds(dt, 24 * 60 * 60);
     try std.testing.expectEqual(@as(u8, 3), march.month);
     try std.testing.expectEqual(@as(u8, 1), march.day);
+}
+
+test "分页抽取：多页遍历内存有界（每页回收，不随页数增长）" {
+    const a = std.testing.allocator;
+
+    const xml =
+        \\<EntityModel><Tables><Table Name="Big" TableName="Big_Row">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Name" DataType="String" Length="64" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    // 注意：`Dal` **接管模型所有权**（`Dal.deinit` 会 `model.deinit()`），调用方不能再释放
+    const m = try model.EntityModel.parse(a, xml);
+
+    var dal = Dal.initWithModel(a, "Data Source=:memory:;Provider=SQLite", m) catch {
+        std.debug.print("[SKIP] 无法加载 SQLite\n", .{});
+        return;
+    };
+    defer dal.deinit();
+    var s = dal.openSession() catch {
+        std.debug.print("[SKIP] 无法加载 SQLite\n", .{});
+        return;
+    };
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const t = try dal.table("Big");
+
+    // 造 400 行（每行 64 字节字符串），批大小 20 → 20 页
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        var name_buf: [64]u8 = undefined;
+        @memset(&name_buf, 'x');
+        _ = try t.insert(&s, &.{
+            .{ .name = "Name", .value = .{ .text = name_buf[0..] } },
+        });
+    }
+
+    var ex = PagingExtractor.init(t, "Id");
+    ex.batch_size = 20;
+
+    var pages: usize = 0;
+    var total_rows: usize = 0;
+    var max_arena: usize = 0;
+    while (try ex.next(&s)) |rows| {
+        pages += 1;
+        total_rows += rows.len;
+        // 处理「当前页」：只看本页，不攒行
+        for (rows) |r| {
+            const name = r.get("Name").?.text;
+            std.debug.assert(name.len == 64);
+        }
+        const now = arenaBytes(&s);
+        if (now > max_arena) max_arena = now;
+    }
+
+    try std.testing.expectEqual(@as(usize, 400), total_rows);
+    try std.testing.expectEqual(@as(usize, 20), pages);
+    // 每页约 20 行 × (Row + 64B 字符串 + 列名借用) ≈ 3KB；20 页全攒下会 ≥ 60KB。
+    // 有界的话峰值应停在「一两页」的量级——这里给 16KB 的宽松上界，防止回归成累积。
+    try std.testing.expect(max_arena < 16 * 1024);
+}
+
+/// 会话结果 arena 当前占用（诊断/用例用；正式代码不要依赖具体数值）。
+fn arenaBytes(s: *Session) usize {
+    return s.resultBytes();
 }
