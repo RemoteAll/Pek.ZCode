@@ -81,6 +81,8 @@ pub const Simulator = struct {
             },
             .string => .{ .text = try self.randomStringAlloc(arena, r, col.length) },
             .datetime => .{ .datetime = self.randomDatetime() },
+            // GUID 列造真 GUID（不是随机字符串）：造数、导入、对拍都需要能被当成 GUID 校验
+            .guid => .{ .text = try @import("zzig").Guid.guidAlloc(arena) },
             .binary, .json => Error.UnsupportedColumn,
         };
     }

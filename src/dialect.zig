@@ -283,6 +283,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "datetime"),
                 .binary => gpa.dupe(u8, "binary"),
                 .json => gpa.dupe(u8, "text"),
+                // C# `SQLite.cs`：Guid → uniqueidentifier
+                .guid => gpa.dupe(u8, "uniqueidentifier"),
             },
             .mysql => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "TINYINT"),
@@ -303,6 +305,8 @@ pub const DatabaseKind = enum {
                 .datetime => datetimeSpec(gpa, "datetime", col.scale),
                 .binary => gpa.dupe(u8, "longblob"),
                 .json => gpa.dupe(u8, "JSON"),
+                // C# `MySql.cs`：Guid → CHAR(36)
+                .guid => gpa.dupe(u8, "CHAR(36)"),
             },
             .sqlserver => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "bit"),
@@ -320,6 +324,8 @@ pub const DatabaseKind = enum {
                 .datetime => datetimeSpecMssql(gpa, col.scale),
                 .binary => gpa.dupe(u8, "varbinary(max)"),
                 .json => gpa.dupe(u8, "nvarchar(max)"),
+                // C# `SqlServer.cs`：Guid → uniqueidentifier
+                .guid => gpa.dupe(u8, "uniqueidentifier"),
             },
             .postgresql, .kingbase, .highgo, .vastbase => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "boolean"),
@@ -336,6 +342,8 @@ pub const DatabaseKind = enum {
                 .datetime => datetimeSpec(gpa, "timestamp", col.scale),
                 .binary => gpa.dupe(u8, "bytea"),
                 .json => gpa.dupe(u8, "jsonb"),
+                // C# `PostgreSQL.cs` / `KingBase.cs` / `HighGo.cs` / `VastBase.cs`：Guid → uuid
+                .guid => gpa.dupe(u8, "uuid"),
             },
             .oracle => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "number(1)"),
@@ -353,6 +361,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "timestamp"),
                 .binary => gpa.dupe(u8, "blob"),
                 .json => gpa.dupe(u8, "clob"),
+                // Oracle 无 Guid：按字符串等价（固定 36 位）
+                .guid => gpa.dupe(u8, "char(36)"),
             },
             // 达孟（C# `DaMeng.cs` 的 _DataTypes）：Oracle 系语法，占位符 `:n`
             .dameng => switch (col.data_type) {
@@ -374,6 +384,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "DATETIME"),
                 .binary => gpa.dupe(u8, "BLOB"),
                 .json => gpa.dupe(u8, "TEXT"),
+                // 达孟无 Guid 原生类型 → CHAR(36)
+                .guid => gpa.dupe(u8, "CHAR(36)"),
             },
             // DB2（C# `DB2.cs`）：数字/字符串走 Oracle 风格类型名，时间只有 DATE
             .db2 => switch (col.data_type) {
@@ -397,6 +409,8 @@ pub const DatabaseKind = enum {
                 else
                     gpa.dupe(u8, "BLOB"),
                 .json => gpa.dupe(u8, "CLOB"),
+                // DB2 无 Guid 原生类型 → CHAR(36)
+                .guid => gpa.dupe(u8, "CHAR(36)"),
             },
             // Firebird（C# `Firebird.cs`）：无布尔/无 Guid，Bool 用 SMALLINT
             .firebird => switch (col.data_type) {
@@ -418,6 +432,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "TIMESTAMP"),
                 .binary => gpa.dupe(u8, "BLOB"),
                 .json => gpa.dupe(u8, "BLOB SUB_TYPE TEXT"),
+                // Firebird 无 Guid（C# 注释已写明）→ CHAR(36)
+                .guid => gpa.dupe(u8, "CHAR(36)"),
             },
             // HANA / IRIS / NovaDb（C# 三份 _DataTypes 几乎一致：MySQL 风格类型名）
             .hana, .iris, .nova => switch (col.data_type) {
@@ -439,6 +455,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "DATETIME"),
                 .binary => gpa.dupe(u8, "BLOB"),
                 .json => gpa.dupe(u8, "LONGTEXT"),
+                // IRIS 的 C# 映射就是 CHAR(36)；HANA/NovaDb 同口径
+                .guid => gpa.dupe(u8, "CHAR(36)"),
             },
             // Access / SqlCe（C# 两份：SqlServer 家族类型名，标识符用 []）
             .access => switch (col.data_type) {
@@ -457,6 +475,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "datetime"),
                 .binary => gpa.dupe(u8, "binary"),
                 .json => gpa.dupe(u8, "ntext"),
+                // C# `Access.cs`：Guid → uniqueidentifier
+                .guid => gpa.dupe(u8, "uniqueidentifier"),
             },
             .sqlce => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "bit"),
@@ -474,6 +494,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "datetime"),
                 .binary => gpa.dupe(u8, "varbinary(8000)"),
                 .json => gpa.dupe(u8, "ntext"),
+                // C# `SqlCe.cs`：Guid → uniqueidentifier
+                .guid => gpa.dupe(u8, "uniqueidentifier"),
             },
             // DuckDB / ClickHouse：C# 侧没有静态类型表（走驱动自己的 schema），
             // 这里按两者的**原生类型名**给出（DuckDB 兼容 PG 类型名，ClickHouse 用 String/Int*）
@@ -493,6 +515,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "TIMESTAMP"),
                 .binary => gpa.dupe(u8, "BLOB"),
                 .json => gpa.dupe(u8, "JSON"),
+                // DuckDB 有原生 UUID 类型
+                .guid => gpa.dupe(u8, "UUID"),
             },
             .clickhouse => switch (col.data_type) {
                 .boolean => gpa.dupe(u8, "UInt8"),
@@ -510,6 +534,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "DateTime"),
                 .binary => gpa.dupe(u8, "String"),
                 .json => gpa.dupe(u8, "String"),
+                // ClickHouse 有原生 UUID 类型
+                .guid => gpa.dupe(u8, "UUID"),
             },
             // TDengine（C# `Tdengine.cs` 的 _DataTypes）：无布尔以外的复杂类型，时间固定 TIMESTAMP
             .tdengine => switch (col.data_type) {
@@ -527,6 +553,8 @@ pub const DatabaseKind = enum {
                 .datetime => gpa.dupe(u8, "TIMESTAMP"),
                 .binary => gpa.dupe(u8, "BINARY(64)"),
                 .json => gpa.dupe(u8, "NCHAR(256)"),
+                // TDengine 只有 NCHAR 能装字符串
+                .guid => gpa.dupe(u8, "NCHAR(36)"),
             },
             else => error.Unsupported,
         };

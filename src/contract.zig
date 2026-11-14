@@ -211,6 +211,7 @@ fn appendCsharpType(a: std.mem.Allocator, out: *std.ArrayList(u8), col: *const m
         .datetime => try out.appendSlice(a, "DateTime"),
         .binary => try out.appendSlice(a, "Byte[]"),
         .json => try out.appendSlice(a, "String"),
+        .guid => try out.appendSlice(a, "Guid"),
         .string => {
             // C# 口径：只有 String 在 Nullable 开关打开且列可空时才加 `?`
             if (opts.nullable_string and col.nullable) {

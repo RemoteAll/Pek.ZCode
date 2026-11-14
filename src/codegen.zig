@@ -438,6 +438,8 @@ fn zigType(dt: DataType) []const u8 {
         .string, .json => "[]const u8",
         .datetime => "zcode.DateTime",
         .binary => "[]const u8",
+        // GUID 用 36 位字符表示（不引入单独的 Guid 类型）
+        .guid => "[]const u8",
     };
 }
 
@@ -449,6 +451,7 @@ fn defaultInit(dt: DataType) []const u8 {
         .decimal => " = .{ .mantissa = 0, .scale = 0 }",
         .string, .json, .binary => " = \"\"",
         .datetime => " = .{}",
+        .guid => " = \"\"",
     };
 }
 
@@ -462,6 +465,7 @@ fn addValueExpr(b: *zzig.Buf, dt: DataType, name: []const u8) !void {
         .datetime => try b.fmt(".{{ .datetime = self.@\"{s}\" }}", .{name}),
         .string, .json => try b.fmt(".{{ .text = self.@\"{s}\" }}", .{name}),
         .binary => try b.fmt(".{{ .blob = self.@\"{s}\" }}", .{name}),
+        .guid => try b.fmt(".{{ .text = self.@\"{s}\" }}", .{name}),
     }
 }
 
@@ -478,6 +482,7 @@ fn addAssignStmt(b: *zzig.Buf, dt: DataType, name: []const u8) !void {
         .datetime => try b.fmt("self.@\"{s}\" = v.asDatetime() orelse .{{}};", .{name}),
         .string, .json => try b.fmt("switch (v) {{ .text => |t| self.@\"{s}\" = t, .null => self.@\"{s}\" = \"\", else => {{}} }}", .{ name, name }),
         .binary => try b.fmt("switch (v) {{ .blob => |b| self.@\"{s}\" = b, .null => self.@\"{s}\" = \"\", else => {{}} }}", .{ name, name }),
+        .guid => try b.fmt("switch (v) {{ .text => |t| self.@\"{s}\" = t, .null => self.@\"{s}\" = \"\", else => {{}} }}", .{ name, name }),
     }
 }
 
@@ -547,8 +552,32 @@ test "生成实体：meta/脏位/取值与装载" {
     try std.testing.expect(std.mem.indexOf(u8, src, "self.@\"Score\" = v.asI64() orelse 0;") != null);
 }
 
-test "生成实体：双文件契约（基础文件 + 业务扩展模板）" {
+test "生成实体：Guid 列生成 []const u8 + .text 包装（不引入单独类型）" {
     const xml =
+        \\<EntityModel><Tables><Table Name="Doc" TableName="ZCode_Doc">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Token" DataType="Guid" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    var m = try EntityModel.parse(std.testing.allocator, xml);
+    defer m.deinit();
+
+    const src = try generateTableAlloc(std.testing.allocator, &m.tables[0]);
+    defer std.testing.allocator.free(src);
+
+    // 字段声明：字符串形态（有默认空串）
+    try std.testing.expect(std.mem.indexOf(u8, src, "@\"Token\": []const u8 = \"\"") != null);
+    // 元数据：类型是 guid
+    try std.testing.expect(std.mem.indexOf(u8, src, ".{ .name = \"Token\", .data_type = .guid }") != null);
+    // 写库取值：包成 .text
+    try std.testing.expect(std.mem.indexOf(u8, src, ".{ .text = self.@\"Token\" }") != null);
+    // 读库赋值：从 .text 取
+    try std.testing.expect(std.mem.indexOf(u8, src, "switch (v) { .text => |t| self.@\"Token\" = t") != null);
+}
+
+test "生成实体：双文件契约（基础文件 + 业务扩展模板）" {    const xml =
         \\<EntityModel><Tables><Table Name="Article" TableName="ZCode_Article" MaxCacheCount="500">
         \\  <Columns>
         \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />

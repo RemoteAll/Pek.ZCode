@@ -906,6 +906,65 @@ test "显式写入自增列（导入/迁移）：Id 按给定值落库，不重�
     try std.testing.expect(next_id > 100);
 }
 
+test "Guid 列：建表 → 写入 → 读回（SQLite uniqueidentifier 存文本）" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "guid");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    const xml =
+        \\<EntityModel><Tables><Table Name="Doc" TableName="DH_Doc">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Token" DataType="Guid" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    ;
+    const m = zcode.EntityModel.parse(a, xml) catch |e| {
+        std.debug.print("[FAIL] Guid 模型解析失败：{s}\n", .{@errorName(e)});
+        return e;
+    };
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{db_path});
+    defer a.free(conn);
+    var dal = zcode.Dal.initWithModel(a, conn, m) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Doc");
+
+    // 拦截器按 C# `AutoSetGuidField` 的语义补值
+    var gi = zcode.interceptor.GuidInterceptor{ .column = "Token" };
+    var chain = zcode.interceptor.Chain.init(a);
+    defer chain.deinit();
+    try chain.add(gi.interceptor());
+
+    // 生成值由调用方 allocator 持有（真实用法里是请求 arena），这里用 arena 统一回收
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fields: std.ArrayList(zcode.sqlbuild.Field) = .empty;
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = arena.allocator(), .items = &fields });
+    try std.testing.expectEqual(@as(usize, 1), fields.items.len);
+    const token = fields.items[0].value.asText().?;
+    try std.testing.expect(@import("zzig").Guid.isValid(token));
+
+    _ = try table.insert(&s, fields.items);
+
+    const rows = try s.queryRows("SELECT Token FROM DH_Doc", &.{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const read_back = rows[0].get("Token").?.asText().?;
+    // 写进去什么就读回什么：不做大小写 / 格式转换
+    try std.testing.expectEqualStrings(token, read_back);
+    // 约定的小写形态（C# `Guid.ToString()` 也是小写）
+    for (read_back) |c| try std.testing.expect(!std.ascii.isUpper(c));
+}
+
 // 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
 test {
     _ = @import("integration_features.zig");

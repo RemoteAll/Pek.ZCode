@@ -362,8 +362,58 @@ fn stripScheme(ip: []const u8) []const u8 {
     return ip[p + 3 ..];
 }
 
-/// 标准审计链（对应 C# 代码生成器给每个实体加的那四行 `Meta.Interceptors.Add(...)`）。
+/// GUID 拦截器：插入时给**指定列**填新 GUID（对应 C# `EntityOperate.AutoSetGuidField`）。
 ///
+/// C# 的语义很窄，照抄：
+/// - 只针对实体上**指定的那一个字段**（`Mask.AutoSetGuidField = _.Guid`），不是"所有 Guid 列"；
+/// - **只在插入**时补；调用方已经给了值就**不动**（C# 判断 `!entity.IsDirty(fi.Name)`）；
+/// - 没有指定列名时不生效。
+///
+/// 与 C# 的一处差异：C# 是"没脏就写"，Zig 拿到的是字段列表，判定改成
+/// 「没传 / 传了空串 / 传了非法 GUID 文本」→ 补新值；传了合法 GUID 视为调用方有意为之。
+pub const GuidInterceptor = struct {
+    /// 要自动填值的列名（空 = 不生效）
+    column: []const u8 = "",
+    /// 生成器（默认 `zzig.Guid.guidAlloc`；测试可注入固定值）
+    gen_fn: *const fn (gpa: std.mem.Allocator) anyerror![]const u8 = defaultGuid,
+
+    fn defaultGuid(gpa: std.mem.Allocator) anyerror![]const u8 {
+        return @import("zzig").Guid.guidAlloc(gpa);
+    }
+
+    pub fn interceptor(self: *GuidInterceptor) Interceptor {
+        return .{ .ctx = @ptrCast(self), .apply = applyImpl, .name = "GuidInterceptor" };
+    }
+
+    fn applyImpl(ctx: *anyopaque, method: Method, table: *const TableMeta, fields: Fields) anyerror!bool {
+        const self: *GuidInterceptor = @ptrCast(@alignCast(ctx));
+        if (self.column.len == 0) return false;
+        // 只在插入时补；更新时保留原值
+        if (method != .insert) return false;
+
+        const col = table.column(self.column) orelse return false;
+        if (col.data_type != .guid) {
+            std.debug.print(
+                "[zcode] GUID 拦截器：表 {s} 的列 {s} 不是 Guid 类型（实际 {s}），跳过\n",
+                .{ table.name, self.column, col.data_type.name() },
+            );
+            return false;
+        }
+
+        // 已经有合法 GUID 就尊重调用方的值
+        if (fields.get(col.name)) |existing| {
+            if (existing.asText()) |text| {
+                if (@import("zzig").Guid.isValid(text)) return false;
+            }
+        }
+
+        const generated = try self.gen_fn(fields.gpa);
+        try fields.set(col.name, .{ .text = generated });
+        return true;
+    }
+};
+
+/// 标准审计链（对应 C# 代码生成器给每个实体加的那四行 `Meta.Interceptors.Add(...)`）。
 /// C# 的 `{Name}.Biz.cs` 静态构造里固定注册 `UserInterceptor` / `TimeInterceptor` /
 /// `IPInterceptor` / `TraceInterceptor` 四个，这里是同口径的一体化封装：
 ///
@@ -632,6 +682,71 @@ test "IP 拦截器：无 IP 时 allow_empty 决定是否清空 UpdateIP；插入
 fn fakeMyIp(gpa: std.mem.Allocator) ?[]const u8 {
     _ = gpa;
     return "192.168.1.10";
+}
+
+test "GUID 拦截器：插入补指定列，已有合法值/更新都不动，非 Guid 列跳过" {
+    // 生成值是「由调用方 allocator 持有」的（真实用法里是请求 arena），这里用 arena 统一回收
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = try model.EntityModel.parse(a,
+        \\<EntityModel><Tables><Table Name="Order" TableName="DH_Order">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Guid" DataType="Guid" />
+        \\    <Column Name="Code" DataType="String" Length="50" />
+        \\  </Columns>
+        \\</Table></Tables></EntityModel>
+    );
+    defer m.deinit();
+
+    var gi = GuidInterceptor{ .column = "Guid", .gen_fn = &fixedGuid };
+    var chain = Chain.init(a);
+    defer chain.deinit();
+    try chain.add(gi.interceptor());
+
+    // 插入：没传 → 补一个新 GUID
+    var items: std.ArrayList(Field) = .empty;
+    defer items.deinit(a);
+    try items.append(a, .{ .name = "Code", .value = .{ .text = "k1" } });
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items });
+    const filled = fieldsValue(items.items, "Guid").?.asText().?;
+    try std.testing.expectEqualStrings("11111111-2222-4333-8444-555555555555", filled);
+    try std.testing.expect(std.mem.indexOfScalar(u8, filled, '-') != null);
+
+    // 插入：调用方给了合法 GUID → 尊重原值
+    var items2: std.ArrayList(Field) = .empty;
+    defer items2.deinit(a);
+    try items2.append(a, .{ .name = "Guid", .value = .{ .text = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items2 });
+    try std.testing.expectEqualStrings("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", fieldsValue(items2.items, "Guid").?.asText().?);
+
+    // 插入：给了空串（= 默认值）→ 覆盖成新 GUID
+    var items3: std.ArrayList(Field) = .empty;
+    defer items3.deinit(a);
+    try items3.append(a, .{ .name = "Guid", .value = .{ .text = "" } });
+    try chain.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items3 });
+    try std.testing.expectEqualStrings("11111111-2222-4333-8444-555555555555", fieldsValue(items3.items, "Guid").?.asText().?);
+
+    // 更新：一律不动
+    var sets: std.ArrayList(Field) = .empty;
+    defer sets.deinit(a);
+    try chain.applyTo(.update, &m.tables[0], .{ .gpa = a, .items = &sets });
+    try std.testing.expectEqual(@as(usize, 0), sets.items.len);
+
+    // 列不是 Guid 类型 → 跳过（配置写错时明确打印，不静默写坏数据）
+    var bad = GuidInterceptor{ .column = "Code", .gen_fn = &fixedGuid };
+    var chain2 = Chain.init(a);
+    defer chain2.deinit();
+    try chain2.add(bad.interceptor());
+    var items4: std.ArrayList(Field) = .empty;
+    defer items4.deinit(a);
+    try chain2.applyTo(.insert, &m.tables[0], .{ .gpa = a, .items = &items4 });
+    try std.testing.expectEqual(@as(usize, 0), items4.items.len);
+}
+
+fn fixedGuid(gpa: std.mem.Allocator) anyerror![]const u8 {
+    return gpa.dupe(u8, "11111111-2222-4333-8444-555555555555");
 }
 
 test "标准审计链：一次挂上 User/Time/IP/Trace，四个审计列都补齐" {

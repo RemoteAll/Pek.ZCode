@@ -18,12 +18,19 @@ pub const DataType = enum {
     datetime,
     binary,
     json,
+    /// GUID / UUID（C# `DataType.Guid`）。
+    ///
+    /// 值在 Zig 侧统一用 **36 位小写带连字符的字符串**表示（`zzig.db.Value.text`），
+    /// 不引入新的 union 分支——各方言的 TEXT/CHAR(36)/uuid 都能装字符串，
+    /// 驱动读回来也是文本，多一个 `Value.guid` 只会多一条不必要的转换路径。
+    guid,
 
     /// 全部类型（遍历/自检用）。
     pub const all = [_]DataType{
         .boolean, .byte,     .int16,  .int32,
         .int64,   .single,   .double, .decimal,
         .string,  .datetime, .binary, .json,
+        .guid,
     };
 
     /// 标准名称（与 Model.xml 中的 `DataType` 属性一致）。
@@ -41,6 +48,7 @@ pub const DataType = enum {
             .datetime => "DateTime",
             .binary => "Binary",
             .json => "Json",
+            .guid => "Guid",
         };
     }
 
@@ -59,6 +67,9 @@ pub const DataType = enum {
         if (std.ascii.eqlIgnoreCase(t, "datetime") or std.ascii.eqlIgnoreCase(t, "date") or std.ascii.eqlIgnoreCase(t, "timestamp")) return .datetime;
         if (std.ascii.eqlIgnoreCase(t, "binary") or std.ascii.eqlIgnoreCase(t, "byte[]") or std.ascii.eqlIgnoreCase(t, "blob")) return .binary;
         if (std.ascii.eqlIgnoreCase(t, "json") or std.ascii.eqlIgnoreCase(t, "jsonb")) return .json;
+        // GUID：Model.xml 里写 `DataType="Guid"`（C# 口径）；`uuid` / `uniqueidentifier` 是库侧类型名
+        if (std.ascii.eqlIgnoreCase(t, "guid") or std.ascii.eqlIgnoreCase(t, "uuid") or
+            std.ascii.eqlIgnoreCase(t, "uniqueidentifier")) return .guid;
         return error.UnknownDataType;
     }
 

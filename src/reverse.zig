@@ -278,6 +278,8 @@ fn sqliteDataType(declared: []const u8) DataType {
     if (std.ascii.startsWithIgnoreCase(t, "DATETIME") or std.ascii.startsWithIgnoreCase(t, "TIMESTAMP") or std.ascii.startsWithIgnoreCase(t, "DATE")) return .datetime;
     if (std.ascii.startsWithIgnoreCase(t, "BLOB") or std.ascii.startsWithIgnoreCase(t, "BINARY")) return .binary;
     if (std.ascii.startsWithIgnoreCase(t, "JSON")) return .json;
+    // SQLite 的官方 Guid 写法（C# `SQLite.cs` 的 _DataTypes）：uniqueidentifier / guid
+    if (std.ascii.eqlIgnoreCase(t, "uniqueidentifier") or std.ascii.startsWithIgnoreCase(t, "guid")) return .guid;
     return .string;
 }
 
@@ -615,6 +617,8 @@ fn pgDataType(data_type: []const u8, udt_name: []const u8) DataType {
         std.ascii.eqlIgnoreCase(u, "date")) return .datetime;
     if (std.ascii.eqlIgnoreCase(u, "bytea")) return .binary;
     if (std.ascii.eqlIgnoreCase(u, "json") or std.ascii.eqlIgnoreCase(u, "jsonb")) return .json;
+    // PG 系的原生 Guid 类型（C# `PostgreSQL.cs` / `KingBase.cs` / `HighGo.cs` 都用 uuid）
+    if (std.ascii.eqlIgnoreCase(u, "uuid")) return .guid;
     // serial 系列在 information_schema 里也表现为 integer/bigint，此处已覆盖
     return .string;
 }
@@ -773,7 +777,8 @@ fn mssqlDataType(data_type: []const u8) DataType {
     if (std.ascii.eqlIgnoreCase(t, "binary") or std.ascii.eqlIgnoreCase(t, "varbinary") or
         std.ascii.eqlIgnoreCase(t, "image") or std.ascii.eqlIgnoreCase(t, "timestamp") or
         std.ascii.eqlIgnoreCase(t, "rowversion")) return .binary;
-    if (std.ascii.eqlIgnoreCase(t, "uniqueidentifier")) return .string;
+    // C# `DAL_Mapper` 把 uniqueidentifier 映射成 Guid；本仓同样反查成 guid（值仍是 36 位文本）
+    if (std.ascii.eqlIgnoreCase(t, "uniqueidentifier")) return .guid;
     return .string;
 }
 

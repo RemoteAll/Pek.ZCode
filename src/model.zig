@@ -838,8 +838,31 @@ test "写出→再解析 往返一致" {
     try std.testing.expectEqual(@as(i32, 4), m2.tables[0].column("Amount").?.scale);
 }
 
-test "视图识别：IsView 与 # 前缀" {
+test "Guid 列：Model.xml 里 DataType=\"Guid\" 能解析（以前直接 error.InvalidModel）" {
     const xml =
+        \\<EntityModel><Tables>
+        \\<Table Name="Doc"><Columns>
+        \\<Column Name="Id" DataType="Int32" PrimaryKey="True" Identity="True" />
+        \\<Column Name="Token" DataType="Guid" />
+        \\<Column Name="Uuid" DataType="uuid" />
+        \\</Columns></Table>
+        \\</Tables></EntityModel>
+    ;
+    var m = try EntityModel.parse(std.testing.allocator, xml);
+    defer m.deinit();
+
+    const t = &m.tables[0];
+    try std.testing.expectEqual(DataType.guid, t.column("Token").?.data_type);
+    // 反查/其它库给的别名也认
+    try std.testing.expectEqual(DataType.guid, t.column("Uuid").?.data_type);
+
+    // 写回 XML 时保持 C# 口径的类型名 `Guid`
+    const out = try m.toXmlAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "DataType=\"Guid\"") != null);
+}
+
+test "视图识别：IsView 与 # 前缀" {    const xml =
         \\<EntityModel><Tables>
         \\<Table Name="V1" IsView="True"><Columns><Column Name="Id" DataType="Int32" /></Columns></Table>
         \\<Table Name="#V2"><Columns><Column Name="Id" DataType="Int32" /></Columns></Table>

@@ -980,6 +980,16 @@ fn normalizeValue(arena: std.mem.Allocator, data_type: model.DataType, raw: Valu
                 break :blk .{ .text = text };
             },
         },
+        // GUID 在 Zig 侧就是字符串：驱动读回来若是 blob（如 SQL Server uniqueidentifier 的原始字节）
+        // 或其它形态，统一转成文本，不做二进制 GUID 布局解析（各家字节序不同，猜必错）。
+        .guid => switch (raw) {
+            .text => raw,
+            .null => raw,
+            else => blk: {
+                const text = try raw.toTextAlloc(arena);
+                break :blk .{ .text = text };
+            },
+        },
         .binary => switch (raw) {
             .blob, .null => raw,
             else => blk: {
