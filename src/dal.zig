@@ -911,7 +911,8 @@ pub const Dal = struct {
                 return Session.initWithDriver(self.gpa, .duckdb, .{ .duckdb = db });
             },
             .oracle => {
-                const lib = if (self.oracle_lib) |*l| l else return error.Unsupported;                // 两种写法都支持：
+                const lib = if (self.oracle_lib) |*l| l else return error.Unsupported;
+                // 两种写法都支持：
                 // 1) Server=host + Database=SERVICE_NAME（常规）
                 // 2) Server 直接给完整 DSN（`//host:1521/svc` 或 `(DESCRIPTION=(...))`）
                 const looks_like_dsn = std.mem.indexOf(u8, opts.server, "//") != null or

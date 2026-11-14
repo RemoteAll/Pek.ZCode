@@ -70,6 +70,10 @@ pub const entity_ext = @import("entity_ext.zig");
 pub const extends = @import("extends.zig");
 /// CSV 读写（RFC4180 风格，全仓只此一份）
 pub const csv = @import("csv.zig");
+/// 测试数据生成（按模型列类型造数，对应 C# `DataSimulation`）
+pub const simulation = @import("simulation.zig");
+/// 搜索条件推导（索引列 / 枚举 / 布尔开关 / 时间列，对应 C# `SearchBuilder`）
+pub const search = @import("search.zig");
 /// 整表实体缓存（Blocking 一致性 + 写后自动失效）
 pub const cache = @import("cache.zig");
 /// 代码生成：Model.xml → Zig 实体
@@ -186,6 +190,8 @@ test {
     _ = @import("pagesplit.zig");
     _ = @import("pinyin.zig");
     _ = @import("csv.zig");
+_ = @import("simulation.zig");
+_ = @import("search.zig");
     _ = @import("entity_ext.zig");
     _ = @import("extends.zig");
     _ = @import("fieldcache.zig");

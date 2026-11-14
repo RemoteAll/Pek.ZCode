@@ -289,8 +289,11 @@ Rust Pek.RCode 模型：实体 27 个，通过 27 个
 | `stat` 的 `avg` 直接报 `error.Unsupported` | C# 的均值由业务层「先读再算」；本库不提供假的原子实现，要求调用方自己维护 `Sum` + `Count` |
 | `StatModel.init` 不截断、`StatModel.at` 截断 | 与 C# 一致（C# 是 `Fill`/`Split` 才截断）；分开两个构造器让“要不要截断”显式化，避免静默改变时间值 |
 | 窗口函数别名按方言引用 | C# 原样拼别名；SQLite 会把未引用别名当标识符且大小写折叠，故 Zig 侧引起来（函数名与 OVER 子句仍逐字一致） |
-| `MSPageSplit`（SQL Server 2000/2005 的 TOP + NOT IN / 双 TOP / ROW_NUMBER 分页）未移植 | 本库的 SQL Server 分页走 `OFFSET..FETCH`（SQL Server 2012+）；老版本分页属遗留算法，且需要整套 `SelectBuilder` 克隆/子查询设施，收益低于成本 |
-| `Membership`（用户/角色/部门/菜单/租户/日志/参数/地区 + DataScope）、`Linq/EntityQueryProvider`、`XCodeTool` 的模板引擎未移植 | 前者是独立子系统（对应 Rust 生态里的 `Pek.RPermissions`，本库定位是 ORM 核心）；LINQ 表达式树在 Zig 无对应语法，条件用 `Where` 结构化拼装；模板引擎由 `codegen.zig`（Model.xml → Zig 实体）承担 |
+| ~~`MSPageSplit` 未移植~~ **已更正（2026-11-14 审计）** | 此行原先写「未移植」，实际 `src/pagesplit.zig` 早已实现全部四条算法（`pageSplitAlloc` / `topNotInAlloc` / `doubleTopAlloc` / `maxMinAlloc` / `rowNumberAlloc` + `Builder` 子集，且有单测）。**旧记录是错的**，已删除该结论；核对过程见 `docs/迁移缺口审计.md` 第四节 |
+| `Linq/`（`EntityQueryable`/`EntityQueryProvider`）不迁移 | Zig 没有表达式树与运算符重载，等价表达是 `query.zig`（`Where`/`Query` 结构化条件）+ `sqlbuild.zig`（选列/排序/分页/聚合）；**是形态差异不是能力缺失** |
+| `Common/DataSimulation`、`Code/SearchBuilder` 不迁移 ~~已推翻~~ **已迁移（2026-11-14）** | `simulation.zig`（按列类型造数，尊重列长度、种子可复现）+ `search.zig`（索引列/枚举整数/布尔开关/时间列 → 参数计划） |
+| ~~`Membership` 未移植~~ **已更正（2026-11-14 审计）** | `membership.zig` + `src/membership/*`（enums/password/datascope/log/rules/area/provider/entities）已实现；`XCodeTool` 的模板引擎能力由 `tools/zcodegen.zig`（`zig build codegen`）承担 |
+| `Code/HtmlBuilder.BuildDataDictionary`（数据字典 HTML）**仍缺** | 下一轮补 `datadict.zig`：模型 → HTML 表格（表/列/类型/长度/可空/注释/索引），用模型快照做黄金断言 |
 | 20+ 种小众方言（Access/ClickHouse/TDengine/DuckDB/Hana/Firebird/DB2/达梦/IRIS/MongoDB/NovaDb…）未实现 | ~~枚举与连接串可识别，但类型映射/DDL 明确 `error.Unsupported`~~ **已推翻（2026-11-12）**：19 家 SQL 方言全量实现并由 `zig build audit-dialects` 守住；只有 MongoDB（文档库）/ InfluxDB（Line Protocol）保持 `error.Unsupported` |
 
 ## 4. 下沉到 `zzig` 的公共件（2026-11-11）
