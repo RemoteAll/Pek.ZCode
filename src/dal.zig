@@ -17,6 +17,7 @@ const postgres = @import("zzig").postgres;
 const tds = @import("zzig").tds;
 const tdengine = @import("zzig").tdengine;
 const influxdb = @import("zzig").influxdb;
+const clickhouse = @import("zzig").clickhouse;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const dbtable = @import("dbtable.zig");
@@ -449,6 +450,20 @@ pub const Dal = struct {
                     .strategy = readwrite.Strategy.init(gpa),
                 };
             },
+            .clickhouse => {
+                if (opts_owned.server.len == 0 and opts_owned.data_source.len > 0) {
+                    opts_owned.server = try gpa.dupe(u8, opts_owned.data_source);
+                }
+                if (opts_owned.server.len == 0) return error.NoConnection;
+                // 端口缺省以方言为准（ClickHouse HTTP 8123）
+                if (opts_owned.port == 3306) opts_owned.port = clickhouse.default_port;
+                return Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+            },
             else => return error.Unsupported,
         }
     }
@@ -776,6 +791,20 @@ pub const Dal = struct {
                 });
                 return Session.initWithDriver(self.gpa, .influxdb, .{ .influxdb = conn });
             },
+            .clickhouse => {
+                const use_url = std.ascii.startsWithIgnoreCase(opts.server, "http");
+                const conn = try clickhouse.Conn.open(self.gpa, .{
+                    .base_url = if (use_url) opts.server else "",
+                    .host = if (use_url) "127.0.0.1" else opts.server,
+                    .port = opts.port,
+                    .tls = std.ascii.startsWithIgnoreCase(opts.server, "https"),
+                    .user = if (opts.user.len > 0) opts.user else "default",
+                    .password = opts.password,
+                    .database = opts.database,
+                    .timeout_ms = opts.timeout_ms,
+                });
+                return Session.initWithDriver(self.gpa, .clickhouse, .{ .clickhouse = conn });
+            },
             else => return error.Unsupported,
         }
     }
@@ -799,7 +828,7 @@ pub const Dal = struct {
     pub fn supportsPooling(self: *const Dal) bool {
         return switch (self.opts.provider) {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
-            .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .nova, .kingbase, .highgo, .vastbase => true,
+            .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .clickhouse, .nova, .kingbase, .highgo, .vastbase => true,
             else => false,
         };
     }
@@ -1135,8 +1164,9 @@ pub const Dal = struct {
             .mysql => "SELECT VERSION()",
             .nova => "SELECT VERSION()",
             .postgresql, .kingbase, .highgo, .vastbase => "SHOW server_version",
-            // TDengine 有服务器版本函数；InfluxDB 没有 SQL，走 `GET /ping` 的响应头（本类不探）
+            // TDengine 有服务器版本函数；ClickHouse 有 `version()`；InfluxDB 没有 SQL（本类不探）
             .tdengine => "SELECT SERVER_VERSION()",
+            .clickhouse => "SELECT version()",
             else => {
                 // SQL Server 的 `@@VERSION` 形如 `Microsoft SQL Server 2022 (RTM) - 16.0.1000.6`，
                 // 首个数字是发布年份，解析必错；它也不用这两个能力，直接保守档。

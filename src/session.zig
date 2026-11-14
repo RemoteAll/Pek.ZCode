@@ -17,6 +17,7 @@ const postgres = @import("zzig").postgres;
 const tds = @import("zzig").tds;
 const tdengine = @import("zzig").tdengine;
 const influxdb = @import("zzig").influxdb;
+const clickhouse = @import("zzig").clickhouse;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const setting = @import("setting.zig");
@@ -201,6 +202,8 @@ pub const Driver = union(enum) {
     tdengine: tdengine.Conn,
     /// InfluxDB：`execute` = 写 Line Protocol，`queryRows` = Flux / InfluxQL
     influxdb: influxdb.Conn,
+    /// ClickHouse：HTTP 8123，SQL 文本直发，`default_format=JSONCompact`
+    clickhouse: clickhouse.Conn,
 };
 
 pub const Session = struct {
@@ -257,6 +260,7 @@ pub const Session = struct {
             .sqlserver => |*conn| conn.deinit(),
             .tdengine => |*conn| conn.deinit(),
             .influxdb => |*conn| conn.deinit(),
+            .clickhouse => |*conn| conn.deinit(),
         }
     }
 
@@ -468,6 +472,13 @@ pub const Session = struct {
                 };
                 return 0;
             },
+            .clickhouse => |*conn| {
+                const n = conn.exec(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -572,6 +583,16 @@ pub const Session = struct {
                     .ok => &.{},
                 };
             },
+            .clickhouse => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows.rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -594,6 +615,7 @@ pub const Session = struct {
             // 时序库无自增语义（主键就是时间戳）
             .tdengine => 0,
             .influxdb => 0,
+            .clickhouse => 0,
         };
     }
 
@@ -605,11 +627,12 @@ pub const Session = struct {
             .sqlserver => |*conn| conn.lastError(),
             .tdengine => |*conn| conn.lastError(),
             .influxdb => |*conn| conn.lastError(),
+            .clickhouse => |*conn| conn.lastError(),
         };
     }
 
     /// 预编译语句，供批量写/游标读取复用（调用方负责 finalize）。
-    /// MySQL / PG / SQL Server / TDengine / InfluxDB 不支持这条旁路（各自走驱动自己的批量 API）。
+    /// MySQL / PG / SQL Server / TDengine / InfluxDB / ClickHouse 不支持这条旁路（各走驱动自己的批量 API）。
     pub fn prepare(self: *Session, sql: []const u8) !sqlite.Stmt {
         return switch (self.driver) {
             .sqlite => |*db| db.prepare(self.gpa, sql),
@@ -618,6 +641,7 @@ pub const Session = struct {
             .sqlserver => error.Unsupported,
             .tdengine => error.Unsupported,
             .influxdb => error.Unsupported,
+            .clickhouse => error.Unsupported,
         };
     }
 
@@ -633,7 +657,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb => error.Unsupported,
+            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse => error.Unsupported,
         };
     }
 

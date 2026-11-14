@@ -32,11 +32,13 @@
 - **口径（用户 2026-11-13 明确）：迁移优先，不要以「本机无实例」为由拒绝实现**——
   缺的方法要实现；公共能力下沉 `zzig`；**无实例的驱动用回环假服务端（`zzig/src/db/http_loopback_test.zig` 范式）守住协议**，
   真库验证留到有条件时。
-- **执行层矩阵（2026-11-13）**：已接 6 家协议（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
-  **InfluxDB HTTP**）+ 2 组协议复用（**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
+- **执行层矩阵（2026-11-14）**：已接 **7 家协议**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
+  **InfluxDB HTTP** / **ClickHouse HTTP 8123**）+ 2 组协议复用（**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
   - InfluxDB **不是 SQL 库**：`insert`/`upsert` 走 **Line Protocol**（`dbtable.influxLineAlloc`：时间列→行尾纳秒、
     主键→tag、其余→field），查询走 Flux（v2）或 InfluxQL（v1）；不要试图给它生成 `INSERT INTO`。
-  - TDengine REST **没有预处理语句**：`?` 必须客户端内联（`tdengine.inlineParamsAlloc`，跳过字符串/注释里的 `?`）。
+  - TDengine REST 与 ClickHouse HTTP **都没有预处理语句**：`?` 必须客户端内联（`zzig.db.inline`，两家共用）。
+  - ClickHouse 用 `default_format=JSONCompact`（URL 级默认值，对 `INSERT`/`DDL` 无影响）；
+    **不要按「是不是 SELECT」去拼 `FORMAT`**（拼错就是 DDL 语法错）；64 位整数默认以**字符串**回，按 `meta[].type` 解析回去。
 - **两级缓存已逐条对齐 C#（`docs/决策记录.md` 第（三十五）节）**：
   - `cache.Cache(T)`（`Meta.Cache`，整表）：**硬内存上限 = `MaxCacheCount` 行**，装载带 `LIMIT max_rows+1`，
     超限**一行不留** + 60s 静默期；`MaxCacheCount <= 0` 永不缓存。读路径无锁（不可变快照 + 原子发布）。
