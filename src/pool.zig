@@ -19,12 +19,22 @@
 //!
 //! ## 线程模型
 //!
-//! 本库是同步单连接模型，`SessionPool` **不是线程安全的**；多线程共享需外层加锁。
+//! `SessionPool` **内部已加锁**（`zzig.compat.Mutex`），可以多线程共享同一个池。
+//!
+//! 两点实现细节：
+//! - **`open` 不在锁内**：建连接要 TCP 握手/鉴权（毫秒级），持锁开连接会把并发变成串行。
+//!   做法是「锁内预留名额（`opening`）→ 放锁开连接 → 锁内记账」；预留名额计入 `max_size`，
+//!   所以并发首访也不会超过上限；
+//! - `Session` 本身仍是「单线程使用」的对象：池负责借还的安全，**借出去的会话不要多线程共用**。
+//! - **归还时清空语句缓存**：`Session` 的 SQLite 语句缓存里存着指向自身内部的 `*Db`，
+//!   按值搬进空闲列表就是悬空指针（并发用例实测过段错误）。代价是每次借出重新 prepare，
+//!   SQLite 侧是本地解析（微秒级）；换来地址永远对自己那个 `Session` 有效。
 
 const std = @import("std");
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const clock = @import("clock.zig");
+const compat = @import("zzig").compat;
 
 pub const Options = struct {
     /// 池 + 借出总数上限
@@ -85,8 +95,12 @@ pub const SessionPool = struct {
     gpa: std.mem.Allocator,
     factory: Factory,
     opts: Options,
+    /// 保护下面所有状态（多个线程共享同一个池时必需）
+    mutex: compat.Mutex = .{},
     idle: std.ArrayListUnmanaged(Idle) = .empty,
     in_use: usize = 0,
+    /// 正在 `open` 中（已预留名额，尚未计入 `created`）：防止并发首访突破上限
+    opening: usize = 0,
     created: usize = 0,
     reused: usize = 0,
     discarded: usize = 0,
@@ -102,9 +116,14 @@ pub const SessionPool = struct {
     }
 
     /// 预热：事先建好 `n` 个空闲连接（不超过上限）。
+    ///
+    /// 启动期调用，持锁完成（`open` 在锁内，但调用方本来就是串行的）。
     pub fn prewarm(self: *SessionPool, n: usize) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var made: usize = 0;
-        while (made < n and self.totalCount() < self.opts.max_size) : (made += 1) {
+        while (made < n and self.totalCountLocked() < self.opts.max_size) : (made += 1) {
             const s = self.factory.open(self.factory.ctx) catch break;
             self.idle.append(self.gpa, .{ .session = s, .last_used_ms = clock.nowMs() }) catch {
                 var owned = s;
@@ -117,32 +136,59 @@ pub const SessionPool = struct {
     }
 
     /// 借一个会话：优先复用空闲；否则在上限内新建；超限报 `error.PoolExhausted`。
+    ///
+    /// 线程安全（可多线程共享同一个池）。`open` 不在锁内：先锁内预留名额，再放锁开连接，
+    /// 最后锁内记账；预留名额计入上限，所以并发首访也不会超过 `max_size`。
     pub fn acquire(self: *SessionPool) !Session {
-        _ = self.purgeExpired();
+        self.mutex.lock();
+
+        _ = self.purgeExpiredLocked();
 
         while (self.idle.items.len > 0) {
             const entry = self.idle.pop().?;
             if (isUsable(&entry.session)) {
                 self.reused += 1;
                 self.noteAcquired();
+                self.mutex.unlock();
                 return entry.session;
             }
+            // 关闭死连接可能慢（网络），放到锁外做
             var dead = entry.session;
+            self.mutex.unlock();
             dead.deinit();
+            self.mutex.lock();
             self.discarded += 1;
         }
 
-        if (self.totalCount() >= self.opts.max_size) return error.PoolExhausted;
+        if (self.totalCountLocked() + self.opening >= self.opts.max_size) {
+            self.mutex.unlock();
+            return error.PoolExhausted;
+        }
+        self.opening += 1;
+        self.mutex.unlock();
 
-        const s = try self.factory.open(self.factory.ctx);
+        const s = self.factory.open(self.factory.ctx) catch |e| {
+            self.mutex.lock();
+            self.opening -= 1;
+            self.mutex.unlock();
+            return e;
+        };
+
+        self.mutex.lock();
+        self.opening -= 1;
         self.created += 1;
         self.noteAcquired();
+        self.mutex.unlock();
         return s;
     }
 
     /// 归还会话。事务中 / 已断开的会话**关闭丢弃**，其余放回空闲。
     pub fn release(self: *SessionPool, s: Session) void {
         var owned = s;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (owned.tx_depth > 0) {
             std.debug.print("[zcode] 连接池：归还的会话仍处于事务中（depth={d}），已丢弃以免污染后续调用\n", .{owned.tx_depth});
             owned.deinit();
@@ -157,6 +203,10 @@ pub const SessionPool = struct {
             return;
         }
 
+        // 关键：本会话马上要被**按值复制**进 `idle` 列表；SQLite 的缓存语句里存着
+        // 指向 `Session` 内部的 `*Db`，搬动后就是悬空指针（会 `reset()` 到旧地址上）。
+        // 所以先把语句缓存清干净再搬（详见 `Session.clearStmtCache` 的注释）。
+        owned.clearStmtCache();
         owned.resetResults();
         self.idle.append(self.gpa, .{ .session = owned, .last_used_ms = clock.nowMs() }) catch {
             owned.deinit();
@@ -169,6 +219,8 @@ pub const SessionPool = struct {
 
     /// 清空空闲连接（借出的不受影响）。
     pub fn clear(self: *SessionPool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.idle.items) |*entry| {
             entry.session.deinit();
             self.discarded += 1;
@@ -176,15 +228,26 @@ pub const SessionPool = struct {
         self.idle.clearRetainingCapacity();
     }
 
-    pub fn idleCount(self: *const SessionPool) usize {
+    pub fn idleCount(self: *SessionPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.idle.items.len;
     }
 
-    pub fn totalCount(self: *const SessionPool) usize {
-        return self.idle.items.len + self.in_use;
+    pub fn totalCount(self: *SessionPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.totalCountLocked();
     }
 
-    pub fn stats(self: *const SessionPool) Stats {
+    /// 池 + 借出 + 正在开连接的总数（不包含空闲总数以外的东西）。
+    fn totalCountLocked(self: *const SessionPool) usize {
+        return self.idle.items.len + self.in_use + self.opening;
+    }
+
+    pub fn stats(self: *SessionPool) Stats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return .{
             .idle = self.idle.items.len,
             .in_use = self.in_use,
@@ -198,6 +261,12 @@ pub const SessionPool = struct {
 
     /// 丢弃超时未使用的空闲连接（调用方不需要关心，`acquire` 会自动做）。
     pub fn purgeExpired(self: *SessionPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.purgeExpiredLocked();
+    }
+
+    fn purgeExpiredLocked(self: *SessionPool) usize {
         if (self.opts.idle_timeout_ms == 0 or self.idle.items.len == 0) return 0;
         const now = clock.nowMs();
         const limit: i64 = @intCast(self.opts.idle_timeout_ms);

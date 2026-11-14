@@ -332,6 +332,23 @@ pub const Session = struct {
         _ = self.arena.reset(.retain_capacity);
     }
 
+    /// 清空并释放语句缓存（**会话即将按值搬走时必须先调用**）。
+    ///
+    /// 为什么必须：SQLite 的 `Stmt` 里存的是 `*Db`，而 `Db` 就长在 `Session.driver.sqlite`
+    /// **内部**。`Session` 一旦按值被复制/搬进容器，缓存里那些 `Stmt` 的 `*Db` 就指向旧地址，
+    /// 下一次 `reset()` 会写坏内存（2026-11-15 连接池并发用例实测：`sqlite.zig:329`
+    /// `lib.reset(self.handle)` 段错误）。
+    ///
+    /// 所以约定：**`Session` 有缓存语句后不可按值搬走**；池化/装箱/放进列表之前先调本函数。
+    /// 代价是复用时少一次 prepared 复用（SQLite 侧 `prepare` 是本地解析，微秒级），换来地址安全。
+    pub fn clearStmtCache(self: *Session) void {
+        for (self.stmt_cache.items) |*e| {
+            e.stmt.finalize();
+            self.gpa.free(e.sql);
+        }
+        self.stmt_cache.clearRetainingCapacity();
+    }
+
     /// 结果集 arena 当前占用字节数（诊断用）。
     ///
     /// 用途：观察长生命周期会话的内存。**大表遍历必须能看到它不随页数增长**——
