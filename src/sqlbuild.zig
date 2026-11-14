@@ -582,11 +582,58 @@ pub fn countUpTo(gpa: std.mem.Allocator, kind: DatabaseKind, table_name: []const
 /// - `query.select` 中的列名会校验并引用；不是列名的内容按原始表达式使用（如 `COUNT(*)`）
 /// - 分页：`page_index >= 1 && page_size > 0` 时启用
 /// - 分页/取前 N/跳行场景未显式排序时，按主键兜底，保证结果稳定
+/// JOIN 类型（对应 C# `SelectBuilder` 的 Join 语义）。
+pub const JoinKind = enum { inner, left, right, full, cross };
+
+/// 一个 JOIN：表名 + 别名 + ON 条件。
+///
+/// `ON` 用**原始 SQL 片段**：多表关联条件里常有 `a.x = b.y AND b.z > ?`，
+/// 交给调用方写比在这里再发明一套表达式 DSL 更直接（与 C# `SelectBuilder` 的 join 用法一致）。
+/// 注意：`ON` 里的 `?` 会由调用方自己带参数（本函数的 `params` 只收 WHERE 的参数）。
+pub const Join = struct {
+    kind: JoinKind = .inner,
+    /// 表名（原样输出，调用方需要时自己引用；分库场景直接给物理分表名）
+    table: []const u8,
+    /// 别名（空 = 不写）
+    alias: []const u8 = "",
+    /// ON 条件（`CROSS JOIN` 不需要）
+    on: []const u8 = "",
+};
+
+/// 组装 SELECT（无 JOIN，等价于 `selectJoined(..., &.{}, ...)`）。
 pub fn select(
     gpa: std.mem.Allocator,
     kind: DatabaseKind,
     table: *const TableMeta,
     table_name: []const u8,
+    q: *const Query,
+) !Sql {
+    return selectImpl(gpa, kind, table, table_name, &.{}, q);
+}
+
+/// 组装带 JOIN 的 SELECT（含排序、分页、取前 N 条）。
+///
+/// 与 `select` 的差别只在 FROM 之后：按 `joins` 顺序拼 `JOIN ... ON ...`。
+/// - 选列：本表列名会引用；带 `.` 的表达式（如 `u.Name`）原样保留，建议自己写 `AS` 别名；
+/// - 排序：不是本表列名的内容（如 `u.Name`）原样保留；
+/// - 分页/取前 N 无显式排序时，仍按**主表**主键兜底。
+pub fn selectJoined(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    joins: []const Join,
+    q: *const Query,
+) !Sql {
+    return selectImpl(gpa, kind, table, table_name, joins, q);
+}
+
+fn selectImpl(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    joins: []const Join,
     q: *const Query,
 ) !Sql {
     var b = Buf.init(gpa);
@@ -619,6 +666,26 @@ pub fn select(
             .no_wait => try b.add(" WITH (UPDLOCK, NOWAIT)"),
             .skip_locked => try b.add(" WITH (UPDLOCK, READPAST)"),
             .none => {},
+        }
+    }
+
+    // JOIN：顺序拼在 FROM 之后（ON 是原样片段，不做引用改写）
+    for (joins) |j| {
+        try b.add(switch (j.kind) {
+            .inner => " INNER JOIN ",
+            .left => " LEFT JOIN ",
+            .right => " RIGHT JOIN ",
+            .full => " FULL JOIN ",
+            .cross => " CROSS JOIN ",
+        });
+        try b.add(j.table);
+        if (j.alias.len > 0) {
+            try b.add(" ");
+            try b.add(j.alias);
+        }
+        if (j.kind != .cross and j.on.len > 0) {
+            try b.add(" ON ");
+            try b.add(j.on);
         }
     }
 
@@ -866,4 +933,75 @@ test "SELECT WHERE + 排序（无分页）" {
         "SELECT * FROM \"DH_Order\" WHERE (\"Status\" = ?) ORDER BY \"Code\"",
         sql.text,
     );
+}
+
+// ── JOIN（对应 C# `SelectBuilder` 的 join 能力）─────────────────────────────
+
+test "SELECT JOIN：INNER/LEFT + 别名 + ON + WHERE + 排序" {
+    const a = std.testing.allocator;
+    const t = testTable();
+
+    var w = Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Status", .{ .int = 1 });
+
+    var q = Query.init(a);
+    defer q.deinit();
+    _ = q.filterWhere(&w);
+    _ = try q.column("u.Name AS UserName");
+    _ = try q.orderBy("u.Name", false);
+
+    const joins = [_]Join{
+        .{ .kind = .inner, .table = "DH_User", .alias = "u", .on = "u.Id = DH_Order.UserId" },
+        .{ .kind = .left, .table = "DH_Shop", .alias = "s", .on = "s.Id = DH_Order.ShopId" },
+    };
+
+    const sql = try selectJoined(a, .sqlite, &t, "DH_Order", &joins, &q);
+    defer sql.deinit(a);
+    try std.testing.expectEqualStrings(
+        "SELECT u.Name AS UserName FROM \"DH_Order\"" ++
+            " INNER JOIN DH_User u ON u.Id = DH_Order.UserId" ++
+            " LEFT JOIN DH_Shop s ON s.Id = DH_Order.ShopId" ++
+            " WHERE (\"Status\" = ?) ORDER BY u.Name",
+        sql.text,
+    );
+    // WHERE 的参数照常收集（JOIN 的 ON 片段由调用方自己带参）
+    try std.testing.expectEqual(@as(usize, 1), sql.params.len);
+}
+
+test "SELECT JOIN：CROSS 不写 ON；无排序分页时仍按主表主键兜底" {
+    const a = std.testing.allocator;
+    const t = testTable();
+
+    var q = Query.init(a);
+    defer q.deinit();
+    _ = q.page(3, 20);
+
+    const joins = [_]Join{.{ .kind = .cross, .table = "DH_Type", .on = "s.ignored = 1" }};
+
+    const sql = try selectJoined(a, .sqlite, &t, "DH_Order", &joins, &q);
+    defer sql.deinit(a);
+    // CROSS JOIN 不输出 ON；ORDER BY 用主表主键（"Id"）；分页参数正确
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM \"DH_Order\" CROSS JOIN DH_Type ORDER BY \"Id\" LIMIT 20 OFFSET 40",
+        sql.text,
+    );
+}
+
+test "SELECT JOIN：SQL Server 行锁提示仍在主表后，JOIN 顺延" {
+    const a = std.testing.allocator;
+    const t = testTable();
+
+    var q = Query.init(a);
+    defer q.deinit();
+    _ = q.take(5);
+    q.lock = .skip_locked;
+
+    const joins = [_]Join{.{ .kind = .inner, .table = "DH_User", .alias = "u", .on = "u.Id = DH_Order.UserId" }};
+
+    const sql = try selectJoined(a, .sqlserver, &t, "DH_Order", &joins, &q);
+    defer sql.deinit(a);
+    // 表提示紧跟主表（`[DH_Order] WITH (...)`），JOIN 在其后
+    try std.testing.expect(std.mem.indexOf(u8, sql.text, "[DH_Order] WITH (UPDLOCK, READPAST) INNER JOIN DH_User u ON u.Id = DH_Order.UserId") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql.text, "TOP 5") != null or std.mem.indexOf(u8, sql.text, "FETCH NEXT 5 ROWS ONLY") != null);
 }
