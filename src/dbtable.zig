@@ -213,7 +213,10 @@ pub const TableRef = struct {
             self.notifyWrite();
             return 0;
         }
-        const sql = try sqlbuild.insert(self.gpa, self.kind, self.table, self.table_name, fields);
+        // 允许显式写入自增列：导入 / 迁移 / 跳库同步必须保留原主键。
+        // SQL Server 会包 `SET IDENTITY_INSERT`，PG 系会加 `OVERRIDING SYSTEM VALUE`；
+        // 调用方没给自增列时这些处理自然不会发生（见 `sqlbuild.insertWith`）。
+        const sql = try sqlbuild.insertWith(self.gpa, self.kind, self.table, self.table_name, fields, .{ .allow_identity = true });
         defer sql.deinit(self.gpa);
 
         if (self.table.identity()) |idcol| {
@@ -397,7 +400,7 @@ pub const TableRef = struct {
         var start: usize = 0;
         while (start < effective_rows.len) {
             const end = @min(start + per_batch, effective_rows.len);
-            const sql = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end]);
+            const sql = try sqlbuild.insertMultiWith(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end], .{ .allow_identity = true });
             defer sql.deinit(self.gpa);
             affected += try s.execute(sql.text, sql.params);
             start = end;
@@ -492,7 +495,7 @@ pub const TableRef = struct {
         var start: usize = 0;
         while (start < effective_rows.len) {
             const end = @min(start + per_batch, effective_rows.len);
-            const base = try sqlbuild.insertMulti(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end]);
+            const base = try sqlbuild.insertMultiWith(self.gpa, self.kind, self.table, self.table_name, effective_rows[start..end], .{ .allow_identity = true });
             defer base.deinit(self.gpa);
 
             const text = try self.upsertSqlAlloc(base.text, effective_rows[0], conflict, mode);

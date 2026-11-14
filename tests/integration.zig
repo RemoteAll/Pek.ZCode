@@ -861,11 +861,55 @@ test "MySQL 真库：反向工程 → Model.xml（需 -Dmysql-conn）" {
     }
 }
 
+test "显式写入自增列（导入/迁移）：Id 按给定值落库，不重排" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "identity");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+
+    // 迁移场景：原库里 id=100 的那行要原样搬过来（不重新分配自增值）
+    const now2 = zcode.DateTime.nowLocal();
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Id", .value = .{ .int = 100 } },
+        .{ .name = "Code", .value = .{ .text = "migrated" } },
+        .{ .name = "Title", .value = .{ .text = "迁移行" } },
+        .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("1.0000") } },
+        .{ .name = "Ok", .value = .{ .boolean = true } },
+        .{ .name = "CreateTime", .value = .{ .datetime = now2 } },
+    });
+
+    const rows = try s.queryRows("SELECT Id, Code FROM DH_JiLiYu WHERE Code = 'migrated'", &.{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 100), rows[0].get("Id").?.asI64().?);
+
+    // 之后的自增插入不应撞上 100
+    const next_id = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Code", .value = .{ .text = "after" } },
+        .{ .name = "Title", .value = .{ .text = "后续行" } },
+        .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("2.0000") } },
+        .{ .name = "Ok", .value = .{ .boolean = true } },
+        .{ .name = "CreateTime", .value = .{ .datetime = now2 } },
+    });
+    try std.testing.expect(next_id > 100);
+}
+
 // 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
 test {
     _ = @import("integration_features.zig");
 }
-
 // PostgreSQL 接线用例（协议层由 zzig 回环假服务端覆盖）
 test {
     _ = @import("integration_pg.zig");

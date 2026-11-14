@@ -51,6 +51,31 @@ pub fn insert(
     table_name: []const u8,
     fields: []const Field,
 ) !Sql {
+    return insertWith(gpa, kind, table, table_name, fields, .{});
+}
+
+/// INSERT 的可选项。
+pub const InsertOptions = struct {
+    /// 允许显式写入**自增列**（数据迁移 / 导入 / 跳库同步必需）。
+    ///
+    /// 各方言的处理不同（C# 侧对应 `EntityOperate.AllowInsertIdentity`）：
+    /// - SQL Server / SqlCe：整条语句外面包 `SET IDENTITY_INSERT <表> ON; … OFF`
+    ///   （不包就是「不能为表 'x' 中的标识列插入显式值」）；
+    /// - PostgreSQL 系 / DB2 / DuckDB：DDL 用的是 `GENERATED ALWAYS AS IDENTITY`，
+    ///   必须在 `VALUES` 前加 `OVERRIDING SYSTEM VALUE`；
+    /// - SQLite / MySQL / Oracle（本仓用序列表达式）：直接给值即可，不做包装。
+    allow_identity: bool = false,
+};
+
+/// 组装 INSERT（带选项）。未显式提供自增列时，`allow_identity` 不起作用。
+pub fn insertWith(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    fields: []const Field,
+    opts: InsertOptions,
+) !Sql {
     if (fields.len == 0) return error.Model;
 
     var b = Buf.init(gpa);
@@ -58,6 +83,21 @@ pub fn insert(
 
     var params: std.ArrayList(Value) = .empty;
     errdefer params.deinit(gpa);
+
+    // 调用方是否显式给了自增列（决定要不要按方言做特殊处理）
+    var identity_given = false;
+    if (table.identity()) |identity| {
+        for (fields) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, identity.name)) identity_given = true;
+        }
+    }
+    const explicit_identity = opts.allow_identity and identity_given;
+
+    if (explicit_identity and (kind == .sqlserver or kind == .sqlce)) {
+        try b.add("SET IDENTITY_INSERT ");
+        try kind.pushQuoted(&b, table_name);
+        try b.add(" ON;");
+    }
 
     try b.add("INSERT INTO ");
     try kind.pushQuoted(&b, table_name);
@@ -72,11 +112,7 @@ pub fn insert(
     var sequence_identity: ?*const ColumnMeta = null;
     if (kind == .oracle) {
         if (table.identity()) |identity| {
-            var provided = false;
-            for (fields) |f| {
-                if (std.ascii.eqlIgnoreCase(f.name, identity.name)) provided = true;
-            }
-            if (!provided) {
+            if (!identity_given) {
                 try b.add(", ");
                 try kind.pushQuoted(&b, table.effectiveColumnName(identity));
                 sequence_identity = identity;
@@ -84,7 +120,14 @@ pub fn insert(
         }
     }
 
-    try b.add(") VALUES (");
+    try b.add(")");
+
+    // `GENERATED ALWAYS AS IDENTITY` 的方言：显式给值时必须声明覆盖
+    if (explicit_identity and (kind.isPostgresFamily() or kind == .db2 or kind == .duckdb)) {
+        try b.add(" OVERRIDING SYSTEM VALUE");
+    }
+
+    try b.add(" VALUES (");
     for (fields, 0..) |field, index| {
         if (index > 0) try b.add(", ");
         try kind.pushPlaceholder(&b, index);
@@ -94,6 +137,12 @@ pub fn insert(
         try b.fmt(", \"SEQ_{s}\".NEXTVAL", .{table_name});
     }
     try b.add(")");
+
+    if (explicit_identity and (kind == .sqlserver or kind == .sqlce)) {
+        try b.add(";SET IDENTITY_INSERT ");
+        try kind.pushQuoted(&b, table_name);
+        try b.add(" OFF");
+    }
 
     const text = try b.toOwnedSlice();
     return .{ .text = text, .params = try params.toOwnedSlice(gpa) };
@@ -319,6 +368,21 @@ pub fn insertMulti(
     table_name: []const u8,
     rows: []const []const Field,
 ) !Sql {
+    return insertMultiWith(gpa, kind, table, table_name, rows, .{});
+}
+
+/// 多行 INSERT（带选项；`allow_identity` 语义同 `insertWith`）。
+///
+/// 批量导入/迁移同样要保留原主键，所以这里也必须处理
+/// SQL Server 的 `SET IDENTITY_INSERT` 与 PG 系的 `OVERRIDING SYSTEM VALUE`。
+pub fn insertMultiWith(
+    gpa: std.mem.Allocator,
+    kind: DatabaseKind,
+    table: *const TableMeta,
+    table_name: []const u8,
+    rows: []const []const Field,
+    opts: InsertOptions,
+) !Sql {
     if (rows.len == 0) return error.Model;
     const cols = rows[0].len;
     if (cols == 0) return error.Model;
@@ -335,6 +399,21 @@ pub fn insertMulti(
     var params: std.ArrayList(Value) = .empty;
     errdefer params.deinit(gpa);
 
+    // 列集合里是否含自增列（行间列集合已校验一致，看第一行即可）
+    var identity_given = false;
+    if (table.identity()) |identity| {
+        for (rows[0]) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, identity.name)) identity_given = true;
+        }
+    }
+    const explicit_identity = opts.allow_identity and identity_given;
+
+    if (explicit_identity and (kind == .sqlserver or kind == .sqlce)) {
+        try b.add("SET IDENTITY_INSERT ");
+        try kind.pushQuoted(&b, table_name);
+        try b.add(" ON;");
+    }
+
     try b.add("INSERT INTO ");
     try kind.pushQuoted(&b, table_name);
     try b.add(" (");
@@ -342,7 +421,13 @@ pub fn insertMulti(
         if (index > 0) try b.add(", ");
         try kind.pushQuoted(&b, try columnName(table, field.name));
     }
-    try b.add(") VALUES ");
+    try b.add(")");
+
+    if (explicit_identity and (kind.isPostgresFamily() or kind == .db2 or kind == .duckdb)) {
+        try b.add(" OVERRIDING SYSTEM VALUE");
+    }
+
+    try b.add(" VALUES ");
 
     for (rows, 0..) |row, row_index| {
         if (row_index > 0) try b.add(", ");
@@ -353,6 +438,12 @@ pub fn insertMulti(
             try params.append(gpa, field.value);
         }
         try b.add(")");
+    }
+
+    if (explicit_identity and (kind == .sqlserver or kind == .sqlce)) {
+        try b.add(";SET IDENTITY_INSERT ");
+        try kind.pushQuoted(&b, table_name);
+        try b.add(" OFF");
     }
 
     const text = try b.toOwnedSlice();
@@ -1023,8 +1114,61 @@ test "SELECT WHERE + 排序（无分页）" {
     );
 }
 
-// ── JOIN（对应 C# `SelectBuilder` 的 join 能力）─────────────────────────────
+test "显式插入自增列：SQL Server 包 IDENTITY_INSERT，PG 系加 OVERRIDING SYSTEM VALUE" {
+    const a = std.testing.allocator;
+    const t = testTable(); // Id 为自增主键
 
+    const with_id = [_]Field{
+        .{ .name = "Id", .value = .{ .int = 7 } },
+        .{ .name = "Code", .value = .{ .text = "k1" } },
+    };
+
+    // SQL Server / SqlCe：必须包 SET IDENTITY_INSERT
+    const ss = try insertWith(a, .sqlserver, &t, "DH_Order", &with_id, .{ .allow_identity = true });
+    defer ss.deinit(a);
+    try std.testing.expectEqualStrings(
+        "SET IDENTITY_INSERT [DH_Order] ON;INSERT INTO [DH_Order] ([Id], [Code]) VALUES (@p0, @p1);SET IDENTITY_INSERT [DH_Order] OFF",
+        ss.text,
+    );
+
+    // PG 系：DDL 是 GENERATED ALWAYS，显式给值必须 OVERRIDING SYSTEM VALUE
+    const pg = try insertWith(a, .postgresql, &t, "DH_Order", &with_id, .{ .allow_identity = true });
+    defer pg.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, pg.text, " OVERRIDING SYSTEM VALUE VALUES (") != null);
+
+    // SQLite / MySQL：直接给值，不加任何包装
+    const lite = try insertWith(a, .sqlite, &t, "DH_Order", &with_id, .{ .allow_identity = true });
+    defer lite.deinit(a);
+    try std.testing.expectEqualStrings("INSERT INTO \"DH_Order\" (\"Id\", \"Code\") VALUES (?, ?)", lite.text);
+
+    // 没给自增列时，选项不产生任何包装（避免无谓的多语句）
+    const no_id = [_]Field{.{ .name = "Code", .value = .{ .text = "k1" } }};
+    const ss2 = try insertWith(a, .sqlserver, &t, "DH_Order", &no_id, .{ .allow_identity = true });
+    defer ss2.deinit(a);
+    try std.testing.expectEqualStrings("INSERT INTO [DH_Order] ([Code]) VALUES (@p0)", ss2.text);
+
+    // 默认选项（allow_identity = false）保持旧行为：SQL Server 不包
+    const ss3 = try insert(a, .sqlserver, &t, "DH_Order", &with_id);
+    defer ss3.deinit(a);
+    try std.testing.expectEqualStrings("INSERT INTO [DH_Order] ([Id], [Code]) VALUES (@p0, @p1)", ss3.text);
+
+    // 多行批量插入同样要处理（导入走的是批量路径，不是逐条 insert）
+    const row2 = [_]Field{
+        .{ .name = "Id", .value = .{ .int = 8 } },
+        .{ .name = "Code", .value = .{ .text = "k2" } },
+    };
+    const batch = [_][]const Field{ &with_id, &row2 };
+    const ss_batch = try insertMultiWith(a, .sqlserver, &t, "DH_Order", &batch, .{ .allow_identity = true });
+    defer ss_batch.deinit(a);
+    try std.testing.expect(std.mem.startsWith(u8, ss_batch.text, "SET IDENTITY_INSERT [DH_Order] ON;INSERT INTO [DH_Order] ([Id], [Code]) VALUES "));
+    try std.testing.expect(std.mem.endsWith(u8, ss_batch.text, ");SET IDENTITY_INSERT [DH_Order] OFF"));
+
+    const pg_batch = try insertMultiWith(a, .postgresql, &t, "DH_Order", &batch, .{ .allow_identity = true });
+    defer pg_batch.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, pg_batch.text, " OVERRIDING SYSTEM VALUE VALUES ") != null);
+}
+
+// ── JOIN（对应 C# `SelectBuilder` 的 join 能力）─────────────────────────────
 test "SELECT JOIN：INNER/LEFT + 别名 + ON + WHERE + 排序" {
     const a = std.testing.allocator;
     const t = testTable();
