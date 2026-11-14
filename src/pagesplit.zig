@@ -21,6 +21,55 @@
 const std = @import("std");
 const Buf = @import("zzig").Buf;
 
+/// 深分页倒序优化（≂ C# `Entity.FindAll` 里的「海量数据查询优化」）。
+///
+/// 背景：`LIMIT n OFFSET 900000` 这种深页，数据库要把前面 90 万行都扫一遍再丢掉。
+/// C# 的做法是——**偏移过半时把排序反过来、从尾部取，取回来再在内存里翻一次**，
+/// 这样扫描量从 90 万降到 10 万。
+///
+/// 三条门槛与 C# 一致（`startRowIndex > 500_000`、`count > 1_000_000`、`startRowIndex * 2 > count`），
+/// 但做成可配置字段：亿级表的实际阈值未必一样，也因为集成用例要用小表验证这套逻辑
+/// （常量写死就只能靠人工推理，测不了）。
+pub const DeepPage = struct {
+    /// 偏移超过它才考虑倒序（C# 500_000）
+    min_offset: usize = 500_000,
+    /// 总行数超过它才考虑倒序（C# 1_000_000）
+    min_total: i64 = 1_000_000,
+
+    /// 是否值得倒序取尾部。
+    ///
+    /// `page_size` 只用于「尾部对齐」的边界判断（见 `reversedOffset`），
+    /// 这里保留参数是为了调用方同签名使用、避免两处口径漂移。
+    pub fn shouldReverse(self: DeepPage, offset: usize, page_size: usize, total: i64) bool {
+        _ = page_size;
+        if (offset <= self.min_offset) return false;
+        if (total <= self.min_total) return false;
+        const o: i64 = @intCast(offset);
+        return o * 2 > total;
+    }
+
+    /// 倒序后的偏移：原页覆盖 `[offset, offset + page_size)`，
+    /// 倒序后覆盖 `[total - offset - page_size, total - offset)`。
+    ///
+    /// 该页不在表尾完整范围内（`total - offset - page_size < 0`）、或 `page_size == 0` 时返回 null。
+    pub fn reversedOffset(self: DeepPage, offset: usize, page_size: usize, total: i64) ?usize {
+        _ = self;
+        if (page_size == 0) return null;
+        const t = total;
+        const o: i64 = @intCast(offset);
+        const p: i64 = @intCast(page_size);
+        const start = t - o - p;
+        if (start < 0) return null;
+        return @intCast(start);
+    }
+
+    /// 一次给出结论：`null` = 不值得倒序（按原样查）。
+    pub fn plan(self: DeepPage, offset: usize, page_size: usize, total: i64) ?usize {
+        if (!self.shouldReverse(offset, page_size, total)) return null;
+        return self.reversedOffset(offset, page_size, total);
+    }
+};
+
 /// 分页规格（对应 C# `SelectBuilder` 里用得着的那几个字段）。
 pub const Spec = struct {
     /// 表名或子查询（`(Select ...) X` 由调用方自己拼）
@@ -567,8 +616,35 @@ test "条件含 OR 时追加 And 要加括号" {
     try std.testing.expect(std.mem.startsWith(u8, sql, "Select Top 5 * From User Where (A=1 Or B=2) And Id Not In("));
 }
 
-test "多列排序：topNotIn 明确拒绝，doubleTop 正常反向" {
-    const a = std.testing.allocator;
+test "深分页倒序：三条门槛（偏移 / 总数 / 过半）与尾部偏移换算" {
+    const plan = DeepPage{}; // 默认阈值与 C# 一致：500_000 / 1_000_000
+
+    // 偏移没超过 50 万 → 不倒序（哪怕总数上亿）
+    try std.testing.expect(!plan.shouldReverse(500_000, 20, 100_000_000));
+    // 总数没超过 100 万 → 不倒序
+    try std.testing.expect(!plan.shouldReverse(900_000, 20, 1_000_000));
+    // 过了一半才倒序：90 万 → 是否 > 50 万 ✓
+    try std.testing.expect(plan.shouldReverse(900_000, 20, 1_000_000 + 1));
+    // 刚好一半（offset*2 == total）不倒序 —— C# 用 `startRowIndex * 2 > count`
+    try std.testing.expect(!plan.shouldReverse(1_000_000 - 1, 2, 2_000_000 - 2));
+
+    // 尾部偏移：total=1_000_001, offset=900_000, size=20 → 1_000_001-900_000-20 = 99_981
+    try std.testing.expectEqual(@as(?usize, 99_981), plan.reversedOffset(900_000, 20, 1_000_001));
+    // 页大小 0 / 越界 → null（调用方按原样查）
+    try std.testing.expect(plan.reversedOffset(900_000, 0, 1_000_001) == null);
+    try std.testing.expect(plan.reversedOffset(1_000_000, 20, 1_000_001) == null);
+
+    // plan 一步到位
+    try std.testing.expectEqual(@as(?usize, 99_981), plan.plan(900_000, 20, 1_000_001));
+    try std.testing.expect(plan.plan(10, 20, 1_000_001) == null);
+
+    // 阈值可配（集成用例用小表验证同一套逻辑）
+    const small = DeepPage{ .min_offset = 2, .min_total = 4 };
+    try std.testing.expect(small.shouldReverse(7, 2, 10));
+    try std.testing.expectEqual(@as(?usize, 1), small.plan(7, 2, 10));
+}
+
+test "多列排序：topNotIn 明确拒绝，doubleTop 正常反向" {    const a = std.testing.allocator;
     var spec = sample;
     spec.order_by = "Id Desc, Name";
 

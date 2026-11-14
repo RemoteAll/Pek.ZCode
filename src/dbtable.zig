@@ -932,8 +932,64 @@ pub const TableRef = struct {
         return rows[0];
     }
 
-    /// 取一列的最大值（对应 C# `Entity.FindMax` 的用途：增量同步要「最大 ID / 最新时间」）。
+    /// 深分页查询结果：`reversed = true` 表示这次真的走了「倒序取尾部」分支（可直接写进日志/指标）。
+    pub const DeepPageResult = struct {
+        rows: []Row,
+        reversed: bool,
+    };
+
+    /// 深分页查询（≂ C# `Entity.FindAll` 的「海量数据查询优化」）。
     ///
+    /// 偏移落在表尾时**倒序取尾部、再把结果翻回正序**：扫描量从 `offset` 降到 `total - offset`。
+    /// 亿级表翻到第 90 万页时这一条能把一次查询从「扫 90 万行」降到「扫几万行」。
+    ///
+    /// 前置条件：
+    /// - `q.order_by` 非空（没有确定排序就不敢翻，直接按原样查）；
+    /// - `total` 由调用方给（通常来自 `Dal.countTotal` / `countUpTo`；走缓存还是从库由调用方决定），
+    ///   本函数**不自己发 COUNT**——亿级表上多一次 COUNT 就是多一次全扫。
+    ///
+    /// 返回的行已经按**原排序**排好，调用方无需再翻。
+    pub fn queryDeepPage(
+        self: *const TableRef,
+        s: *Session,
+        q: *const query.Query,
+        total: i64,
+        plan: @import("pagesplit.zig").DeepPage,
+    ) !DeepPageResult {
+        const offset = q.offset orelse 0;
+        const page_size = q.limit orelse 0;
+        const reversed_offset = plan.plan(offset, page_size, total) orelse return .{ .rows = try self.queryRows(s, q), .reversed = false };
+        if (q.order_by.items.len == 0) return .{ .rows = try self.queryRows(s, q), .reversed = false };
+
+        // 浅复制 Query：只把排序翻过来 + 换偏移，其余字段沿用原值
+        var q2 = q.*;
+        var flipped: std.ArrayList(query.OrderBy) = .empty;
+        defer flipped.deinit(self.gpa);
+        try flipped.ensureTotalCapacity(self.gpa, q.order_by.items.len);
+        for (q.order_by.items) |ob| {
+            flipped.appendAssumeCapacity(.{ .column = ob.column, .desc = !ob.desc });
+        }
+        q2.order_by = flipped;
+        q2.offset = reversed_offset;
+
+        const rows = try self.queryRows(s, &q2);
+        // 倒序取回来的行翻回正序（原地交换）
+        if (rows.len > 1) {
+            var i: usize = 0;
+            var j: usize = rows.len - 1;
+            while (i < j) : ({
+                i += 1;
+                j -= 1;
+            }) {
+                const tmp = rows[i];
+                rows[i] = rows[j];
+                rows[j] = tmp;
+            }
+        }
+        return .{ .rows = rows, .reversed = true };
+    }
+
+    /// 取一列的最大值（对应 C# `Entity.FindMax` 的用途：增量同步要「最大 ID / 最新时间」）。    ///
     /// 空表 / 无匹配行返回 `null`（C# 返回 0，无法区分「没有数据」和「值就是 0」；
     /// 这里用 `?Value` 把这个区分留给调用方）。
     pub fn maxValue(self: *const TableRef, s: *Session, column: []const u8, filter: ?*const Where) !?Value {

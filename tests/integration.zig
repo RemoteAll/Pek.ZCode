@@ -1020,6 +1020,86 @@ test "聚合取最值：maxValue/minValue 带条件，空表返回 null" {
     try std.testing.expectEqual(@as(i64, 0), (try table.aggregateValue(&s, .count, "", &w2)).?.asI64().?);
 }
 
+test "深分页倒序优化：倒序取尾部再翻回来，结果与正序分页完全一致" {
+    const a = std.testing.allocator;
+
+    const db_path = try tempDbPath(a, "deeppage");
+    defer a.free(db_path);
+    defer zcode.File.DeleteQuiet(db_path);
+
+    var dal = openDal(a, db_path) catch |e| {
+        std.debug.print("[SKIP] SQLite 不可用：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("JiLiYu");
+    const now = zcode.DateTime.nowLocal();
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const code = try std.fmt.allocPrint(a, "c{d}", .{i + 1});
+        defer a.free(code);
+        _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = code } },
+            .{ .name = "Title", .value = .{ .text = "t" } },
+            .{ .name = "Amount", .value = .{ .decimal = try zcode.Decimal.parse("1.0000") } },
+            .{ .name = "Ok", .value = .{ .boolean = true } },
+            .{ .name = "CreateTime", .value = .{ .datetime = now } },
+        });
+    }
+    const total: i64 = 10;
+
+    // 正序分页：offset=7, limit=2 → Id 8,9
+    var q = zcode.Query.init(a);
+    defer q.deinit();
+    _ = try q.orderBy("Id", false);
+    q.offset = 7;
+    q.limit = 2;
+
+    // 门槛设小，让小表也能走倒序分支（阈值可配就是为了这条用例能测）
+    const small = zcode.pagesplit.DeepPage{ .min_offset = 2, .min_total = 4 };
+    const deep = try table.queryDeepPage(&s, &q, total, small);
+    // **分支真的走了**：否则「结果与正序一致」这条断言什么也证明不了
+    try std.testing.expect(deep.reversed);
+    const rows = deep.rows;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 8), rows[0].get("Id").?.asI64().?);
+    try std.testing.expectEqual(@as(i64, 9), rows[1].get("Id").?.asI64().?);
+
+    // 与「关掉优化」的正序结果逐行一致
+    const plain = try table.queryRows(&s, &q);
+    try std.testing.expectEqual(plain.len, rows.len);
+    for (plain, rows) |want, got| {
+        try std.testing.expectEqual(want.get("Id").?.asI64().?, got.get("Id").?.asI64().?);
+    }
+
+    // 降序排序也要一致（翻回来的是原排序）
+    var qd = zcode.Query.init(a);
+    defer qd.deinit();
+    _ = try qd.orderBy("Id", true);
+    qd.offset = 7;
+    qd.limit = 2;
+    const rows_d = (try table.queryDeepPage(&s, &qd, total, small)).rows;
+    const plain_d = try table.queryRows(&s, &qd);
+    try std.testing.expectEqual(plain_d.len, rows_d.len);
+    for (plain_d, rows_d) |want, got| {
+        try std.testing.expectEqual(want.get("Id").?.asI64().?, got.get("Id").?.asI64().?);
+    }
+
+    // 没有排序 → 不敢翻，按原样查（并明确告知未倒序）
+    var qn = zcode.Query.init(a);
+    defer qn.deinit();
+    qn.offset = 7;
+    qn.limit = 2;
+    const deep_n = try table.queryDeepPage(&s, &qn, total, small);
+    try std.testing.expect(!deep_n.reversed);
+    try std.testing.expectEqual(@as(usize, 2), deep_n.rows.len);
+}
+
 // 新增能力的集成用例（分表 / 读写分离 / 连接池 / 拦截器 / Migration Full）
 test {
     _ = @import("integration_features.zig");
