@@ -61,7 +61,7 @@ pub const DatabaseKind = enum {
         if (eq(t, "saphana") or eq(t, "hana")) return .hana;
         if (eq(t, "firebird")) return .firebird;
         if (eq(t, "db2")) return .db2;
-        if (eq(t, "dameng") or eq(t, "dm")) return .dameng;
+        if (eq(t, "dameng") or eq(t, "dm") or eq(t, "达梦")) return .dameng;
         if (eq(t, "iris")) return .iris;
         if (eq(t, "access") or eq(t, "oledb")) return .access;
         if (eq(t, "sqlce") or eq(t, "sqlce35") or eq(t, "sqlserverce")) return .sqlce;

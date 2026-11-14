@@ -241,6 +241,8 @@ fn isUsable(s: *const Session) bool {
         .duckdb => false,
         // Oracle（OCI）：会话在手就可用（断线由 `lastError` + 业务重试兜底）
         .oracle => |conn| conn.svc != null,
+        // ODBC：连接句柄还在就可用
+        .odbc => |conn| conn.dbc != null,
     };
 }
 

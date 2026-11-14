@@ -26,15 +26,17 @@
   - `dbpackage.backupAllToFile` / `restoreAllFromFile` 多表归档（`.zip` / `.gz` / 纯文本三档）；
     **zip 实现下沉 `zzig.zip`**（store/deflate），**gzip 复用 `zzig.Http.gzip*`** —— 两者分工不要搞反：多文件用 zip，单流压缩用 gzip；
   - `entity_ext.mergeAny` + `copyFromAny`（≂ C# `Merge<T,T2>`，键列编译期校验，只复制两边同名列）。
-- 未实现：Oracle（TNS/OCI）、MongoDB（BSON）、ClickHouse（HTTP 8123）、DuckDB（嵌入式）四家**执行驱动**；
-  C# `DbTable` v3 二进制互通（`Db/Query` 现为 JSON 行列）。
+- 2026-11-14 第二十四~二十六轮：`zzig.db.clickhouse` / `db.mongodb`(+`db.bson`) / `db.duckdb` 三家执行驱动，
+  加 `zzig.dyn`（动态库加载）与 `zzig.db.inline`（参数内联）；
+  第二十七轮补 `zzig.db.oracle`（OCI 动态加载），第二十八轮补 `zzig.db.odbc`
+  （一家盖 Access/SqlCe/DB2/HANA/Firebird/达梦/IRIS 共 7 个方言）—— **21 个方言全部有执行驱动**。
   远程服务已做：`src/dbservice.zig` + `src/dbclient.zig`（HTTP/1.1 服务端在 `zzig/src/http/server.zig`）。
 - **口径（用户 2026-11-13 明确）：迁移优先，不要以「本机无实例」为由拒绝实现**——
   缺的方法要实现；公共能力下沉 `zzig`；**无实例的驱动用回环假服务端（`zzig/src/db/http_loopback_test.zig` 范式）守住协议**，
   真库验证留到有条件时。
-- **执行层矩阵（2026-11-14）**：已接 **10 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
-  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG** / **DuckDB 嵌入式** / **Oracle OCI 动态加载**）+ 2 组协议复用
-  （**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
+- **执行层矩阵（2026-11-14）**：已接 **11 家驱动**（SQLite / MySQL / PostgreSQL / SQL Server / **TDengine REST `/rest/sql`** /
+  **InfluxDB HTTP** / **ClickHouse HTTP 8123** / **MongoDB OP_MSG** / **DuckDB 嵌入式** / **Oracle OCI 动态加载** /
+  **ODBC（7 方言）**）+ 2 组协议复用（**金仓·瀚高·海量 → PG 驱动**、**NovaDb → MySQL 驱动**）。
   - InfluxDB **不是 SQL 库**：`insert`/`upsert` 走 **Line Protocol**（`dbtable.influxLineAlloc`：时间列→行尾纳秒、
     主键→tag、其余→field），查询走 Flux（v2）或 InfluxQL（v1）；不要试图给它生成 `INSERT INTO`。
   - TDengine REST 与 ClickHouse HTTP **都没有预处理语句**：`?` 必须客户端内联（`zzig.db.inline`，两家共用）。
@@ -52,6 +54,12 @@
     `lastInsertId` 恒 0（用 `SEQ_{表名}.CURRVAL` / `RETURNING`）。
   - **未验证真库成功路径**：DuckDB（需 `duckdb.dll`）、Oracle（需 Instant Client + 实例）；失败路径都有用例守着，
     有条件时优先补这两个的真库用例——**汇报时不得把“已接线”说成“已实测”**。
+  - **ODBC 家族（Access / SqlCe / DB2 / HANA / Firebird / 达梦 / IRIS）**：`zzig.db.odbc` 动态加载 `odbc32.dll`/`libodbc.so`，
+    **一家盖 7 个方言**（C# 侧它们也是 OLE DB / ODBC 桥）。**必须走 W 变体**（`SQLDriverConnectW` /
+    `SQLExecDirectW` / `SQLDescribeColW` + `SQL_C_WCHAR`）：A 变体按系统 ANSI 代码页解码，中文会随机器变形。
+    事务靠开关 `SQL_ATTR_AUTOCOMMIT`（`begin()` 关、`commit()/rollback()` 走 `SQLEndTran` 后开回来），
+    所以不在事务里的单条写入仍是立即落库的。`lastInsertId` 恒 0（各家 `@@IDENTITY`/`SCOPE_IDENTITY()` 不同，
+    由方言层按需生成 SQL）。
 - **两级缓存已逐条对齐 C#（`docs/决策记录.md` 第（三十五）节）**：
   - `cache.Cache(T)`（`Meta.Cache`，整表）：**硬内存上限 = `MaxCacheCount` 行**，装载带 `LIMIT max_rows+1`，
     超限**一行不留** + 60s 静默期；`MaxCacheCount <= 0` 永不缓存。读路径无锁（不可变快照 + 原子发布）。

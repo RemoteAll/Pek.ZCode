@@ -21,6 +21,7 @@ const clickhouse = @import("zzig").clickhouse;
 const mongodb = @import("zzig").mongodb;
 const duckdb = @import("zzig").duckdb;
 const oracle = @import("zzig").oracle;
+const odbc = @import("zzig").odbc;
 const Value = @import("zzig").db.Value;
 const DatabaseKind = @import("dialect.zig").DatabaseKind;
 const setting = @import("setting.zig");
@@ -213,6 +214,8 @@ pub const Driver = union(enum) {
     duckdb: duckdb.Db,
     /// Oracle：OCI 动态加载（`oci.dll` / `libclntsh.so`）
     oracle: oracle.Conn,
+    /// ODBC 家族（Access / SqlCe / DB2 / HANA / Firebird / 达梦 / IRIS）：动态加载 `odbc32.dll`
+    odbc: odbc.Conn,
 };
 
 pub const Session = struct {
@@ -273,6 +276,7 @@ pub const Session = struct {
             .mongodb => |*conn| conn.deinit(),
             .duckdb => |*db| db.close(),
             .oracle => |*conn| conn.deinit(),
+            .odbc => |*conn| conn.deinit(),
         }
     }
 
@@ -518,6 +522,13 @@ pub const Session = struct {
                 };
                 return @intCast(n);
             },
+            .odbc => |*conn| {
+                const n = conn.exec(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] SQL 执行失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return @intCast(n);
+            },
         }
     }
 
@@ -650,6 +661,16 @@ pub const Session = struct {
                     .ok => &.{},
                 };
             },
+            .odbc => |*conn| {
+                const r = conn.queryAlloc(self.arena.allocator(), sql, params) catch |e| {
+                    std.debug.print("[zcode] 查询失败：{s}\n  SQL: {s}\n  原因: {s}\n", .{ @errorName(e), sql, conn.lastError() });
+                    return e;
+                };
+                return switch (r) {
+                    .rows => |rows| rows,
+                    .ok => &.{},
+                };
+            },
         }
     }
 
@@ -677,6 +698,8 @@ pub const Session = struct {
             .duckdb => |*db| db.lastInsertId(),
             // Oracle 没有自增列（用 `SEQ_{表名}.CURRVAL` 或 `RETURNING`）
             .oracle => |*conn| conn.lastInsertId(),
+            // ODBC 没有统一的自增回写（各家 `@@IDENTITY` / `SCOPE_IDENTITY()` 不同）
+            .odbc => |*conn| conn.lastInsertId(),
         };
     }
 
@@ -692,6 +715,7 @@ pub const Session = struct {
             .mongodb => |*conn| conn.lastError(),
             .duckdb => |*db| db.lastError(),
             .oracle => |*conn| conn.lastError(),
+            .odbc => |*conn| conn.lastError(),
         };
     }
 
@@ -709,6 +733,7 @@ pub const Session = struct {
             .mongodb => error.Unsupported,
             .duckdb => error.Unsupported,
             .oracle => error.Unsupported,
+            .odbc => error.Unsupported,
         };
     }
 
@@ -724,7 +749,7 @@ pub const Session = struct {
                 );
                 return e;
             },
-            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .duckdb, .oracle => error.Unsupported,
+            .sqlite, .postgres, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .duckdb, .oracle, .odbc => error.Unsupported,
         };
     }
 
@@ -788,6 +813,7 @@ pub const Session = struct {
                 _ = try self.execute("BEGIN TRANSACTION", &.{});
             },
             .oracle => try self.beginOracleTransaction(level),
+            .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => try self.beginOdbcTransaction(level),
             else => {
                 std.debug.print("[zcode] 事务：{s} 不支持跨语句事务（时序/文档库无事务语义），已拒绝\n", .{self.kind.name()});
                 return error.Unsupported;
@@ -795,6 +821,19 @@ pub const Session = struct {
         }
         return self.tx_depth;
     }
+    /// ODBC 家族（Access / SqlCe / DB2 / HANA / Firebird / 达梦 / IRIS）：
+    /// 事务边界靠 `SQL_ATTR_AUTOCOMMIT` 开关（驱动层 `Conn.begin()`），隔离级别暂不支持。
+    fn beginOdbcTransaction(self: *Session, level: IsolationLevel) !void {
+        if (level != .default) {
+            std.debug.print("[zcode] 事务：ODBC 驱动（{s}）暂不支持隔离级别 {s}\n", .{ self.kind.name(), @tagName(level) });
+            return error.Unsupported;
+        }
+        switch (self.driver) {
+            .odbc => |*conn| try conn.begin(),
+            else => unreachable,
+        }
+    }
+
     /// Oracle 的事务是**隐式**的：第一条 DML 就开始，不需要 `BEGIN TRANSACTION`。
     /// 所以这里只在显式指定隔离级别时发 `SET TRANSACTION`（必须是事务里的第一条语句）。
     fn beginOracleTransaction(self: *Session, level: IsolationLevel) !void {
@@ -823,6 +862,10 @@ pub const Session = struct {
                 .sqlite, .mysql, .postgresql, .sqlserver => _ = try self.execute("COMMIT", &.{}),
                 .oracle => switch (self.driver) {
                     .oracle => |*conn| try conn.commit(),
+                    else => unreachable,
+                },
+                .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => switch (self.driver) {
+                    .odbc => |*conn| try conn.commit(),
                     else => unreachable,
                 },
                 else => {
@@ -858,6 +901,19 @@ pub const Session = struct {
             .oracle => {
                 const conn = switch (self.driver) {
                     .oracle => |*c| c,
+                    else => unreachable,
+                };
+                conn.rollback() catch |e| {
+                    if (ignore_exception) {
+                        std.debug.print("[zcode] 回滚失败（已忽略）：{s}；{s}\n", .{ @errorName(e), self.lastError() });
+                        return 0;
+                    }
+                    return e;
+                };
+            },
+            .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => {
+                const conn = switch (self.driver) {
+                    .odbc => |*c| c,
                     else => unreachable,
                 };
                 conn.rollback() catch |e| {

@@ -287,6 +287,8 @@ pub const Dal = struct {
     duck_lib: ?@import("zzig").duckdb.Lib = null,
     /// Oracle OCI 动态库句柄（`Provider=Oracle` 时用；生命周期与 Dal 一致）
     oracle_lib: ?@import("zzig").oracle.Lib = null,
+    /// ODBC 驱动管理器句柄（Access / SqlCe / DB2 / HANA / Firebird / 达梦 / IRIS）
+    odbc_lib: ?@import("zzig").odbc.Lib = null,
     /// 整表实体缓存注册表（写操作后按表名使缓存失效）
     cache_hooks: std.ArrayListUnmanaged(CacheHook) = .empty,
     /// 读写分离策略（忽略表 / 全局切主库）
@@ -529,7 +531,25 @@ pub const Dal = struct {
                 };
                 return d;
             },
-            else => return error.Unsupported,
+            // ODBC 家族：一个驱动盖 7 个方言（C# 侧这些也是走 OLE DB / ODBC 桥）
+            .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => {
+                if (opts_owned.database.len == 0 and opts_owned.data_source.len == 0) return error.NoConnection;
+                var d = Dal{
+                    .gpa = gpa,
+                    .model = m,
+                    .opts = opts_owned,
+                    .strategy = readwrite.Strategy.init(gpa),
+                };
+                d.odbc_lib = @import("zzig").odbc.Lib.load(gpa) catch |e| {
+                    std.debug.print(
+                        "[zcode] ODBC 不可用（{s}）：Windows 自带 odbc32.dll；" ++
+                            "Linux 请装 unixODBC 并在 /etc/odbcinst.ini 配驱动\n",
+                        .{@errorName(e)},
+                    );
+                    return e;
+                };
+                return d;
+            },
         }
     }
 
@@ -555,6 +575,7 @@ pub const Dal = struct {
         if (self.lib) |*lib| lib.deinit();
         if (self.duck_lib) |*lib| lib.module.close(self.gpa);
         if (self.oracle_lib) |*lib| lib.module.close(self.gpa);
+        if (self.odbc_lib) |*lib| lib.module.close(self.gpa);
         self.opts.deinit(self.gpa);
         self.model.deinit();
     }
@@ -890,8 +911,7 @@ pub const Dal = struct {
                 return Session.initWithDriver(self.gpa, .duckdb, .{ .duckdb = db });
             },
             .oracle => {
-                const lib = if (self.oracle_lib) |*l| l else return error.Unsupported;
-                // 两种写法都支持：
+                const lib = if (self.oracle_lib) |*l| l else return error.Unsupported;                // 两种写法都支持：
                 // 1) Server=host + Database=SERVICE_NAME（常规）
                 // 2) Server 直接给完整 DSN（`//host:1521/svc` 或 `(DESCRIPTION=(...))`）
                 const looks_like_dsn = std.mem.indexOf(u8, opts.server, "//") != null or
@@ -906,7 +926,21 @@ pub const Dal = struct {
                 });
                 return Session.initWithDriver(self.gpa, .oracle, .{ .oracle = conn });
             },
-            else => return error.Unsupported,
+            .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => {
+                const lib = if (self.odbc_lib) |*l| l else return error.Unsupported;
+                // 连接串三种写法：
+                // 1) `Database=` 里给完整 ODBC 串（带 `=` 和 `;`）→ 原样用
+                // 2) Access：给 `.mdb`/`.accdb` 文件路径 → 拼 DRIVER{...};DBQ=...
+                // 3) 其它：给 DSN 名 → `DSN=x;UID=..;PWD=..`
+                const src = if (opts.database.len > 0) opts.database else opts.data_source;
+                const conn_str = if (opts.provider == .access)
+                    try @import("zzig").odbc.accessConnStrAlloc(self.gpa, if (opts.data_source.len > 0) opts.data_source else src, true)
+                else
+                    try @import("zzig").odbc.buildConnStrAlloc(self.gpa, src, opts.user, opts.password);
+                defer self.gpa.free(conn_str);
+                const conn = try @import("zzig").odbc.Conn.open(self.gpa, lib, .{ .conn_str = conn_str });
+                return Session.initWithDriver(self.gpa, opts.provider, .{ .odbc = conn });
+            },
         }
     }
 
@@ -931,6 +965,7 @@ pub const Dal = struct {
             .sqlite => !std.mem.eql(u8, self.opts.data_source, ":memory:"),
             .mysql, .postgresql, .sqlserver, .tdengine, .influxdb, .clickhouse, .mongodb, .nova, .kingbase, .highgo, .vastbase => true,
             .oracle => true,
+            .hana, .firebird, .db2, .dameng, .iris, .access, .sqlce => true,
             else => false,
         };
     }
@@ -2276,6 +2311,39 @@ test "Oracle：连接串解析 + 缺客户端库时立即报 OracleNotAvailable"
         dal_ok.deinit(); // 本机有 Oracle 客户端库：能建就好，随后正常释放
     } else |e| {
         try std.testing.expectEqual(@import("zzig").oracle.Error.OracleNotAvailable, e);
+    }
+}
+
+test "ODBC 家族（Access/SqlCe/DB2/HANA/Firebird/达梦/IRIS）：方言认得出 + 建连失败给明确错误" {
+    const a = std.testing.allocator;
+
+    // 7 个方言的 Provider 名都要认得（C# 侧它们都走 OLE DB / ODBC 桥）
+    for ([_][]const u8{ "DB2", "Access", "SqlCe", "Hana", "Firebird", "Dameng", "达梦", "IRIS" }) |p| {
+        try std.testing.expect(DatabaseKind.fromProvider(p) != null);
+    }
+    try std.testing.expectEqual(DatabaseKind.db2, DatabaseKind.fromProvider("DB2").?);
+    try std.testing.expectEqual(DatabaseKind.dameng, DatabaseKind.fromProvider("达梦").?);
+
+    // 只给 Provider 不给库：直接拒（没有 DSN 名就没法连）
+    const m0 = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    try std.testing.expectError(error.NoConnection, Dal.initWithModel(a, "Provider=DB2", m0));
+
+    // Windows 自带 odbc32.dll：Dal 应当能建起来；真去连一个不存在的 DSN 必须报 ConnectFailed，
+    // 而不是 panic 或静默返回空会话。
+    const m1 = try EntityModel.parse(a, "<EntityModel><Tables/></EntityModel>");
+    const built = Dal.initWithModel(a, "Provider=DB2;Database=zcode_no_such_dsn_xyz;UserID=u;Password=p", m1);
+    if (built) |d| {
+        var dal = d;
+        defer dal.deinit();
+        var sess = dal.openSession() catch |e| {
+            try std.testing.expectEqual(@as(anyerror, @import("zzig").odbc.Error.ConnectFailed), e);
+            return;
+        };
+        // 真的连上了（本机装了这个 DSN）：不判失败，正常收尾
+        sess.deinit();
+    } else |e| {
+        // Unix 上没装 unixODBC 是正常的
+        try std.testing.expectEqual(@as(anyerror, @import("zzig").odbc.Error.OdbcNotAvailable), e);
     }
 }
 
