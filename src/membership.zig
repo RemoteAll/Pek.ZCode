@@ -25,6 +25,8 @@ pub const area = @import("membership/area.zig");
 pub const provider = @import("membership/provider.zig");
 /// 多租户数据隔离（C# `ITenantSource.cs`：条件补全 + 插入补租户）。
 pub const tenant = @import("membership/tenant.zig");
+/// 菜单索引与查找（C# `IMenuFactory.cs`：按 ID/名称/全名/URL 查 + 子菜单排序与权限过滤）。
+pub const menu = @import("membership/menu.zig");
 /// 九张表的实体（由 `Member.xml` 生成）。
 pub const entities = @import("membership/entities/mod.zig");
 
@@ -50,6 +52,7 @@ pub const LogActions = log.action;
 pub const TenantContext = tenant.Context;
 pub const TenantInterceptor = tenant.Interceptor;
 pub const applyTenant = tenant.applyTenant;
+pub const MenuIndex = menu.Index;
 
 test {
     _ = enums;
@@ -60,5 +63,6 @@ test {
     _ = area;
     _ = provider;
     _ = tenant;
+    _ = menu;
     _ = entities;
 }
