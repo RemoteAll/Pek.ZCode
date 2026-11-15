@@ -416,6 +416,8 @@ pub fn SingleCache(comptime T: type) type {
             loaded_at: i64,
             /// 最近访问序号（单调递增）：淘汰时取最小的
             visit_seq: u64 = 0,
+            /// 从键（已按 `slave_ignore_case` 归一化；指向本条目 arena 内的副本）
+            slave_key: ?[]const u8 = null,
             arena: std.heap.ArenaAllocator,
         };
 
@@ -431,6 +433,14 @@ pub fn SingleCache(comptime T: type) type {
         /// 条目上限（C# `MaxEntity`）：防止大表把内存吃满；0 = 不限
         max_entries: usize = 10_000,
         entries: std.AutoHashMapUnmanaged(i64, Entry) = .empty,
+        /// 从键 → 主键（≂ C# `SingleEntityCache._SlaveEntities`）。未配置 `slave_of` 时永远为空。
+        slave_index: std.StringHashMapUnmanaged(i64) = .empty,
+        /// 从实体取从键（≂ C# `GetSlaveKeyMethod`）；null = 不维护从键索引。
+        ///
+        /// 用 `setSlaveKey` 设置而不是构造参数：它是可选能力，绝大多数实体只有主键查询。
+        slave_of: ?*const fn (e: *const T) ?[]const u8 = null,
+        /// 从键忽略大小写（≂ C# `SlaveKeyIgnoreCase`）
+        slave_ignore_case: bool = false,
         mutex: Mutex = .{},
         /// 只保护「首次注册」：并发首访时只能注册一条钩子（否则会重复注册 + 泄漏）
         reg_mutex: Mutex = .{},
@@ -469,7 +479,20 @@ pub fn SingleCache(comptime T: type) type {
             var it = self.entries.iterator();
             while (it.next()) |kv| kv.value_ptr.arena.deinit();
             self.entries.deinit(self.gpa);
+            self.slave_index.deinit(self.gpa);
             self.scratch.deinit(self.gpa);
+        }
+
+        /// 启用从键索引（≂ C# 给 `SingleEntityCache` 设 `GetSlaveKeyMethod` / `SlaveKeyIgnoreCase`）。
+        ///
+        /// 启用后，**已经缓存**的条目不会自动补索引（它们本来就没算过从键）；
+        /// 要么在装载前就设好，要么先 `invalidateAll()`。这一点写进注释避免“为什么缓存里有的却查不到”。
+        pub fn setSlaveKey(self: *Self, of: *const fn (e: *const T) ?[]const u8, ignore_case: bool) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.slave_of = of;
+            self.slave_ignore_case = ignore_case;
+            self.slave_index.clearRetainingCapacity();
         }
 
         pub fn stats(self: *const Self) CacheStats {
@@ -494,11 +517,13 @@ pub fn SingleCache(comptime T: type) type {
             var it = self.entries.iterator();
             while (it.next()) |kv| kv.value_ptr.arena.deinit();
             self.entries.clearRetainingCapacity();
+            self.slave_index.clearRetainingCapacity();
         }
 
         fn removeLocked(self: *Self, pk: i64) void {
             if (self.entries.fetchRemove(pk)) |kv| {
                 var entry = kv.value;
+                if (entry.slave_key) |sk| _ = self.slave_index.remove(sk);
                 entry.arena.deinit();
             }
         }
@@ -584,23 +609,109 @@ pub fn SingleCache(comptime T: type) type {
 
             self.mutex.lock();
             defer self.mutex.unlock();
-            try self.putLocked(pk, owned, arena);
+            try self.putLocked(pk, owned, &arena);
             // 记下回库时的分布式版本：之后变了就说明别的进程改过这张表
             if (self.dal.remote_cache) |rc| self.remote_ver = rc.local_version(rc.ctx, self.phys_name);
             return owned;
         }
 
-        fn putLocked(self: *Self, pk: i64, value: T, arena: std.heap.ArenaAllocator) !void {
+        fn putLocked(self: *Self, pk: i64, value: T, arena: *std.heap.ArenaAllocator) !void {
+            // 从键：复制（必要时小写化）到条目 arena，随后由 `slave_index` 借用
+            var slave_key: ?[]const u8 = null;
+            if (self.slave_of) |of| {
+                if (of(&value)) |raw| {
+                    if (raw.len > 0) {
+                        const a = arena.allocator();
+                        if (self.slave_ignore_case) {
+                            const lower = try a.alloc(u8, raw.len);
+                            for (raw, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
+                            slave_key = lower;
+                        } else {
+                            slave_key = try a.dupe(u8, raw);
+                        }
+                    }
+                }
+            }
+
             const gop = try self.entries.getOrPut(self.gpa, pk);
-            if (gop.found_existing) gop.value_ptr.arena.deinit();
+            if (gop.found_existing) {
+                if (gop.value_ptr.slave_key) |old| _ = self.slave_index.remove(old);
+                gop.value_ptr.arena.deinit();
+            }
             self.seq += 1;
             gop.value_ptr.* = .{
                 .value = value,
                 .loaded_at = DateTime.nowUnix(),
                 .visit_seq = self.seq,
-                .arena = arena,
+                .slave_key = slave_key,
+                .arena = arena.*,
             };
             if (self.max_entries > 0 and self.entries.count() > self.max_entries) self.evictLocked();
+            // 注意：`evictLocked` 可能刚好把刚插入的这一条淘汰，所以索引要在淘汰**之后**写
+            if (slave_key) |sk| {
+                if (self.entries.contains(pk)) try self.slave_index.put(self.gpa, sk, pk);
+            }
+        }
+
+        /// 按从键取（≂ C# `SingleEntityCache.GetItemWithSlaveKey`）：从键 → 主键 → 缓存条目；
+        /// 未命中则用 `find` 回库（≂ C# `FindSlaveKeyMethod`），拿到实体后按主键入缓存。
+        ///
+        /// `find` 的返回值里必须有**单列主键**，否则返回 `error.NoPrimaryKey`（复合/非整型主键不走本能力）。
+        /// 未配置 `slave_of` → `error.SlaveKeyNotConfigured`（不能默默返回 null，那是“查不到”与“没配”混淆）。
+        pub fn getBySlave(
+            self: *Self,
+            s: *Session,
+            slave_key: []const u8,
+            ctx: *anyopaque,
+            find: *const fn (ctx: *anyopaque, s: *Session, slave: []const u8) anyerror!?T,
+        ) !?T {
+            try self.ensureRegistered();
+            self.checkRemote();
+            _ = self.total.fetchAdd(1, .monotonic);
+
+            if (self.slave_of == null) return error.SlaveKeyNotConfigured;
+            if (slave_key.len == 0) return null;
+
+            // 索引 key 与 `putLocked` 保持同一口径（需要时小写化）
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.gpa);
+            const key = if (self.slave_ignore_case) blk: {
+                try buf.ensureTotalCapacity(self.gpa, slave_key.len);
+                for (slave_key) |ch| buf.appendAssumeCapacity(std.ascii.toLower(ch));
+                break :blk buf.items;
+            } else slave_key;
+
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.slave_index.get(key)) |pk| {
+                    if (self.entries.getPtr(pk)) |entry| {
+                        if (!self.isExpired(entry)) {
+                            self.seq += 1;
+                            entry.visit_seq = self.seq;
+                            _ = self.success.fetchAdd(1, .monotonic);
+                            return entry.value;
+                        }
+                        self.removeLocked(pk);
+                    } else {
+                        // 条目被淘汰但索引还在：清掉脏索引
+                        _ = self.slave_index.remove(key);
+                    }
+                }
+            }
+
+            const row = (try find(ctx, s, slave_key)) orelse return null;
+            const pk = entity.singlePkI64(T.meta, row) orelse return error.NoPrimaryKey;
+
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            errdefer arena.deinit();
+            const owned = try cloneEntity(T, arena.allocator(), row);
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.putLocked(pk, owned, &arena);
+            if (self.dal.remote_cache) |rc| self.remote_ver = rc.local_version(rc.ctx, self.phys_name);
+            return owned;
         }
 
         /// 超出上限时批量淘汰到 90%（一次扫描 + 排序，不是每插入一条就全扫）。

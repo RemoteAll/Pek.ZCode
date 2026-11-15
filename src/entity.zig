@@ -773,7 +773,7 @@ fn pkToI64(meta: EntityMeta, e: anytype) i64 {
 
 /// 唯一主键且为整型时返回其值；复合主键/非整型主键返回 `null`。
 /// 用于「单行写 → 缓存按主键精确失效」：复合主键的缓存只能整体失效。
-fn singlePkI64(meta: EntityMeta, e: anytype) ?i64 {
+pub fn singlePkI64(meta: EntityMeta, e: anytype) ?i64 {
     var found: ?i64 = null;
     for (meta.fields, 0..) |f, i| {
         if (!f.primary_key) continue;

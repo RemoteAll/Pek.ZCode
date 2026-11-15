@@ -774,3 +774,134 @@ test "唯一性检查：命中别人算冲突、命中自己不算、多行必�
         try std.testing.expectError(error.NoField, zcode.entity.exist(&dal, &fresh, &s, &.{"Nope"}, true));
     }
 }
+
+// ── 单对象缓存的从键索引（≂ C# SingleEntityCache.GetItemWithSlaveKey） ──
+
+fn titleOf(e: *const LogRow) ?[]const u8 {
+    return if (e.Title.len > 0) e.Title else null;
+}
+
+const ByTitleCtx = struct {
+    dal: *zcode.Dal,
+    /// 回库次数（用来区分「缓存命中」和「又查了一次库」）
+    calls: usize = 0,
+};
+
+fn findLogByTitle(ctx: *anyopaque, s: *zcode.Session, title: []const u8) anyerror!?LogRow {
+    const self: *ByTitleCtx = @ptrCast(@alignCast(ctx));
+    self.calls += 1;
+
+    var w = zcode.Where.init(self.dal.gpa);
+    defer w.deinit();
+    _ = try w.eq("Title", .{ .text = title });
+
+    var q = zcode.Query.init(self.dal.gpa);
+    defer q.deinit();
+    _ = q.filterWhere(&w);
+    _ = q.take(1);
+
+    const rows = try zcode.entity.queryRows(self.dal, LogRow, s, &q);
+    return if (rows.len > 0) rows[0] else null;
+}
+
+test "单对象缓存：按从键（Title）取 → 回库一次后命中缓存；失效后重建；空值不缓存" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "slavekey");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Log");
+    const id = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "alice" } },
+    });
+
+    var sc = zcode.cache.SingleCache(LogRow).init(&dal, 60);
+    defer sc.deinit();
+    sc.setSlaveKey(titleOf, false);
+
+    var ctx = ByTitleCtx{ .dal = &dal };
+
+    // ① 首次：回库一次
+    const first = (try sc.getBySlave(&s, "alice", &ctx, findLogByTitle)).?;
+    try std.testing.expectEqual(@as(i32, @intCast(id)), first.Id);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+
+    // ② 第二次：走缓存，不再回库
+    const second = (try sc.getBySlave(&s, "alice", &ctx, findLogByTitle)).?;
+    try std.testing.expectEqualStrings("alice", second.Title);
+    try std.testing.expectEqual(@as(usize, 1), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 1), sc.cachedCount());
+
+    // ③ 查不到：返回 null，且**不缓存空值**（再查还会回库）
+    try std.testing.expect((try sc.getBySlave(&s, "nobody", &ctx, findLogByTitle)) == null);
+    try std.testing.expectEqual(@as(usize, 1), sc.cachedCount());
+    try std.testing.expect((try sc.getBySlave(&s, "nobody", &ctx, findLogByTitle)) == null);
+    try std.testing.expectEqual(@as(usize, 3), ctx.calls);
+
+    // ④ 精确失效后，从键再取会重建（索引必须跟着条目一起没掉）
+    sc.invalidate(@intCast(id));
+    try std.testing.expectEqual(@as(usize, 0), sc.cachedCount());
+    const again = (try sc.getBySlave(&s, "alice", &ctx, findLogByTitle)).?;
+    try std.testing.expectEqualStrings("alice", again.Title);
+    try std.testing.expectEqual(@as(usize, 4), ctx.calls);
+}
+
+test "单对象缓存：从键忽略大小写（索引归一化，不改变回库条件）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "slavekey_ci");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Log");
+    const id = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "Bob" } },
+    });
+
+    var sc = zcode.cache.SingleCache(LogRow).init(&dal, 60);
+    defer sc.deinit();
+    sc.setSlaveKey(titleOf, true); // ignore_case
+
+    var ctx = ByTitleCtx{ .dal = &dal };
+
+    // 先用主键装载进缓存（这一步会把从键按小写记进索引）
+    _ = (try sc.get(&s, @intCast(id))).?;
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+
+    // 用大写从键取：索引命中 → 不回库
+    const got = (try sc.getBySlave(&s, "BOB", &ctx, findLogByTitle)).?;
+    try std.testing.expectEqualStrings("Bob", got.Title);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+}
+
+test "单对象缓存：未配置从键时明确报错，不把『没配』当成『查不到』" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "slavekey_nocfg");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    var sc = zcode.cache.SingleCache(LogRow).init(&dal, 60);
+    defer sc.deinit();
+
+    var ctx = ByTitleCtx{ .dal = &dal };
+    try std.testing.expectError(error.SlaveKeyNotConfigured, sc.getBySlave(&s, "x", &ctx, findLogByTitle));
+}
