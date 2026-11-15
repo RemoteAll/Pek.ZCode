@@ -1382,10 +1382,22 @@ pub const Dal = struct {
         const code = self.probe_code.load(.acquire);
         if (unpackServerVersion(code)) |v| return dialect.Features.forVersion(kind, v);
         if (code == probe_failed and !self.probe_warned.swap(true, .acquire)) {
-            std.debug.print(
-                "[zcode] {s}：服务端版本未知，方言能力按保守档（{s}）\n",
-                .{ kind.name(), (dialect.Features.conservative.describeAlloc(self.gpa) catch "行别名=关 / RETURNING=关") },
-            );
+            // `describeAlloc` 返回的是**堆上的串**，打印完必须释放：早先直接把它塞进
+            // `std.debug.print` 的参数里，每次 `table()` 都漏一块（实测 53 字节/次，
+            // 2026-11-15 由集成测试的 SafeAllocator 抓到）。SQL Server 不探版本，
+            // 所以它**每次**都走这条保守档分支。
+            if (dialect.Features.conservative.describeAlloc(self.gpa)) |desc| {
+                defer self.gpa.free(desc);
+                std.debug.print(
+                    "[zcode] {s}：服务端版本未知，方言能力按保守档（{s}）\n",
+                    .{ kind.name(), desc },
+                );
+            } else |_| {
+                std.debug.print(
+                    "[zcode] {s}：服务端版本未知，方言能力按保守档（行别名=关 / RETURNING=关）\n",
+                    .{kind.name()},
+                );
+            }
         }
         return dialect.Features.unknownVersion(kind);
     }

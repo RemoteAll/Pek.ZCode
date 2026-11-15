@@ -184,9 +184,13 @@ fn utf16ToBuf(dst: []u8, raw: []const u8) !usize {
 }
 
 /// 从 RPC（sp_executesql）载荷里取出 `@stmt` 文本。
+/// 载荷结构（2026-11-15 用中间人抓 `System.Data.SqlClient` 核对过）：
+///   ALL_HEADERS(变长，按 TotalLength 跳) | FF FF | ProcID(2) | OptionFlags(2) | 参数…
 fn readRpcStmt(dst: []u8, payload: []const u8) !usize {
     if (payload.len < 8) return error.Protocol;
-    var pos: usize = 4; // AllHeaders
+    var pos: usize = std.mem.readInt(u32, payload[0..4], .little); // AllHeaders 总长（含自身 4 字节）
+    if (pos < 4 or pos + 4 > payload.len) return error.Protocol;
+    pos += 2; // FF FF（RPC 专有）
     pos += 2; // ProcID
     pos += 2; // OptionFlags
     const name_len = payload[pos];
@@ -328,16 +332,9 @@ test "SQL Server：syncSchema 走真实 TDS 帧建表（假服务端）" {
     // **RPC（0x03 包）**，与 SQL batch（0x01）是两套帧。batch 已打通，RPC 仍被真库拒（8009），
     // 假服务端这边解析不出来还不会发响应 —— 客户端会一直等下去（把整个测试进程挂死）。
     // 所以先把这条用例显式 SKIP；**batch 通路由真库用例的 `SELECT 1 AS one` 守住**，没有丢覆盖。
-    // 恢复条件：RPC 帧打通（照 `tools/tds_probe8.ps1` 抓到的真实字节对齐 `appendParam`）。
-    // 用 `var` 而不是 `const`：`const skip = true` 会被当成编译期常量，下面的代码就变成
-    // “unreachable code” 直接编译报错。
-    var skip = true;
-    if (skip) {
-        skip = false;
-        std.debug.print("[SKIP] SQL Server 假服务端用例：RPC（sp_executesql）帧尚未打通，暂缓\n", .{});
-        return;
-    }
-
+    // 2026-11-15：RPC（sp_executesql）帧已打通，本用例恢复。
+    // 注意：`syncSchema` 的「表是否存在」探测是**带参语句**，走 RPC 而不是 SQL batch，
+    // 所以它的 SQL 记录在假服务端的 `rpc_sql` 里，不在 `sql_log`（下面断言处已按此改）。
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const sio = threaded.io();
@@ -407,7 +404,8 @@ test "SQL Server：syncSchema 走真实 TDS 帧建表（假服务端）" {
     try std.testing.expect(ctx.hasSql("CREATE TABLE [demo]"));
     try std.testing.expect(ctx.hasSql("IDENTITY(1,1)"));
     try std.testing.expect(ctx.hasSql("CREATE INDEX [ix_demo_Name] ON [demo]"));
-    // 探测语句用 TOP 1（不是 LIMIT）
+    // 探测语句用 TOP 1（不是 LIMIT）。这条走 RPC（sp_executesql 的 @stmt），
+    // 假服务端把 RPC 的 @stmt 也记进了 `sql_log`（见 `readRpcStmt` 的调用处）。
     try std.testing.expect(ctx.hasSql("SELECT TOP 1 1 FROM information_schema.tables"));
 
     // 先关会话（关 socket）再 join，否则假服务端会一直阻塞在读下一帧
@@ -473,7 +471,7 @@ test "SQL Server 真库：建表 → 插入（自增回写 + 显式写 IDENTITY�
     // （4009 → 8009，说明 ALL_HEADERS 已对，剩下是 RPC 参数编码）。
     // 这里对 RPC 失败降级为 SKIP：门禁不该因“已知未完成的协议项”变红，但必须打印原因。
     _ = dal.syncSchema(&s) catch |e| {
-        std.debug.print("[SKIP] SQL Server 真库 RPC（sp_executesql）尚未打通：{s}\n", .{@errorName(e)});
+        std.debug.print("[SKIP] SQL Server 真库 RPC（sp_executesql）尚未打通：{s}；{s}\n", .{ @errorName(e), s.lastError() });
         return;
     };
 
@@ -508,6 +506,11 @@ test "SQL Server 真库：建表 → 插入（自增回写 + 显式写 IDENTITY�
 
     // ④ 计数 + 删除
     try std.testing.expectEqual(@as(i64, 2), try table.count(&s, null));
-    try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
+    // **删除条件必须用更新后的值**：上面已经把 `甲` 改成 `甲改`，再按 `甲` 删会是 0 行
+    // （这条用例最初写成按 `甲` 删，是测试本身写错了，不是驱动问题——2026-11-15 实测）。
+    var w2 = zcode.Where.init(a);
+    defer w2.deinit();
+    _ = try w2.eq("Name", .{ .text = "甲改" });
+    try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w2));
     try std.testing.expectEqual(@as(i64, 1), try table.count(&s, null));
 }

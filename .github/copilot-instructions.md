@@ -132,13 +132,20 @@
     且 TDS 驱动支持命名管道）——`powershell -File tools/mssql-local.ps1 -Action connstr` 会幂等建
     `zcode_test` 库 + `zcode_t` 登录并**打印可用的 `-Dsqlserver-conn`**（管道名 `LOCALDB#XXXX` 每次启动会变，别手写死）。
     仍然成立：LocalDB **不开 TCP**，只能走管道。**不需要装 SQL Server Express**（只有要测 TCP/TLS/MARS 时才考虑）。
-  - **TDS 真库链路现状（2026-11-15）**：PRELOGIN ✅ → LOGIN7 ✅（服务端回 ENVCHANGE 5701/5703）→
-    **SQL batch（0x01 包）✅**（`SELECT 1 AS one` 能拿到结果集）→ **RPC（0x03 包 / `sp_executesql`）仍被拒**
-    （先 4009、后 8009「RPC protocol stream is incorrect」，说明 ALL_HEADERS 已对，剩参数编码）。
-    真库用例对 RPC 失败**显式 SKIP 并打印原因**，不静默放过。
-    两个已验证的协议硬口径：**命名管道是消息模式，一条 TDS 消息必须一次 `WriteFile` 写完**（分两次写会被当成
-    两条消息 → 服务端断管道 → `233 ERROR_PIPE_NOT_CONNECTED`）；**SQL batch / RPC 的 ALL_HEADERS 是 22 字节**
-    （`TotalLength=22` + `HeaderLength=18` + `TRANSACTION_DESCRIPTOR`），写 4 字节的 0 会被判 4009。
+  - **TDS 真库链路现状（2026-11-15）**：PRELOGIN ✅ → LOGIN7 ✅ → **SQL batch（0x01）✅** →
+    **RPC / `sp_executesql`（0x03）✅**。`tests/integration_tsql.zig` 的真库用例实测通过：
+    建表（`syncSchema`，含参数化存在性探测）→ 插入并回写自增 ID → 显式写 IDENTITY →
+    `SELECT ... ORDER BY` → 参数化 `UPDATE` → `DELETE` → `COUNT`。
+    四个已验证的协议硬口径（**都是真库逼出来的，别凭记忆改**）：
+    ① 命名管道是消息模式，**一条 TDS 消息必须一次 `WriteFile` 写完**（分两次写 → 服务端断管道 → `233`）；
+    ② SQL batch / RPC 的 **ALL_HEADERS 是 22 字节**（`TotalLength=22` + `TRANSACTION_DESCRIPTOR`），
+    写 4 字节的 0 会被判 `4009`；
+    ③ **RPC 在 ALL_HEADERS 之后还有 2 字节 `FF FF`**，少了它服务端从错位置读参数（`8009`，报的类型
+    0x53 是 SQL 文本首字母 `'S'`）；
+    ④ **RPC 参数名要带 `@`**（抓包是 `03 | 40 00 70 00 30 00`，即 `@p0`），去掉 `@` 会 `8178`。
+    另外两个易忽略点：`ORDER BY` 的响应里有 **`0xA9` ORDER 令牌**要跳过；
+    `lastInsertId` 用 **`CAST(@@IDENTITY AS bigint)`**（`SCOPE_IDENTITY()` 是批次级作用域，
+    本驱动「INSERT 与 identity 查询分两次发」，会恒为 NULL）。
     定位这类问题**别再猜规范**：`tools/tds_probe7.ps1`（冒充服务端抓 sqlcmd 的 batch 字节）、
     `tools/tds_probe8.ps1`（MITM 抓 `System.Data.SqlClient` 的 RPC 字节）能直接给出权威字节。
   - `tools/regression.ps1` 会探测 5433/3307，在跑就自动带上真库用例，不在跑就显式 SKIP（不会静默跳过）。
