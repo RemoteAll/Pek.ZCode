@@ -18,8 +18,8 @@ const Menu = @import("entities/Menu.zig").Menu;
 
 /// 子菜单排序：`Sort` 降序、`ID` 升序（≂ C# `OrderByDescending(e => e.Sort).ThenBy(e => e.ID)`）。
 fn lessThanSortId(_: void, x: *const Menu, y: *const Menu) bool {
-    if (x.@"Sort" != y.@"Sort") return x.@"Sort" > y.@"Sort";
-    return x.@"ID" < y.@"ID";
+    if (x.Sort != y.Sort) return x.Sort > y.Sort;
+    return x.ID < y.ID;
 }
 
 /// 菜单索引（≂ C# `MenuFactory` 的缓存查找）。
@@ -52,17 +52,17 @@ pub const Index = struct {
         }
 
         for (list, 0..) |*e, i| {
-            try self.by_id.put(gpa, e.@"ID", i);
-            const gop = try children_raw.getOrPut(gpa, e.@"ParentID");
+            try self.by_id.put(gpa, e.ID, i);
+            const gop = try children_raw.getOrPut(gpa, e.ParentID);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(gpa, i);
         }
 
         // 第二遍：小写键（忽略大小写等值查找，≂ C# `EqualIgnoreCase`）
         for (list) |*e| {
-            if (e.@"Name".len > 0) try self.by_name.put(gpa, try lowerAlloc(a, e.@"Name"), indexOfId(&self.by_id, e.@"ID"));
-            if (e.@"FullName".len > 0) try self.by_full_name.put(gpa, try lowerAlloc(a, e.@"FullName"), indexOfId(&self.by_id, e.@"ID"));
-            if (e.@"Url".len > 0) try self.by_url.put(gpa, try lowerAlloc(a, e.@"Url"), indexOfId(&self.by_id, e.@"ID"));
+            if (e.Name.len > 0) try self.by_name.put(gpa, try lowerAlloc(a, e.Name), indexOfId(&self.by_id, e.ID));
+            if (e.FullName.len > 0) try self.by_full_name.put(gpa, try lowerAlloc(a, e.FullName), indexOfId(&self.by_id, e.ID));
+            if (e.Url.len > 0) try self.by_url.put(gpa, try lowerAlloc(a, e.Url), indexOfId(&self.by_id, e.ID));
         }
 
         // 第三遍：子菜单排序（Sort 降序 + ID 升序）
@@ -150,7 +150,7 @@ pub const Index = struct {
         errdefer out.deinit(a);
         for (ids) |i| {
             const e = &self.list[i];
-            if (!incl_invisible and !e.@"Visible") continue;
+            if (!incl_invisible and !e.Visible) continue;
             try out.append(a, e);
         }
         return out.toOwnedSlice(a);
@@ -174,7 +174,7 @@ pub const Index = struct {
         var out: std.ArrayListUnmanaged(*const Menu) = .empty;
         errdefer out.deinit(a);
         for (all) |e| {
-            if (!containsId(resource_ids, e.@"ID")) continue;
+            if (!containsId(resource_ids, e.ID)) continue;
             try out.append(a, e);
         }
         return out.toOwnedSlice(a);
@@ -208,13 +208,13 @@ pub const Index = struct {
             const is_self = steps == 0;
             steps += 1;
             if (!is_self or include_self) {
-                const name = if (use_display_name and e.@"DisplayName".len > 0) e.@"DisplayName" else e.@"Name";
+                const name = if (use_display_name and e.DisplayName.len > 0) e.DisplayName else e.Name;
                 if (name.len > 0) try parts.append(a, name);
             }
             // 上溯：`ParentID == 0` **不是**终点——C# 的 Root 就是 `ID == 0` 的实体，
             // 所以继续找 `findById(0)`；找不到才停（普通表没有 ID=0 的根，自然就停）。
-            if (e.@"ParentID" == e.@"ID") break; // 自己指向自己（根）→ 停
-            cur = self.findById(e.@"ParentID");
+            if (e.ParentID == e.ID) break; // 自己指向自己（根）→ 停
+            cur = self.findById(e.ParentID);
         }
 
         var b: std.ArrayListUnmanaged(u8) = .empty;
@@ -250,14 +250,14 @@ fn lowerAlloc(a: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 fn menu(id: i32, parent: i32, name: []const u8, display: []const u8, full: []const u8, url: []const u8, sort: i32, visible: bool) Menu {
     return .{
-        .@"ID" = id,
-        .@"ParentID" = parent,
-        .@"Name" = name,
-        .@"DisplayName" = display,
-        .@"FullName" = full,
-        .@"Url" = url,
-        .@"Sort" = sort,
-        .@"Visible" = visible,
+        .ID = id,
+        .ParentID = parent,
+        .Name = name,
+        .DisplayName = display,
+        .FullName = full,
+        .Url = url,
+        .Sort = sort,
+        .Visible = visible,
     };
 }
 
@@ -273,13 +273,13 @@ test "菜单索引：按 ID/Name/FullName/Url 查找（后三者忽略大小写�
     var idx = try Index.buildAlloc(a, &list);
     defer idx.deinit();
 
-    try std.testing.expectEqualStrings("System", idx.findById(1).?.@"Name");
+    try std.testing.expectEqualStrings("System", idx.findById(1).?.Name);
     try std.testing.expect(idx.findById(99) == null);
 
     // 忽略大小写
-    try std.testing.expectEqualStrings("User", idx.findByName("user").?.@"Name");
-    try std.testing.expectEqualStrings("User", idx.findByFullName("system/USER").?.@"Name");
-    try std.testing.expectEqualStrings("Role", idx.findByUrl("/SYSTEM/Role").?.@"Name");
+    try std.testing.expectEqualStrings("User", idx.findByName("user").?.Name);
+    try std.testing.expectEqualStrings("User", idx.findByFullName("system/USER").?.Name);
+    try std.testing.expectEqualStrings("Role", idx.findByUrl("/SYSTEM/Role").?.Name);
     try std.testing.expect(idx.findByName("nope") == null);
     try std.testing.expect(idx.findByName("") == null);
 }
@@ -300,10 +300,10 @@ test "菜单索引：子菜单按 Sort 降序 + ID 升序；可过滤不可见" 
     const visible = try idx.childrenAlloc(0, false, a);
     defer a.free(visible);
     try std.testing.expectEqual(@as(usize, 4), visible.len); // Root/B/C/A（D 不可见）
-    try std.testing.expectEqual(@as(i32, 0), visible[0].@"ID"); // Sort 100
-    try std.testing.expectEqual(@as(i32, 2), visible[1].@"ID"); // Sort 30 且 ID 小
-    try std.testing.expectEqual(@as(i32, 3), visible[2].@"ID");
-    try std.testing.expectEqual(@as(i32, 1), visible[3].@"ID"); // Sort 10
+    try std.testing.expectEqual(@as(i32, 0), visible[0].ID); // Sort 100
+    try std.testing.expectEqual(@as(i32, 2), visible[1].ID); // Sort 30 且 ID 小
+    try std.testing.expectEqual(@as(i32, 3), visible[2].ID);
+    try std.testing.expectEqual(@as(i32, 1), visible[3].ID); // Sort 10
 
     const all = try idx.childrenAlloc(0, true, a);
     defer a.free(all);
@@ -325,7 +325,7 @@ test "菜单索引：按用户资源白名单过滤子菜单（≂ GetMySubMenus
     const mine = try idx.mySubMenusAlloc(0, &.{ 1, 3 }, false, a);
     defer a.free(mine);
     try std.testing.expectEqual(@as(usize, 1), mine.len);
-    try std.testing.expectEqual(@as(i32, 1), mine[0].@"ID");
+    try std.testing.expectEqual(@as(i32, 1), mine[0].ID);
 
     // 含不可见 → A + C
     const mine_all = try idx.mySubMenusAlloc(0, &.{ 1, 3 }, true, a);
