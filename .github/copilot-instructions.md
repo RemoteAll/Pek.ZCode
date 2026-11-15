@@ -148,6 +148,11 @@
     本驱动「INSERT 与 identity 查询分两次发」，会恒为 NULL）。
     定位这类问题**别再猜规范**：`tools/tds_probe7.ps1`（冒充服务端抓 sqlcmd 的 batch 字节）、
     `tools/tds_probe8.ps1`（MITM 抓 `System.Data.SqlClient` 的 RPC 字节）能直接给出权威字节。
+  - **SQL Server 已知缺陷（2026-11-15，未修，优先级不低）**：同一 Dal 上「主会话已在用」时再开
+    **第二条** SQL Server 连接会**卡在 TDS 握手**。已排除的两层（别重复查）：`tools/tds_probe9.ps1`
+    实测同一管道的第二次 `CreateFileW` 只要 6ms（不阻塞），两个 sqlcmd 并发连同一实例也完全正常。
+    ⇒ 卡点在我们自己的握手路径。**因此 `pool.zig` 的连接池目前不要给 SQL Server 开多连接**；
+    版本探测也因此保持保守档（探版本要开第二条连接，会把握手卡死）。
   - `tools/regression.ps1` 会探测 5433/3307，在跑就自动带上真库用例，不在跑就显式 SKIP（不会静默跳过）。
 
 - `zig 0.17.1`（VS Code Zig 扩展托管，`zig.exe` 已在 PATH；0.17.0 已验证同行为）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
