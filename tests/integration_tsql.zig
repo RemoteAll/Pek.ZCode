@@ -488,4 +488,3 @@ test "SQL Server 真库：建表 → 插入（自增回写 + 显式写 IDENTITY�
     try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
     try std.testing.expectEqual(@as(i64, 1), try table.count(&s, null));
 }
-
