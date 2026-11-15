@@ -39,6 +39,12 @@ pub const Cond = struct {
 pub const Where = struct {
     a: std.mem.Allocator,
     conds: std.ArrayList(Cond) = .empty,
+    /// 条件内部借用的文本（如 `anyLike` 的 pattern）：由 `Where` 持有到 `deinit`。
+    ///
+    /// 为什么要有它：`anyLike` 把同一个 pattern 填进 N 个 `Value.text`，如果只记录指针
+    /// 而不持有内存，调用方（如 `search.applyKeys`）一 free，条件里就全是悬空切片
+    /// （2026-11-15 单测实测：`params.items[0].text` 读出垃圾）。
+    owned_text: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(a: std.mem.Allocator) Where {
         return .{ .a = a };
@@ -49,6 +55,8 @@ pub const Where = struct {
             if (c.owns_column) self.a.free(c.column);
             self.a.free(c.values);
         }
+        for (self.owned_text.items) |t| self.a.free(t);
+        self.owned_text.deinit(self.a);
         self.conds.deinit(self.a);
     }
 
@@ -146,6 +154,12 @@ pub const Where = struct {
     /// 任一列模糊匹配：`(c1 LIKE ? OR c2 LIKE ? ...)`（关键字搜索语义）。
     pub fn anyLike(self: *Where, columns: []const []const u8, pattern: []const u8) !*Where {
         if (columns.len == 0) return self;
+
+        // pattern 由 `Where` 自己复制并持有（N 个 Value 共用同一份，deinit 时释放一次）
+        const owned = try self.a.dupe(u8, pattern);
+        errdefer self.a.free(owned);
+        try self.owned_text.append(self.a, owned);
+
         var expr: std.ArrayList(u8) = .empty;
         defer expr.deinit(self.a);
         for (columns, 0..) |c, i| {
@@ -155,7 +169,52 @@ pub const Where = struct {
         }
         const fragment = try std.fmt.allocPrint(self.a, "({s})", .{expr.items});
         const vals = try self.a.alloc(Value, columns.len);
-        for (vals) |*v| v.* = .{ .text = pattern };
+        for (vals) |*v| v.* = .{ .text = owned };
+        return self.appendOwnedAll(fragment, .raw, vals);
+    }
+
+    /// 关键字模糊匹配（≂ C# `FieldItem.Contains`）：把**原始关键字**转义后包成 `%kw%`，
+    /// 生成 `(c1 LIKE ? ESCAPE '!' OR c2 LIKE ? ESCAPE '!')`。
+    ///
+    /// 与 `anyLike` 的分工：`anyLike` 收的是**已完成的 pattern**（`%k%`），调用方自己负责
+    /// 通配符语义；本函数收的是**用户输入**，库负责转义。不转义时用户搜 `50%` 会变成
+    /// 「50 开头的任意串」，是静默错。
+    ///
+    /// 转义符特意用 `'!'` 而不是 `'\'`：`ESCAPE '\'` 在 SQLite/PG/SQL Server/Oracle 上都行，
+    /// 但 **MySQL 的字符串字面量里反斜杠本身要写两次**（`'\\'`），同一段静态 SQL 无法两边都对；
+    /// `!` 在所有方言里都是普通字符，一套 SQL 通吃。
+    pub fn anyLikeEscaped(self: *Where, columns: []const []const u8, keyword: []const u8) !*Where {
+        if (columns.len == 0) return self;
+
+        var pat: std.ArrayList(u8) = .empty;
+        defer pat.deinit(self.a);
+        try pat.append(self.a, '%');
+        for (keyword) |c| {
+            switch (c) {
+                '!', '%', '_' => {
+                    try pat.append(self.a, '!');
+                    try pat.append(self.a, c);
+                },
+                else => try pat.append(self.a, c),
+            }
+        }
+        try pat.append(self.a, '%');
+
+        // pattern 由 `Where` 自己复制并持有（N 个 Value 共用同一份，deinit 时释放一次）
+        const owned = try self.a.dupe(u8, pat.items);
+        errdefer self.a.free(owned);
+        try self.owned_text.append(self.a, owned);
+
+        var expr: std.ArrayList(u8) = .empty;
+        defer expr.deinit(self.a);
+        for (columns, 0..) |c, i| {
+            if (i > 0) try expr.appendSlice(self.a, " OR ");
+            try expr.appendSlice(self.a, c);
+            try expr.appendSlice(self.a, " LIKE ? ESCAPE '!'");
+        }
+        const fragment = try std.fmt.allocPrint(self.a, "({s})", .{expr.items});
+        const vals = try self.a.alloc(Value, columns.len);
+        for (vals) |*v| v.* = .{ .text = owned };
         return self.appendOwnedAll(fragment, .raw, vals);
     }
 

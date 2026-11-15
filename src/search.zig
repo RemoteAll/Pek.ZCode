@@ -26,6 +26,15 @@
 const std = @import("std");
 const model = @import("model.zig");
 const tmpl = @import("sqltemplate.zig");
+const query_mod = @import("query.zig");
+const Where = query_mod.Where;
+const OrderBy = query_mod.OrderBy;
+const Query = query_mod.Query;
+const expression = @import("expression.zig");
+const Value = @import("zzig").db.Value;
+const Dal = @import("dal.zig").Dal;
+const Session = @import("session.zig").Session;
+const entity = @import("entity.zig");
 
 /// 参数语义
 pub const Kind = enum {
@@ -352,4 +361,449 @@ test "搜索推导 - ShowIn 显式 Show/Hide 覆盖推导结果" {
     const cols = try searchColumnsAlloc(a, &m.tables[0]);
     try std.testing.expectEqual(@as(usize, 1), cols.len);
     try std.testing.expectEqualStrings("Remark", cols[0].name);
+}
+
+// ══════════════════ 执行侧（≂ C# `Entity.Search` 系列） ══════════════════
+//
+// 上面那半是「模型 → 参数计划」（C# `SearchBuilder` 的产出）；
+// 下面这半是「用户输入 → 条件 → 分页查询」，也就是 C# 页面代码里手写的那段。
+//
+// 三条必须照抄 C# 的规则：
+// 1. **按空白拆词，词之间 AND**（`SearchWhereByKeys`：`keys.Split(' ')` 后 `exp &= ...`）；
+// 2. **每个词对所有字符串列 OR LIKE**（`SearchWhereByKey`：`fields` 为空取 `Meta.Fields`，
+//    再 `item.Type != typeof(String) continue`）；
+// 3. **通配符转义**（C# `Contains` → `FormatLike`：`%`→`\%`、`_`→`\_`、`'`→`''`）。
+//    不转义时用户搜 `50%` 会变成「50 开头的任意串」，是静默错。
+
+pub const ApplyError = error{
+    /// `fields` / `time_column` / 排序里给了模型没有的列
+    NoField,
+} || std.mem.Allocator.Error;
+
+/// 搜索选项（≂ C# `Search(key, PageParameter)` 的参数集合）。
+pub const QueryOptions = struct {
+    /// 参与 LIKE 的列（按名，忽略大小写）；**null 或空 = 模型里所有字符串列**。
+    /// 给了非字符串列 → 跳过（照 C# `Contains` 只支持 String）。
+    fields: ?[]const []const u8 = null,
+    /// 时间列（null = 模型里 `Master="True"` 的列；找不到就不加时间条件）
+    time_column: ?[]const u8 = null,
+    /// 时间窗起点（null = 不限）
+    time_start: ?Value = null,
+    /// 时间窗终点（null = 不限）
+    time_end: ?Value = null,
+    /// 右端是否闭区间。缺省 **false = 左闭右开**（对齐 C# DateTime 的 `Between`）；
+    /// 整数日期（`20250101` 这种）需要两端闭合时显式传 true。
+    time_end_inclusive: bool = false,
+    /// 排序（复用 `Query.OrderBy`，列名按模型校验）
+    orders: []const OrderBy = &.{},
+    /// 页码（从 1 开始）
+    page_index: usize = 1,
+    /// 每页行数（0 = 不分页；大表请配合 `Setting.max_query_rows`）
+    page_size: usize = 20,
+};
+
+/// 搜索结果（≂ C# `PageParameter` 回填的 `TotalCount`）。
+pub fn Page(comptime T: type) type {
+    return struct {
+        rows: []T,
+        /// 满足条件的**总行数**（不受分页影响）
+        total: i64,
+        page_index: usize,
+        page_size: usize,
+
+        /// 总页数（`page_size = 0` 表示不分页 → 1 页）。
+        pub fn totalPages(self: @This()) usize {
+            if (self.page_size == 0) return 1;
+            const t: usize = if (self.total <= 0) 0 else @intCast(self.total);
+            return (t + self.page_size - 1) / self.page_size;
+        }
+    };
+}
+
+/// 收集参与搜索的列（返回**物理**列名，可直接进 SQL）。`fields` 为空 → 所有字符串列。
+fn collectSearchColumns(
+    gpa: std.mem.Allocator,
+    table: *const model.TableMeta,
+    fields: ?[]const []const u8,
+) ApplyError![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    if (fields) |names| {
+        if (names.len > 0) {
+            for (names) |n| {
+                const col = table.column(n) orelse return ApplyError.NoField;
+                if (col.data_type != .string) continue;
+                try out.append(gpa, table.effectiveColumnName(col));
+            }
+            return out.toOwnedSlice(gpa);
+        }
+    }
+
+    for (table.columns) |*col| {
+        if (col.data_type != .string) continue;
+        try out.append(gpa, table.effectiveColumnName(col));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// 「空格分隔的关键字」→ 条件：每个词一次「多列 OR LIKE」，**词之间 AND**。
+///
+/// ≂ C# `SearchWhereByKeys`：空串不加条件；按空白拆（去空项）、逐项 `Trim` 后再判空。
+/// **返回实际追加的条件条数**（0 = 没搜索，等于全量）。
+///
+/// 通配符按 C# `FormatLike` 转义后再包 `%...%`：搜 `50%` 是「含 50% 这个串」。
+pub fn applyKeys(
+    w: *Where,
+    gpa: std.mem.Allocator,
+    table: *const model.TableMeta,
+    keys: []const u8,
+    fields: ?[]const []const u8,
+) ApplyError!usize {
+    if (keys.len == 0) return 0;
+
+    const cols = try collectSearchColumns(gpa, table, fields);
+    defer gpa.free(cols);
+    if (cols.len == 0) return 0; // 没有字符串列 → 搜不出东西，也不该加条件
+
+    var added: usize = 0;
+    var it = std.mem.tokenizeAny(u8, keys, " \t\r\n");
+    while (it.next()) |raw| {
+        const word = std.mem.trim(u8, raw, " \t\r\n");
+        if (word.len == 0) continue;
+
+        // 转义与 `%...%` 包装由 `anyLikeEscaped` 负责（含 `ESCAPE '!'` 子句）
+        _ = try w.anyLikeEscaped(cols, word);
+        added += 1;
+    }
+    return added;
+}
+
+/// 值比较（只用于判断时间窗 `start` 与 `end` 的先后；判不了就返回 null = 不做判定）。
+fn valueOrder(x: Value, y: Value) ?std.math.Order {
+    if (x.asI64()) |xi| {
+        if (y.asI64()) |yi| {
+            if (xi < yi) return .lt;
+            if (xi > yi) return .gt;
+            return .eq;
+        }
+    }
+    if (x.asText()) |xs| {
+        if (y.asText()) |ys| return std.mem.order(u8, xs, ys);
+    }
+    return null;
+}
+
+/// 追加时间窗条件（≂ C# `FieldExtension.Between` 的 DateTime / Int64 两个重载）。
+///
+/// - 缺省**左闭右开**（DateTime 口径）：`>= start` / `< end`；
+/// - `end_inclusive = true` 时**两端闭合**（Int64 口径）：`>= start` / `<= end`，
+///   且 `start == end` 退化成 `=`；
+/// - `start > end` → **不加条件**（C# 返回空表达式；宁可搜出全部也不生成恒假条件）。
+///
+/// 返回 false 表示「没加任何条件」（两端都没给 / 模型没有时间列 / start > end）。
+pub fn applyTimeRange(
+    w: *Where,
+    table: *const model.TableMeta,
+    time_column: ?[]const u8,
+    start: ?Value,
+    end: ?Value,
+    end_inclusive: bool,
+) ApplyError!bool {
+    if (start == null and end == null) return false;
+
+    const col = blk: {
+        if (time_column) |name| break :blk table.column(name) orelse return ApplyError.NoField;
+        for (table.columns) |*c| {
+            if (c.master) break :blk c;
+        }
+        break :blk null;
+    };
+    if (col == null) return false;
+    const name = table.effectiveColumnName(col.?);
+
+    if (start != null and end != null) {
+        if (valueOrder(start.?, end.?) == .gt) return false;
+    }
+
+    if (start) |s| {
+        if (end != null and end_inclusive and valueOrder(s, end.?) == .eq) {
+            _ = try w.eq(name, s);
+            return true;
+        }
+        _ = try w.ge(name, s);
+    }
+    if (end) |e| {
+        if (end_inclusive) {
+            _ = try w.le(name, e);
+        } else {
+            _ = try w.lt(name, e);
+        }
+    }
+    return true;
+}
+
+/// 按参数计划把**等值过滤**写进条件（`plan.params` 里 `kind == .equal` 的那些）。
+///
+/// `input` 是「参数名 → 值」的映射（通常来自 HTTP 查询串）。缺失的参数跳过、
+/// **值为 null/空串的也跳过**（列表页没填的筛选项等于不筛）。
+pub fn applyEquals(
+    w: *Where,
+    table: *const model.TableMeta,
+    params: []const Param,
+    input: *const std.StringHashMapUnmanaged(Value),
+) ApplyError!usize {
+    var added: usize = 0;
+    for (params) |p| {
+        if (p.kind != .equal) continue;
+        const v = input.get(p.name) orelse continue;
+        if (v.isNull()) continue;
+        if (v.asText()) |t| {
+            if (t.len == 0) continue;
+        }
+        const col = p.column orelse (table.column(p.name) orelse return ApplyError.NoField);
+        _ = try w.eq(table.effectiveColumnName(col), v);
+        added += 1;
+    }
+    return added;
+}
+
+/// 「搜索框」一站式入口：关键字 + 时间窗 + 排序 + 分页，一次返回**行 + 总数**。
+///
+/// ≂ C# `Search(String key, PageParameter page)` —— C# 的 `PageParameter` 会被回填总行数，
+/// 这里直接放进返回值，调用方不必再发一次 `COUNT`。
+///
+/// 返回的实体字符串**借用会话结果 arena**（与 `entity.queryRows` 同口径），
+/// 下次查询或 `Session.resetResults` 后失效；要长留请自己深拷贝。
+pub fn search(
+    dal: *Dal,
+    comptime T: type,
+    s: *Session,
+    keys: []const u8,
+    opt: QueryOptions,
+) !Page(T) {
+    const ref = try dal.table(T.meta.table_name);
+    const gpa = dal.gpa;
+
+    var w = Where.init(gpa);
+    defer w.deinit();
+
+    _ = try applyKeys(&w, gpa, ref.table, keys, opt.fields);
+    _ = try applyTimeRange(&w, ref.table, opt.time_column, opt.time_start, opt.time_end, opt.time_end_inclusive);
+
+    return searchWhere(dal, T, s, &w, opt.orders, opt.page_index, opt.page_size);
+}
+
+/// 已有条件（`Where`）时的一站式入口：条件 + 排序 + 分页 + 总数。
+pub fn searchWhere(
+    dal: *Dal,
+    comptime T: type,
+    s: *Session,
+    w: *const Where,
+    orders: []const OrderBy,
+    page_index: usize,
+    page_size: usize,
+) !Page(T) {
+    const ref = try dal.table(T.meta.table_name);
+    const gpa = dal.gpa;
+
+    var q = Query.init(gpa);
+    defer q.deinit();
+
+    if (!w.isEmpty()) _ = q.filterWhere(w);
+    for (orders) |o| {
+        // 列名按模型校验：外部传入的排序串就是注入面
+        const col = ref.table.column(o.column) orelse return ApplyError.NoField;
+        _ = try q.orderBy(ref.table.effectiveColumnName(col), o.desc);
+    }
+    if (page_size > 0) _ = q.page(if (page_index == 0) 1 else page_index, page_size);
+
+    const rows = try entity.queryRows(dal, T, s, &q);
+    const total = try ref.count(s, w);
+
+    return .{
+        .rows = rows,
+        .total = total,
+        .page_index = if (page_index == 0) 1 else page_index,
+        .page_size = page_size,
+    };
+}
+
+test "搜索执行 - 空格拆词、词间 AND、每词多列 OR LIKE、通配符已转义" {
+    const a = std.testing.allocator;
+    const t = model.TableMeta{
+        .name = "Demo",
+        .table_name = "DH_Demo",
+        .columns = &.{
+            .{ .name = "Name", .data_type = .string },
+            .{ .name = "Code", .data_type = .string, .column_name = "F_Code" },
+            .{ .name = "Age", .data_type = .int32 },
+        },
+    };
+
+    var w = Where.init(a);
+    defer w.deinit();
+
+    const n = try applyKeys(&w, a, &t, "  ab   50%  ", null);
+    try std.testing.expectEqual(@as(usize, 2), n);
+
+    var params: std.ArrayList(Value) = .empty;
+    defer params.deinit(a);
+    const sql = try w.renderAlloc(a, .sqlite, &params);
+    defer a.free(sql);
+
+    try std.testing.expect(std.mem.indexOf(u8, sql, " AND ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "Age") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ESCAPE '!'") != null);
+    try std.testing.expectEqual(@as(usize, 4), params.items.len);
+    try std.testing.expectEqualStrings("%ab%", params.items[0].text);
+    try std.testing.expectEqualStrings("%50!%%", params.items[2].text);
+}
+
+test "搜索执行 - 空关键字/纯空白不加条件；未知列报 NoField；非字符串列跳过" {
+    const a = std.testing.allocator;
+    const t = model.TableMeta{
+        .name = "Demo",
+        .table_name = "DH_Demo",
+        .columns = &.{
+            .{ .name = "Name", .data_type = .string },
+            .{ .name = "Age", .data_type = .int32 },
+        },
+    };
+
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expectEqual(@as(usize, 0), try applyKeys(&w, a, &t, "", null));
+        try std.testing.expectEqual(@as(usize, 0), try applyKeys(&w, a, &t, "   \t ", null));
+        try std.testing.expect(w.isEmpty());
+    }
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expectEqual(@as(usize, 1), try applyKeys(&w, a, &t, "x", &.{ "Name", "Age" }));
+    }
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expectError(ApplyError.NoField, applyKeys(&w, a, &t, "x", &.{"Nope"}));
+    }
+}
+
+test "搜索执行 - 时间窗：左闭右开 / 两端闭合 / start==end 退化 / start>end 不加" {
+    const a = std.testing.allocator;
+    const t = model.TableMeta{
+        .name = "Demo",
+        .table_name = "DH_Demo",
+        .columns = &.{
+            .{ .name = "CreateTime", .data_type = .int64, .master = true },
+            .{ .name = "Name", .data_type = .string },
+        },
+    };
+    const no_time = model.TableMeta{
+        .name = "Demo2",
+        .table_name = "DH_Demo2",
+        .columns = &.{.{ .name = "Name", .data_type = .string }},
+    };
+
+    var params: std.ArrayList(Value) = .empty;
+    defer params.deinit(a);
+
+    // 左闭右开（C# DateTime 口径）
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(try applyTimeRange(&w, &t, null, .{ .int = 100 }, .{ .int = 200 }, false));
+        params.clearRetainingCapacity();
+        const sql = try w.renderAlloc(a, .sqlite, &params);
+        defer a.free(sql);
+        try std.testing.expect(std.mem.indexOf(u8, sql, ">=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sql, "< ?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sql, "<=") == null);
+    }
+
+    // 两端闭合（C# Int64 口径）
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(try applyTimeRange(&w, &t, null, .{ .int = 100 }, .{ .int = 200 }, true));
+        params.clearRetainingCapacity();
+        const sql = try w.renderAlloc(a, .sqlite, &params);
+        defer a.free(sql);
+        try std.testing.expect(std.mem.indexOf(u8, sql, "<=") != null);
+    }
+
+    // start == end 且闭合 → 退化成 `=`
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(try applyTimeRange(&w, &t, null, .{ .int = 100 }, .{ .int = 100 }, true));
+        params.clearRetainingCapacity();
+        const sql = try w.renderAlloc(a, .sqlite, &params);
+        defer a.free(sql);
+        try std.testing.expect(std.mem.indexOf(u8, sql, ">=") == null);
+        try std.testing.expect(std.mem.indexOf(u8, sql, "=") != null);
+    }
+
+    // start > end → 不加条件
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(!try applyTimeRange(&w, &t, null, .{ .int = 200 }, .{ .int = 100 }, true));
+        try std.testing.expect(w.isEmpty());
+    }
+
+    // 两端都没给 / 模型没有 Master 列 → 不加（不报错）
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(!try applyTimeRange(&w, &t, null, null, null, false));
+        try std.testing.expect(!try applyTimeRange(&w, &no_time, null, .{ .int = 1 }, null, false));
+        try std.testing.expect(w.isEmpty());
+    }
+
+    // 显式指定不存在的列 → NoField
+    {
+        var w = Where.init(a);
+        defer w.deinit();
+        try std.testing.expectError(ApplyError.NoField, applyTimeRange(&w, &t, "Nope", .{ .int = 1 }, null, false));
+    }
+}
+
+test "搜索执行 - 等值过滤：只取 .equal 参数，空值跳过，缺失跳过" {
+    const a = std.testing.allocator;
+    const t = model.TableMeta{
+        .name = "Demo",
+        .table_name = "DH_Demo",
+        .columns = &.{
+            .{ .name = "Status", .data_type = .int32 },
+            .{ .name = "ShopId", .data_type = .int32 },
+        },
+    };
+    const status: model.ColumnMeta = .{ .name = "Status", .data_type = .int32 };
+    const shop: model.ColumnMeta = .{ .name = "ShopId", .data_type = .int32 };
+    const params = [_]Param{
+        .{ .name = "Status", .kind = .equal, .column = &status },
+        .{ .name = "ShopId", .kind = .equal, .column = &shop },
+        .{ .name = "key", .kind = .key },
+        .{ .name = "page", .kind = .page },
+    };
+
+    var input: std.StringHashMapUnmanaged(Value) = .empty;
+    defer input.deinit(a);
+    try input.put(a, "Status", .{ .int = 1 });
+    try input.put(a, "key", .{ .text = "abc" }); // kind 不是 .equal → 不参与
+
+    var w = Where.init(a);
+    defer w.deinit();
+
+    const n = try applyEquals(&w, &t, &params, &input);
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    var out: std.ArrayList(Value) = .empty;
+    defer out.deinit(a);
+    const sql = try w.renderAlloc(a, .sqlite, &out);
+    defer a.free(sql);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "Status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sql, "ShopId") == null);
 }

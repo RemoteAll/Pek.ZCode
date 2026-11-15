@@ -600,3 +600,106 @@ test "字段缓存：Code→Id 整表字典 + 写后自动失效 + TTL" {
     fc.invalidate();
     try std.testing.expectEqual(@as(usize, 4), try fc.count(&s));
 }
+
+// ────────────────────────────  关键字搜索（≂ C# Entity.Search）  ────────────────────────────
+
+/// 测试专用实体（映射上面模型里的 `Log` 表）：只为实现搜索用例，字段取用得上的几列。
+const LogRow = struct {
+    Id: i32 = 0,
+    Title: []const u8 = "",
+    dirty: zcode.entity.DirtyBits = 0,
+
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
+        .name = "Log",
+        .table_name = "DH_Log",
+        .fields = &.{
+            .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true },
+            .{ .name = "Title", .data_type = .string, .length = 50 },
+            .{ .name = "CreateTime", .data_type = .datetime, .nullable = true },
+            .{ .name = "UpdateTime", .data_type = .datetime, .nullable = true },
+        },
+    });
+
+    pub fn columnValue(self: LogRow, index: usize) zcode.Value {
+        return switch (index) {
+            0 => .{ .int = self.Id },
+            1 => .{ .text = self.Title },
+            else => .null,
+        };
+    }
+
+    pub fn setColumnValue(self: *LogRow, index: usize, v: zcode.Value) !void {
+        switch (index) {
+            0 => self.Id = v.asI32() orelse 0,
+            1 => self.Title = v.asText() orelse "",
+            else => {},
+        }
+    }
+};
+
+test "搜索：多词 AND / 通配符转义 / 分页总数（真 SQLite）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "search");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Log");
+    for ([_][]const u8{ "abc", "abc-2024", "xyz", "50%", "50x" }) |title| {
+        _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Title", .value = .{ .text = title } },
+        });
+    }
+
+    // ① 单词：命中 2 行（abc / abc-2024）
+    {
+        const r = try zcode.search.search(&dal, LogRow, &s, "abc", .{ .page_size = 0 });
+        try std.testing.expectEqual(@as(i64, 2), r.total);
+        try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+    }
+
+    // ② 多词 AND（≂ C# `SearchWhereByKeys` 的 `exp &= ...`）：只有 "abc-2024" 同时含两个词
+    {
+        const r = try zcode.search.search(&dal, LogRow, &s, "abc 2024", .{ .page_size = 0 });
+        try std.testing.expectEqual(@as(i64, 1), r.total);
+        try std.testing.expectEqualStrings("abc-2024", r.rows[0].Title);
+    }
+
+    // ③ 通配符转义：搜 `50%` 只命中字面量 "50%"，**不能**把 `%` 当通配符（那样 50x 也会命中）
+    {
+        const r = try zcode.search.search(&dal, LogRow, &s, "50%", .{ .page_size = 0 });
+        try std.testing.expectEqual(@as(i64, 1), r.total);
+        try std.testing.expectEqualStrings("50%", r.rows[0].Title);
+    }
+
+    // ④ 分页 + 总数：共 5 行、每页 2 行 → 第 2 页 2 行、第 3 页 1 行、总页数 3
+    {
+        const r = try zcode.search.search(&dal, LogRow, &s, "", .{
+            .page_size = 2,
+            .page_index = 2,
+            .orders = &.{.{ .column = "Id", .desc = false }},
+        });
+        try std.testing.expectEqual(@as(i64, 5), r.total);
+        try std.testing.expectEqual(@as(usize, 2), r.rows.len);
+        try std.testing.expectEqual(@as(usize, 3), r.totalPages());
+
+        const r3 = try zcode.search.search(&dal, LogRow, &s, "", .{
+            .page_size = 2,
+            .page_index = 3,
+            .orders = &.{.{ .column = "Id", .desc = false }},
+        });
+        try std.testing.expectEqual(@as(usize, 1), r3.rows.len);
+    }
+
+    // ⑤ 空关键字 = 不筛（≂ C# IsNullOrEmpty 返回空表达式）
+    {
+        const r = try zcode.search.search(&dal, LogRow, &s, "   ", .{ .page_size = 0 });
+        try std.testing.expectEqual(@as(i64, 5), r.total);
+    }
+}
