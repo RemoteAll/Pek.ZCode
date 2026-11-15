@@ -840,3 +840,209 @@ test "MergeAny：命中更新 / 未命中插入 / trim 删除多余" {
     }
     try testing.expect(found_jia and found_bing);
 }
+
+// ── 实体列表 ↔ 行集 / DbTable v3 二进制包 ──────────────────────────────
+//
+// ≂ C# `EntityExtension.ToTable` / `Write` / `SaveFile` / `LoadFile`：把实体列表变成
+// 「表」或「二进制包」，反过来再变回实体。用途：
+// - 跨进程/跨语言传数据（`dbservice` 用的就是同一个 DbTable v3 格式）；
+// - 落盘归档 / 断点续传（`.db` 包）；
+// - 批量导入前先在内存里做一次「表」形态的整形。
+//
+// 与 C# 的差异：C# 用 `DataTable` / `BinaryWriter`；本仓落到 `dbtable_packet`（v3 格式，
+// 与 C# 侧字节级兼容），实体 ↔ 行集的转换在**列名层面**对齐（用模型列名，不是属性名以外的别名）。
+
+/// 实体列表 → 行集（列名 = 模型列名，顺序与 `T.meta.fields` 一致）。
+///
+/// **字符串/二进制借用实体本身**，不复制：调用方须保证实体在行集使用期间有效。
+/// 内部用一块连续内存装所有值（`rows.len * fields.len` 个 `Value`），
+/// 所以最省心的用法是传 arena 分配器，或者配合 `toPacketAlloc`。
+pub fn toRowsAlloc(comptime T: type, a: std.mem.Allocator, list: []const T) ![]zcode.session.Row {
+    const n = T.meta.fields.len;
+    if (list.len == 0 or n == 0) return &.{};
+
+    const names = try a.alloc([]const u8, n);
+    errdefer a.free(names);
+    for (T.meta.fields, 0..) |f, i| names[i] = f.name;
+
+    const all_values = try a.alloc(Value, n * list.len);
+    errdefer a.free(all_values);
+
+    const rows = try a.alloc(zcode.session.Row, list.len);
+    errdefer a.free(rows);
+    for (list, 0..) |e, r| {
+        const vals = all_values[r * n ..][0..n];
+        for (T.meta.fields, 0..) |_, i| vals[i] = e.columnValue(i);
+        rows[r] = .{ .names = names, .values = vals };
+    }
+    return rows;
+}
+
+/// 模型类型 → .NET `TypeCode`（`dbtable_packet` 的列类型；空列表时要用它显式写表头）。
+fn typeCodeOf(dt: zcode.DataType) @import("dbtable_packet.zig").TypeCode {
+    return switch (dt) {
+        .boolean => .boolean,
+        .byte => .byte,
+        .int16 => .int16,
+        .int32 => .int32,
+        .int64 => .int64,
+        .single => .single,
+        .double => .double,
+        .decimal => .decimal,
+        .datetime => .datetime,
+        // GUID 走 36 位小写文本（见 `DataType.guid` 的注释）
+        .guid => .string,
+        .binary => .object,
+        .json, .string => .string,
+    };
+}
+
+/// 实体列表 → DbTable v3 二进制包（≂ C# `EntityExtension.Write(list, stream)` / `SaveFile`）。
+///
+/// **空列表也合法**：退化成「只有表头、0 行」的包（列类型取模型声明），
+/// 这样「今天没有数据」和「格式坏了」不会混成一个错。
+///
+/// **NULL 不保留**（与 C# 侧同一格式、同一口径）：`dbtable_packet` 把 null 写为空串/0/最小日期，
+/// 读回永远是非 null。需要在包里有「NULL 与空串」的区别时，请另用 JSON 或自定义格式。
+pub fn toPacketAlloc(comptime T: type, a: std.mem.Allocator, list: []const T) ![]u8 {
+    const packet = @import("dbtable_packet.zig");
+
+    if (list.len == 0) {
+        const n = T.meta.fields.len;
+        if (n == 0) return packet.encodeAlloc(a, &.{}, &.{});
+        const cols = try a.alloc(packet.Column, n);
+        defer a.free(cols);
+        for (T.meta.fields, 0..) |f, i| cols[i] = .{ .name = f.name, .type = typeCodeOf(f.data_type) };
+        return packet.encodeAlloc(a, cols, &.{});
+    }
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const rows = try toRowsAlloc(T, arena.allocator(), list);
+    return packet.encodeRowsAlloc(a, rows);
+}
+
+/// DbTable v3 二进制包 → 实体列表（≂ C# `EntityExtension.LoadFile`）。
+///
+/// 字符串深拷贝到 `a`（与 `entity.fromRows` 同口径），可以安全跨越解码缓冲的生命周期。
+/// 注意：包里的 NULL 在 v3 格式中不存在（写侧已变成空串/0），详见 `toPacketAlloc` 的说明。
+pub fn fromPacketAlloc(comptime T: type, a: std.mem.Allocator, bytes: []const u8) ![]T {
+    const packet = @import("dbtable_packet.zig");
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ra = arena.allocator();
+
+    const d = try packet.decodeAlloc(ra, bytes);
+    if (d.rows.len == 0) return try a.alloc(T, 0);
+
+    const rows = try ra.alloc(zcode.session.Row, d.rows.len);
+    for (d.rows, 0..) |vals, i| rows[i] = .{ .names = d.columns, .values = vals };
+
+    return zcode.entity.fromRows(T, a, rows);
+}
+
+/// 测试专用实体（覆盖 int / string / 可空 string 三种列）
+const PacketRow = struct {
+    Id: i32 = 0,
+    Name: []const u8 = "",
+    Score: i64 = 0,
+    Note: ?[]const u8 = null,
+    dirty: zcode.entity.DirtyBits = 0,
+
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
+        .name = "PacketRow",
+        .table_name = "DH_PacketRow",
+        .fields = &.{
+            .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true },
+            .{ .name = "Name", .data_type = .string, .length = 50 },
+            .{ .name = "Score", .data_type = .int64 },
+            .{ .name = "Note", .data_type = .string, .nullable = true },
+        },
+    });
+
+    pub fn columnValue(self: PacketRow, index: usize) Value {
+        return switch (index) {
+            0 => .{ .int = self.Id },
+            1 => .{ .text = self.Name },
+            2 => .{ .int = self.Score },
+            3 => if (self.Note) |n| .{ .text = n } else .null,
+            else => .null,
+        };
+    }
+
+    pub fn setColumnValue(self: *PacketRow, index: usize, v: Value) !void {
+        switch (index) {
+            0 => self.Id = v.asI32() orelse 0,
+            1 => self.Name = v.asText() orelse "",
+            2 => self.Score = v.asI64() orelse 0,
+            3 => self.Note = v.asText(),
+            else => {},
+        }
+    }
+};
+
+test "实体列表 → 行集：列名取模型名、值不复制（借用实体）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const list = [_]PacketRow{
+        .{ .Id = 1, .Name = "甲", .Score = 10 },
+        .{ .Id = 2, .Name = "乙", .Score = -5, .Note = "备注" },
+    };
+
+    const rows = try toRowsAlloc(PacketRow, arena.allocator(), &list);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(usize, 4), rows[0].names.len);
+    try std.testing.expectEqualStrings("Id", rows[0].names[0]);
+    try std.testing.expectEqualStrings("Note", rows[0].names[3]);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[0].int);
+    try std.testing.expectEqualStrings("乙", rows[1].values[1].text);
+    try std.testing.expect(rows[0].values[3].isNull());
+    try std.testing.expectEqualStrings("备注", rows[1].values[3].text);
+}
+
+test "实体列表 → DbTable 二进制包 → 实体列表（往返，含中文与 NULL）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const list = [_]PacketRow{
+        .{ .Id = 1, .Name = "甲", .Score = 10 },
+        .{ .Id = 2, .Name = "乙", .Score = -5, .Note = "备注" },
+        .{ .Id = 3, .Name = "", .Score = 0 },
+    };
+
+    const bytes = try toPacketAlloc(PacketRow, a, &list);
+    try std.testing.expect(bytes.len > 16);
+
+    const back = try fromPacketAlloc(PacketRow, a, bytes);
+    try std.testing.expectEqual(@as(usize, 3), back.len);
+    try std.testing.expectEqual(@as(i32, 1), back[0].Id);
+    try std.testing.expectEqualStrings("甲", back[0].Name);
+    try std.testing.expectEqual(@as(i64, -5), back[1].Score);
+    try std.testing.expectEqualStrings("备注", back[1].Note.?);
+    // **口径**：DbTable v3 格式（与 C# 侧字节兼容）不携带 NULL 语义——
+    // `appendValue` 把 null 写成空串/0/最小日期，`readValue` 永远返回非 null。
+    // 所以这里的 NULL 读回是空串；要区分 NULL 请另用 JSON/自定义格式。
+    try std.testing.expectEqualStrings("", back[0].Note.?);
+    try std.testing.expectEqualStrings("", back[2].Name);
+}
+
+test "空列表也能出包（只有表头、0 行）——不是错误" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bytes = try toPacketAlloc(PacketRow, a, &.{});
+    const packet = @import("dbtable_packet.zig");
+    const d = try packet.decodeAlloc(a, bytes);
+
+    try std.testing.expectEqual(@as(usize, 4), d.columns.len);
+    try std.testing.expectEqualStrings("Id", d.columns[0]);
+    try std.testing.expectEqual(@as(usize, 0), d.rows.len);
+
+    const back = try fromPacketAlloc(PacketRow, a, bytes);
+    try std.testing.expectEqual(@as(usize, 0), back.len);
+}
+
