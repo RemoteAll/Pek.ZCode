@@ -128,8 +128,11 @@
 - **本地真库**（免安装，数据在仓库 `.tools\` 下，已 gitignore）：
   - MySQL：`tools/mysql-local.ps1`（3307，`G:\Tools\mysql-portable\mysql-8.0.29-winx64`）
   - PostgreSQL：`tools/pg-local.ps1`（5433，`G:\Tools\pgsql-portable\pgsql`，PG 16.2，来自阿里云 Maven 的 zonky 包）
-  - SQL Server：只有 **LocalDB**（`tools/mssql-local.ps1`）——它**只支持 Windows 认证且不开 TCP**，
-    ZCode 的 TDS 驱动（仅 SQL 账号认证）**连不上**；只能 `sqlcmd` 手工验证。驱动级真库验证需要 SQL Server Express。
+  - SQL Server：**LocalDB 可用**（2026-11-15 实测纠正：`IsIntegratedSecurityOnly=0` **允许 SQL 认证**，
+    且 TDS 驱动支持命名管道）——`powershell -File tools/mssql-local.ps1 -Action connstr` 会幂等建
+    `zcode_test` 库 + `zcode_t` 登录并**打印可用的 `-Dsqlserver-conn`**（管道名 `LOCALDB#XXXX` 每次启动会变，别手写死）。
+    仍然成立：LocalDB **不开 TCP**，只能走管道。**已知待修**：`zzig` 的 `PRELOGIN` 被真服务器断开（`233`），
+    握手未打通；假服务端验不出这类问题。**不需要装 SQL Server Express**（只有要测 TCP/TLS/MARS 时才考虑）。
   - `tools/regression.ps1` 会探测 5433/3307，在跑就自动带上真库用例，不在跑就显式 SKIP（不会静默跳过）。
 
 - `zig 0.17.1`（VS Code Zig 扩展托管，`zig.exe` 已在 PATH；0.17.0 已验证同行为）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
