@@ -282,6 +282,42 @@ pub fn main(init: std.process.Init) !void {
         try results.append(gpa, .{ .name = "导航批量填充（5 主键）", .total_ns = nowNs() - start, .iterations = n });
     }
 
+    // 8.5) 关键字搜索：拆词 + 多列 OR LIKE + 渲染 SQL（真实用法是「新建条件 → 拼进查询」）
+    {
+        const n = 20_000;
+        var i: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            var w = zcode.Where.init(gpa);
+            defer w.deinit();
+            _ = try zcode.search.applyKeys(&w, gpa, table.table, "hello world", null);
+
+            var params: std.ArrayList(zcode.Value) = .empty;
+            defer params.deinit(gpa);
+            const sql = try w.renderAlloc(gpa, .sqlite, &params);
+            gpa.free(sql);
+        }
+        try results.append(gpa, .{ .name = "关键字搜索（2 词 × 字符串列）", .total_ns = nowNs() - start, .iterations = n });
+    }
+
+    // 8.6) 同上，关键字含 `%` / `_` / `!` → 走转义分支（`anyLikeEscaped` 的 `!` 转义）
+    {
+        const n = 20_000;
+        var i: usize = 0;
+        const start = nowNs();
+        while (i < n) : (i += 1) {
+            var w = zcode.Where.init(gpa);
+            defer w.deinit();
+            _ = try zcode.search.applyKeys(&w, gpa, table.table, "50%_!x", null);
+
+            var params: std.ArrayList(zcode.Value) = .empty;
+            defer params.deinit(gpa);
+            const sql = try w.renderAlloc(gpa, .sqlite, &params);
+            gpa.free(sql);
+        }
+        try results.append(gpa, .{ .name = "关键字搜索（含通配符转义）", .total_ns = nowNs() - start, .iterations = n });
+    }
+
     // 9) 脏状态探查（u256 位运算，零分配；对照 Rust `perf_guard` 的 dirty_probe）
     {
         const n = 2_000_000;
