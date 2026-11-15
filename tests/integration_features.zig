@@ -703,3 +703,74 @@ test "搜索：多词 AND / 通配符转义 / 分页总数（真 SQLite）" {
         try std.testing.expectEqual(@as(i64, 5), r.total);
     }
 }
+
+// ── 业务唯一性检查（≂ C# Entity.Exist / CheckExist） ──
+
+test "唯一性检查：命中别人算冲突、命中自己不算、多行必冲突（真 SQLite）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "exist");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var dal = try openDalFile(a, path);
+    defer dal.deinit();
+    var s = try dal.openSession();
+    defer s.deinit();
+
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Log");
+    const id1 = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "dup" } },
+    });
+
+    // ① 新对象（Id 还没赋值）+ 同 Title → 冲突
+    {
+        const fresh = LogRow{ .Title = "dup" };
+        try std.testing.expect(try zcode.entity.exist(&dal, &fresh, &s, &.{"Title"}, true));
+    }
+
+    // ② 老对象（Id 就是命中的那一行）+ is_new = false → **不算**冲突（改自己）
+    {
+        const self_row = LogRow{ .Id = @intCast(id1), .Title = "dup" };
+        try std.testing.expect(!try zcode.entity.exist(&dal, &self_row, &s, &.{"Title"}, false));
+    }
+
+    // ③ 同上但 is_new = true：主键是自增（插入时会被换掉），所以仍按「比主键」判定 → 不算冲突
+    {
+        const self_row = LogRow{ .Id = @intCast(id1), .Title = "dup" };
+        try std.testing.expect(!try zcode.entity.exist(&dal, &self_row, &s, &.{"Title"}, true));
+    }
+
+    // ④ 再插一行同名 → 匹配到 2 行，任何情况都是冲突
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Title", .value = .{ .text = "dup" } },
+    });
+    {
+        const fresh = LogRow{ .Title = "dup" };
+        try std.testing.expect(try zcode.entity.exist(&dal, &fresh, &s, &.{"Title"}, true));
+    }
+
+    // ⑤ 查不到 → 不冲突
+    {
+        const other = LogRow{ .Title = "nope" };
+        try std.testing.expect(!try zcode.entity.exist(&dal, &other, &s, &.{"Title"}, true));
+    }
+
+    // ⑥ checkExist 冲突时返回 error.DuplicateValue；提示串含表描述与「已存在！」
+    {
+        const fresh = LogRow{ .Title = "dup" };
+        try std.testing.expectError(error.DuplicateValue, zcode.entity.checkExist(&dal, &fresh, &s, &.{"Title"}, true));
+
+        const msg = try zcode.entity.describeExistAlloc(&dal, &fresh, &.{"Title"});
+        defer a.free(msg);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Title=dup") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "已存在！") != null);
+    }
+
+    // ⑦ 实体里没有的列 → error.NoField（外部输入的安全边界）
+    {
+        const fresh = LogRow{ .Title = "dup" };
+        try std.testing.expectError(error.NoField, zcode.entity.exist(&dal, &fresh, &s, &.{"Nope"}, true));
+    }
+}

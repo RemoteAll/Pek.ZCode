@@ -808,6 +808,126 @@ pub fn findByPk(dal: *Dal, comptime T: type, s: *Session, pk_values: []const Val
     return try fromRow(T, row);
 }
 
+// ── 业务唯一性检查（≂ C# `Entity.Exist` / `CheckExist`） ─────────────────────
+
+/// 唯一键列（≂ C# `Meta.Unique`）：**单列主键** → 该列；否则**自增列**；都没有 → null。
+pub fn uniqueColumn(gpa: std.mem.Allocator, t: *const TableMeta) !?*const model.ColumnMeta {
+    const pks = try t.primaryKeys(gpa);
+    defer gpa.free(pks);
+    if (pks.len == 1) return pks[0];
+    for (t.columns) |*c| {
+        if (c.identity) return c;
+    }
+    return null;
+}
+
+/// 业务唯一性检查（≂ C# `Entity.Exist(Boolean isNew, params String[] names)`）。
+///
+/// 语义逐条对齐 C#（`Entity.cs:566`）：
+/// 1. 用**实体当前值**按 `names` 构造 `AND` 条件查匹配行数；
+/// 2. 0 行 → false；**多于 1 行 → true**（本来就撞了）；
+/// 3. 恰好 1 行时：`is_new` 且唯一键**不是自增**（Guid / 业务主键，插入时不会被换值）→ true；
+///    否则比较「查到那一行的唯一键」与「实体自己的唯一键」，**不是自己**才算冲突。
+///
+/// 没有唯一键（既无单列主键也无自增列）→ 返回 false（C# `Meta.Unique == null` 同样返回 false）。
+pub fn exist(dal: *Dal, e: anytype, s: *Session, names: []const []const u8, is_new: bool) !bool {
+    const T = @TypeOf(e.*);
+    const meta = T.meta;
+    const t = try tableOf(dal, meta);
+    const gpa = dal.gpa;
+
+    const uk = (try uniqueColumn(gpa, t)) orelse return false;
+    if (names.len == 0) return false;
+
+    var w = Where.init(gpa);
+    defer w.deinit();
+
+    for (names) |name| {
+        const idx = fieldIndex(meta, name) orelse return error.NoField;
+        const col = t.column(name) orelse return error.NoField;
+        _ = try w.eq(t.effectiveColumnName(col), e.columnValue(idx));
+    }
+
+    const ref = try dal.table(meta.table_name);
+    const matches = try ref.count(s, &w);
+    if (matches <= 0) return false;
+    if (matches > 1) return true;
+
+    // 唯一键不是自增：新对象插入时这个值不会被数据库换掉，命中即冲突
+    if (is_new and !uk.identity) return true;
+
+    // 恰好 1 行：取出那一行的唯一键，和「自己」比
+    var q = Query.init(gpa);
+    defer q.deinit();
+    _ = q.filterWhere(&w);
+    _ = try q.column(t.effectiveColumnName(uk));
+    _ = q.take(1);
+
+    const rows = try ref.queryRows(s, &q);
+    if (rows.len == 0) return false;
+
+    const own_idx = fieldIndex(meta, uk.name) orelse return error.NoField;
+    return !valueEql(e.columnValue(own_idx), rows[0].values[0]);
+}
+
+/// 冲突时返回 `error.DuplicateValue` 并打印说明（≂ C# 的 `CheckExist`：抛 `ArgumentOutOfRangeException`）。
+///
+/// 只想拿布尔值时用 `exist`；要中断流程用本函数。提示串由 `describeExistAlloc` 生成。
+pub fn checkExist(dal: *Dal, e: anytype, s: *Session, names: []const []const u8, is_new: bool) !void {
+    if (!try exist(dal, e, s, names, is_new)) return;
+
+    const msg: ?[]u8 = describeExistAlloc(dal, e, names) catch null;
+    defer if (msg) |m| dal.gpa.free(m);
+    std.debug.print("[zcode] 唯一键冲突：{s}\n", .{msg orelse "（无法生成说明）"});
+    return error.DuplicateValue;
+}
+
+/// 冲突提示串（≂ C# `CheckExist` 里的拼装规则）：
+/// 每项 `列描述或列名=值` 用 `，` 连接，末尾 ` 的{表描述或实体名}已存在！`；
+/// 表描述取 `。` / `，` 之前的那一段（C# 同样截断）。
+pub fn describeExistAlloc(dal: *Dal, e: anytype, names: []const []const u8) ![]u8 {
+    const T = @TypeOf(e.*);
+    const meta = T.meta;
+    const gpa = dal.gpa;
+
+    var b: std.ArrayList(u8) = .empty;
+    errdefer b.deinit(gpa);
+
+    for (names, 0..) |name, i| {
+        const idx = fieldIndex(meta, name) orelse return error.NoField;
+        if (i > 0) try b.appendSlice(gpa, "，");
+
+        const label = blk: {
+            for (meta.fields, 0..) |f, k| {
+                if (k == idx and f.description.len > 0) break :blk f.description;
+            }
+            break :blk name;
+        };
+        const v = try e.columnValue(idx).toTextAlloc(gpa);
+        defer gpa.free(v);
+        const piece = try std.fmt.allocPrint(gpa, "{s}={s}", .{ label, v });
+        defer gpa.free(piece);
+        try b.appendSlice(gpa, piece);
+    }
+
+    var table_label: []const u8 = meta.name;
+    {
+        const t = try tableOf(dal, meta);
+        if (t.description.len > 0) {
+            var cut = t.description.len;
+            if (std.mem.indexOfAny(u8, t.description, "。，")) |p| {
+                if (p > 0) cut = p;
+            }
+            table_label = t.description[0..cut];
+        }
+    }
+
+    try b.appendSlice(gpa, " 的");
+    try b.appendSlice(gpa, table_label);
+    try b.appendSlice(gpa, "已存在！");
+    return b.toOwnedSlice(gpa);
+}
+
 /// 条件查询（分页/排序/列选择同 `Query`）。
 pub fn queryRows(dal: *Dal, comptime T: type, s: *Session, q: *const Query) ![]T {
     const ref = try dal.table(T.meta.table_name);
