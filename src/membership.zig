@@ -23,6 +23,8 @@ pub const rules = @import("membership/rules.zig");
 pub const area = @import("membership/area.zig");
 /// 登录提供者（LoginCore 八步 / 注册 / 改密，数据读写由 UserStore 注入）。
 pub const provider = @import("membership/provider.zig");
+/// 多租户数据隔离（C# `ITenantSource.cs`：条件补全 + 插入补租户）。
+pub const tenant = @import("membership/tenant.zig");
 /// 九张表的实体（由 `Member.xml` 生成）。
 pub const entities = @import("membership/entities/mod.zig");
 
@@ -45,6 +47,9 @@ pub const OrmStore = provider.OrmStore;
 pub const deepCopyAlloc = provider.deepCopyAlloc;
 
 pub const LogActions = log.action;
+pub const TenantContext = tenant.Context;
+pub const TenantInterceptor = tenant.Interceptor;
+pub const applyTenant = tenant.applyTenant;
 
 test {
     _ = enums;
@@ -54,5 +59,6 @@ test {
     _ = rules;
     _ = area;
     _ = provider;
+    _ = tenant;
     _ = entities;
 }

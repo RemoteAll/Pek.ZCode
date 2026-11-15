@@ -905,3 +905,100 @@ test "单对象缓存：未配置从键时明确报错，不把『没配』当�
     var ctx = ByTitleCtx{ .dal = &dal };
     try std.testing.expectError(error.SlaveKeyNotConfigured, sc.getBySlave(&s, "x", &ctx, findLogByTitle));
 }
+
+// ── 多租户隔离（≂ C# ITenantSource.cs） ──
+
+const tenant_model_xml =
+    \\<EntityModel><Tables><Table Name="TOrder" TableName="DH_TOrder">
+    \\  <Columns>
+    \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+    \\    <Column Name="TenantId" DataType="Int32" />
+    \\    <Column Name="Code" DataType="String" Length="50" />
+    \\  </Columns>
+    \\</Table></Tables></EntityModel>
+;
+
+test "多租户隔离：插入自动补 TenantId，查询按 TenantId 过滤（真 SQLite）" {
+    const a = std.testing.allocator;
+    const path = try tempDbPath(a, "tenant");
+    defer a.free(path);
+    defer zcode.File.DeleteQuiet(path);
+
+    var m = try zcode.EntityModel.parse(a, tenant_model_xml);
+    errdefer m.deinit();
+    const conn = try std.fmt.allocPrint(a, "Data Source={s};Provider=SQLite", .{path});
+    defer a.free(conn);
+    var dal = try zcode.Dal.initWithModel(a, conn, m);
+    defer dal.deinit();
+
+    var s = try dal.openSession();
+    defer s.deinit();
+    _ = try dal.syncSchema(&s);
+
+    var table = try dal.table("TOrder");
+
+    // ① 租户 1：拦截器自动补 TenantId（字段里不给）
+    {
+        var it = zcode.membership.TenantInterceptor{ .tenant_id = 1 };
+        var chain = zcode.interceptor.Chain.init(a);
+        defer chain.deinit();
+        try chain.add(it.interceptor());
+        table.setInterceptorChain(&chain);
+
+        _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = "A1" } },
+        });
+        table.setInterceptorChain(null);
+    }
+
+    // ② 租户 2：直接给 TenantId
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "TenantId", .value = .{ .int = 2 } },
+        .{ .name = "Code", .value = .{ .text = "B1" } },
+    });
+
+    // ③ 租户 1 查询：只看到自己那行
+    {
+        var w = zcode.Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(try zcode.membership.applyTenant(&w, table.table, 1));
+
+        var q = zcode.Query.init(a);
+        defer q.deinit();
+        _ = q.filterWhere(&w);
+
+        const rows = try table.queryRows(&s, &q);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        try std.testing.expectEqualStrings("A1", rows[0].get("Code").?.asText().?);
+        try std.testing.expectEqual(@as(i64, 1), rows[0].get("TenantId").?.asI64().?);
+    }
+
+    // ④ 后台（tenant = 0）：不加条件 → 两行都能看到
+    {
+        var w = zcode.Where.init(a);
+        defer w.deinit();
+        try std.testing.expect(!try zcode.membership.applyTenant(&w, table.table, 0));
+
+        var q = zcode.Query.init(a);
+        defer q.deinit();
+        if (!w.isEmpty()) _ = q.filterWhere(&w);
+
+        const rows = try table.queryRows(&s, &q);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+    }
+
+    // ⑤ 更新也走同一个条件：租户 1 只能改到自己那行
+    {
+        var w = zcode.Where.init(a);
+        defer w.deinit();
+        _ = try zcode.membership.applyTenant(&w, table.table, 1);
+
+        const n = try table.update(&s, &[_]zcode.sqlbuild.Field{
+            .{ .name = "Code", .value = .{ .text = "A1-改" } },
+        }, &w);
+        try std.testing.expectEqual(@as(usize, 1), n);
+
+        const all = try table.count(&s, null);
+        try std.testing.expectEqual(@as(i64, 2), all);
+    }
+}

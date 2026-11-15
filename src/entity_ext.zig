@@ -1180,4 +1180,3 @@ test "列表索引：没有唯一键列的实体 → error.NoUniqueKey（不猜�
     try std.testing.expectError(error.NoUniqueKey, indexByUniqueAlloc(NoKeyRow, a, &list));
     try std.testing.expectError(error.NoUniqueKey, toDictionaryAlloc(NoKeyRow, a, &list, "Name"));
 }
-
