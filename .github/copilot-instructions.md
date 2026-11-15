@@ -131,8 +131,16 @@
   - SQL Server：**LocalDB 可用**（2026-11-15 实测纠正：`IsIntegratedSecurityOnly=0` **允许 SQL 认证**，
     且 TDS 驱动支持命名管道）——`powershell -File tools/mssql-local.ps1 -Action connstr` 会幂等建
     `zcode_test` 库 + `zcode_t` 登录并**打印可用的 `-Dsqlserver-conn`**（管道名 `LOCALDB#XXXX` 每次启动会变，别手写死）。
-    仍然成立：LocalDB **不开 TCP**，只能走管道。**已知待修**：`zzig` 的 `PRELOGIN` 被真服务器断开（`233`），
-    握手未打通；假服务端验不出这类问题。**不需要装 SQL Server Express**（只有要测 TCP/TLS/MARS 时才考虑）。
+    仍然成立：LocalDB **不开 TCP**，只能走管道。**不需要装 SQL Server Express**（只有要测 TCP/TLS/MARS 时才考虑）。
+  - **TDS 真库链路现状（2026-11-15）**：PRELOGIN ✅ → LOGIN7 ✅（服务端回 ENVCHANGE 5701/5703）→
+    **SQL batch（0x01 包）✅**（`SELECT 1 AS one` 能拿到结果集）→ **RPC（0x03 包 / `sp_executesql`）仍被拒**
+    （先 4009、后 8009「RPC protocol stream is incorrect」，说明 ALL_HEADERS 已对，剩参数编码）。
+    真库用例对 RPC 失败**显式 SKIP 并打印原因**，不静默放过。
+    两个已验证的协议硬口径：**命名管道是消息模式，一条 TDS 消息必须一次 `WriteFile` 写完**（分两次写会被当成
+    两条消息 → 服务端断管道 → `233 ERROR_PIPE_NOT_CONNECTED`）；**SQL batch / RPC 的 ALL_HEADERS 是 22 字节**
+    （`TotalLength=22` + `HeaderLength=18` + `TRANSACTION_DESCRIPTOR`），写 4 字节的 0 会被判 4009。
+    定位这类问题**别再猜规范**：`tools/tds_probe7.ps1`（冒充服务端抓 sqlcmd 的 batch 字节）、
+    `tools/tds_probe8.ps1`（MITM 抓 `System.Data.SqlClient` 的 RPC 字节）能直接给出权威字节。
   - `tools/regression.ps1` 会探测 5433/3307，在跑就自动带上真库用例，不在跑就显式 SKIP（不会静默跳过）。
 
 - `zig 0.17.1`（VS Code Zig 扩展托管，`zig.exe` 已在 PATH；0.17.0 已验证同行为）；构建产物目录 `.zig-cache/`、`zig-out/`（已进 `.gitignore`）。
