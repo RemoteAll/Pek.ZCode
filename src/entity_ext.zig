@@ -192,25 +192,94 @@ fn containsName(names: []const []const u8, name: []const u8) bool {
 /// 避免多一次深拷贝（调用方拿下标回列表取）。键归 `a`。
 pub fn indexByAlloc(comptime T: type, comptime column: []const u8, a: std.mem.Allocator, list: []const T) !std.StringHashMapUnmanaged(usize) {
     const idx = comptime columnIndex(T, column) orelse @compileError("indexBy: 列不存在 " ++ column);
+    return indexByColumnIndexAlloc(T, idx, a, list);
+}
 
-    var map: std.StringHashMapUnmanaged(usize) = .empty;
-    errdefer {
-        var it = map.keyIterator();
-        while (it.next()) |k| a.free(k.*);
-        map.deinit(a);
+/// 按**唯一键列**建索引（≂ C# `ToDictionary(list)`：C# 的键自动取 `Meta.Unique`）。
+///
+/// 唯一键口径与 `entity.uniqueColumn` 一致：**单列主键 → 否则自增列**；
+/// 都没有 → `error.NoUniqueKey`（不猜「用第一列」）。
+pub fn indexByUniqueAlloc(comptime T: type, a: std.mem.Allocator, list: []const T) !std.StringHashMapUnmanaged(usize) {
+    const idx = uniqueFieldIndex(T) orelse return error.NoUniqueKey;
+    return indexByColumnIndexAlloc(T, idx, a, list);
+}
+
+/// 键（唯一键列）→ 另一列的**值**（≂ C# `ToDictionary(list, valueField)` 的 `Dictionary<K,V>`）。
+///
+/// 典型用途：下拉框 `Id → Name`、导入时的 `Code → Id`。
+/// 注意：值里的字符串**借用 `list`**（不复制），`list` 的生命周期必须覆盖字典的使用期；
+/// 键由 `a` 分配，用完 `deinitKeys` 释放。
+pub fn toDictionaryAlloc(
+    comptime T: type,
+    a: std.mem.Allocator,
+    list: []const T,
+    comptime value_field: []const u8,
+) !std.StringHashMapUnmanaged(Value) {
+    const kidx = uniqueFieldIndex(T) orelse return error.NoUniqueKey;
+    const vidx = comptime columnIndex(T, value_field) orelse @compileError("toDictionary: 列不存在 " ++ value_field);
+
+    var map: std.StringHashMapUnmanaged(Value) = .empty;
+    errdefer deinitKeys(a, &map);
+
+    for (list) |e| {
+        const k = try csv.valueTextAlloc(a, e.columnValue(kidx));
+        errdefer a.free(k);
+        const gop = try map.getOrPut(a, k);
+        if (gop.found_existing) {
+            a.free(k); // 重复键保留第一个（≂ C# `if (!dic.Contains(k)) dic.Add(...)`）
+        } else {
+            gop.value_ptr.* = e.columnValue(vidx);
+        }
     }
+    return map;
+}
+
+/// 释放「键 → 下标」索引的键（`indexByAlloc` / `indexByUniqueAlloc` 的配套清理）。
+pub fn deinitIndex(a: std.mem.Allocator, map: *std.StringHashMapUnmanaged(usize)) void {
+    var it = map.keyIterator();
+    while (it.next()) |k| a.free(k.*);
+    map.deinit(a);
+}
+
+/// 释放「键 → 值」字典的键（`toDictionaryAlloc` 的配套清理；值不归字典所有）。
+pub fn deinitKeys(a: std.mem.Allocator, map: *std.StringHashMapUnmanaged(Value)) void {
+    var it = map.keyIterator();
+    while (it.next()) |k| a.free(k.*);
+    map.deinit(a);
+}
+
+fn indexByColumnIndexAlloc(comptime T: type, idx: usize, a: std.mem.Allocator, list: []const T) !std.StringHashMapUnmanaged(usize) {
+    var map: std.StringHashMapUnmanaged(usize) = .empty;
+    errdefer deinitIndex(a, &map);
 
     for (list, 0..) |e, i| {
         const t = try csv.valueTextAlloc(a, e.columnValue(idx));
         errdefer a.free(t);
         const gop = try map.getOrPut(a, t);
         if (gop.found_existing) {
-            a.free(t); // 重复键保留第一个
+            a.free(t); // 重复键保留第一个（≂ C# `if (!dic.Contains(k)) dic.Add(...)`）
         } else {
             gop.value_ptr.* = i;
         }
     }
     return map;
+}
+
+/// 唯一键字段下标（≂ C# `Meta.Unique`）：单列主键 → 否则自增列 → 否则 null。
+fn uniqueFieldIndex(comptime T: type) ?usize {
+    var pk: ?usize = null;
+    var pk_count: usize = 0;
+    inline for (T.meta.fields, 0..) |f, i| {
+        if (f.primary_key) {
+            pk = i;
+            pk_count += 1;
+        }
+    }
+    if (pk_count == 1) return pk;
+    inline for (T.meta.fields, 0..) |f, i| {
+        if (f.identity) return i;
+    }
+    return null;
 }
 
 fn columnIndex(comptime T: type, comptime name: []const u8) ?usize {
@@ -1044,5 +1113,71 @@ test "空列表也能出包（只有表头、0 行）——不是错误" {
 
     const back = try fromPacketAlloc(PacketRow, a, bytes);
     try std.testing.expectEqual(@as(usize, 0), back.len);
+}
+
+test "列表索引：唯一键（自动取主键）→ 下标；键 → 另一列值；重复键保留第一个" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const list = [_]PacketRow{
+        .{ .Id = 1, .Name = "甲", .Score = 10 },
+        .{ .Id = 2, .Name = "乙", .Score = -5 },
+        .{ .Id = 2, .Name = "丙", .Score = 0 }, // 重复键
+    };
+
+    // ① 唯一键 → 下标（≂ C# `ToDictionary(list)`，键自动取 `Meta.Unique`）
+    var idx = try indexByUniqueAlloc(PacketRow, a, &list);
+    defer deinitIndex(a, &idx);
+    try std.testing.expectEqual(@as(usize, 2), idx.count());
+    try std.testing.expectEqual(@as(usize, 0), idx.get("1").?);
+    try std.testing.expectEqual(@as(usize, 1), idx.get("2").?); // 重复保留第一个
+
+    // ② 键 → 另一列的值（≂ C# `ToDictionary(list, valueField)`）
+    var dict = try toDictionaryAlloc(PacketRow, a, &list, "Name");
+    defer deinitKeys(a, &dict);
+    try std.testing.expectEqualStrings("甲", dict.get("1").?.text);
+    try std.testing.expectEqualStrings("乙", dict.get("2").?.text); // 同理保留第一个
+    try std.testing.expect(dict.get("9") == null);
+
+    // ③ 空列表 → 空字典（不报错）
+    var empty_idx = try indexByUniqueAlloc(PacketRow, a, &.{});
+    defer deinitIndex(a, &empty_idx);
+    try std.testing.expectEqual(@as(usize, 0), empty_idx.count());
+}
+
+test "列表索引：没有唯一键列的实体 → error.NoUniqueKey（不猜『用第一列』）" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const NoKeyRow = struct {
+        Name: []const u8 = "",
+        dirty: zcode.entity.DirtyBits = 0,
+
+        pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
+            .name = "NoKeyRow",
+            .table_name = "DH_NoKeyRow",
+            .fields = &.{.{ .name = "Name", .data_type = .string }},
+        });
+
+        pub fn columnValue(self: @This(), index: usize) Value {
+            return switch (index) {
+                0 => .{ .text = self.Name },
+                else => .null,
+            };
+        }
+
+        pub fn setColumnValue(self: *@This(), index: usize, v: Value) !void {
+            switch (index) {
+                0 => self.Name = v.asText() orelse "",
+                else => {},
+            }
+        }
+    };
+
+    const list = [_]NoKeyRow{.{ .Name = "x" }};
+    try std.testing.expectError(error.NoUniqueKey, indexByUniqueAlloc(NoKeyRow, a, &list));
+    try std.testing.expectError(error.NoUniqueKey, toDictionaryAlloc(NoKeyRow, a, &list, "Name"));
 }
 
