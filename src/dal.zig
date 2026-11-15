@@ -79,6 +79,8 @@ pub const ConnectionOptions = struct {
     pub fn deinit(self: *ConnectionOptions, gpa: std.mem.Allocator) void {
         if (self.data_source.len > 0) gpa.free(self.data_source);
         if (self.server.len > 0) gpa.free(self.server);
+        // 命名管道名是 `parseConnectionString` 里 dupe 出来的（`Server=np:\\.\pipe\...`）
+        if (self.pipe_name.len > 0) gpa.free(self.pipe_name);
         if (self.user.len > 0) gpa.free(self.user);
         if (self.password.len > 0) gpa.free(self.password);
         if (self.database.len > 0) gpa.free(self.database);

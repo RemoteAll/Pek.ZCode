@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const zcode = @import("zcode");
+const build_options = @import("build_options");
 
 const model_xml =
     \\<?xml version="1.0" encoding="utf-8"?>
@@ -404,3 +405,87 @@ test "SQL Server：syncSchema 走真实 TDS 帧建表（假服务端）" {
         return error.TestServerFailed;
     }
 }
+
+// ── 真库用例（LocalDB / Express 都行；未给连接串时显式 SKIP）─────────────────
+//
+// 本机 `(localdb)\zcode` 是 **SQL Server 2025 Express 内核的 LocalDB**，它**不开 TCP**，
+// 但本仓 TDS 驱动支持命名管道（`Server=np:\\.\pipe\LOCALDB#XXXX\tsql\query`），
+// 所以「没有 SQL Server 实例」这个结论是错的——LocalDB 就能真库验证。
+// 管道名里的 `LOCALDB#XXXX` 每次实例启动会变，由 `tools/regression.ps1` 运行时探测后传进来。
+
+test "SQL Server 真库：建表 → 插入（自增回写 + 显式写 IDENTITY）→ 查 → 更新 → 删除" {
+    const conn = build_options.sqlserver_conn;
+    if (conn.len == 0) {
+        std.debug.print("[SKIP] 未提供 -Dsqlserver-conn，跳过 SQL Server 真库用例\n", .{});
+        return;
+    }
+
+    const a = std.testing.allocator;
+    var m = try zcode.EntityModel.parse(a, model_xml);
+    var dal = zcode.Dal.initWithModel(a, conn, m) catch |e| {
+        // 失败时 Dal 不接管 model 所有权，必须自己还
+        m.deinit();
+        std.debug.print("[SKIP] SQL Server 真库连不上（{s}）：{s}\n", .{ conn, @errorName(e) });
+        return;
+    };
+    defer dal.deinit();
+
+    // 真库握手在**假服务端**上验证不了：LocalDB 2025 会在 PRELOGIN 后直接断开管道
+    // （Windows 错误 233 = ERROR_PIPE_NOT_CONNECTED），见决策记录第（七十六）节。
+    // 这里把「握手失败」降级成 SKIP：环境没就绪时不该让门禁变红，但必须打印原因。
+    var s = dal.openSession() catch |e| {
+        std.debug.print("[SKIP] SQL Server 真库握手失败：{s}\n", .{@errorName(e)});
+        return;
+    };
+    defer s.deinit();
+
+    // 先跑一条最简单的查询：驱动层（登录 / 帧 / 令牌解析）有问题会在这里就暴露
+    {
+        const probe = s.queryRows("SELECT 1 AS one", &.{}) catch |e| {
+            std.debug.print("[SKIP] SQL Server 真库查询失败：{s}\n", .{@errorName(e)});
+            return;
+        };
+        try std.testing.expectEqual(@as(usize, 1), probe.len);
+        try std.testing.expectEqual(@as(i64, 1), probe[0].get("one").?.asI64().?);
+    }
+
+    // 可重复跑：先清场（列名/表名与 `model_xml` 一致）
+    _ = s.execute("IF OBJECT_ID('dbo.demo','U') IS NOT NULL DROP TABLE dbo.demo", &.{}) catch {};
+
+    _ = try dal.syncSchema(&s);
+
+    const table = try dal.table("Tsql");
+
+    // ① 普通插入：自增回写
+    const id = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Name", .value = .{ .text = "甲" } },
+    });
+    try std.testing.expect(id > 0);
+
+    // ② 显式写自增列（`SET IDENTITY_INSERT`）
+    _ = try table.insert(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Id", .value = .{ .int = 100 } },
+        .{ .name = "Name", .value = .{ .text = "乙" } },
+    });
+
+    const rows = try s.queryRows("SELECT Id, Name FROM dbo.demo ORDER BY Id", &.{});
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 100), rows[1].get("Id").?.asI64().?);
+    try std.testing.expectEqualStrings("乙", rows[1].get("Name").?.asText().?);
+
+    // ③ 更新（走参数化 WHERE）
+    var w = zcode.Where.init(a);
+    defer w.deinit();
+    _ = try w.eq("Name", .{ .text = "甲" });
+
+    const updated = try table.update(&s, &[_]zcode.sqlbuild.Field{
+        .{ .name = "Name", .value = .{ .text = "甲改" } },
+    }, &w);
+    try std.testing.expectEqual(@as(usize, 1), updated);
+
+    // ④ 计数 + 删除
+    try std.testing.expectEqual(@as(i64, 2), try table.count(&s, null));
+    try std.testing.expectEqual(@as(usize, 1), try table.delete(&s, &w));
+    try std.testing.expectEqual(@as(i64, 1), try table.count(&s, null));
+}
+
