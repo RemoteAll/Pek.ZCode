@@ -109,10 +109,6 @@ pub const ConnectionOptions = struct {
     }
 };
 
-/// 解析连接串（键名忽略大小写，值保留原样）。
-///
-/// 认得的键：`Provider` / `Data Source`（别名 `DataSource`/`Filename`）/
-/// `Migration` / `ShowSql` / `Readonly` / `Pooling`；其余键进 `extra`。
 /// 按连接名生成默认 SQLite 连接串（**未配置连接串时的回退**）。
 ///
 /// 对齐 C# `DH.NCode/DataAccessLayer/DAL.cs:108-129` 的既有行为：
@@ -153,6 +149,10 @@ pub fn defaultSqliteConnStr(
     return std.fmt.allocPrint(allocator, "Data Source={s}/{s}.db;Provider=SQLite;Migration=On", .{ dir, name });
 }
 
+/// 解析连接串（键名忽略大小写，值保留原样）。
+///
+/// 认得的键：`Provider` / `Data Source`（别名 `DataSource`/`Filename`）/
+/// `Migration` / `ShowSql` / `Readonly` / `Pooling`；其余键进 `extra`。
 pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !ConnectionOptions {
     var opts = ConnectionOptions{};
     // 任何中途失败都要把已复制的字段还回去（`deinit` 对空字段是安全的）
