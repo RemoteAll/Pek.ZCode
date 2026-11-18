@@ -1308,23 +1308,10 @@ pub const Dal = struct {
             .tdengine => "SELECT SERVER_VERSION()",
             .clickhouse => "SELECT version()",
             .duckdb => "SELECT version()",
-            // SQL Server：**暂不探版本**（保持保守档）。
-            //
-            // 探版本本身没问题（`SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))`
-            // 能拿到 `17.0.4025.3`，`SERVERPROPERTY` 是 `sql_variant`，必须 CAST 才取得到文本），
-            // 问题是它要开**第二条连接**，而 **2026-11-15 实测：同一 Dal 上「主会话已在用」时，
-            // 第二条连接会挂在 TDS 握手** ———整个测试被卡死。
-            //
-            // 已排除的一层（别重复查）：`tools/tds_probe9.ps1` 实测同一个 LocalDB 管道的
-            // **第二次 `CreateFileW` 只要 6ms 就成功**（不阻塞，`WaitNamedPipeW` 也返回 True），
-            // 所以不是「管道实例不够 / CreateFile 在等实例」。卡点在**握手（PRELOGIN/LOGIN7）**，
-            // 需要单独排查（连接池给 SQL Server 开多条连接同样会踩，**优先级不低**）。
-            //
-            // 在修好之前探版本会把握手卡死，比「版本未知」的日志噪声严重得多。
-            .sqlserver => {
-                self.probe_code.store(probe_failed, .release);
-                return;
-            },
+            // SQL Server：`SERVERPROPERTY('ProductVersion')` 返回 `17.0.4025.3` 这种干净的
+            // major.minor.build（**必须 CAST**：它的静态类型是 `sql_variant`，不 CAST 取不出文本）。
+            // 不能用 `@@VERSION` —— 那串里的首数字是**发布年份**，解析必错。
+            .sqlserver => "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))",
             // 其余（Access / SqlCe / Oracle / ODBC / MongoDB / InfluxDB）：没有统一的版本函数，
             // 或本类根本不用版本相关能力，直接保守档
             else => {
@@ -1333,6 +1320,7 @@ pub const Dal = struct {
             },
         };
 
+        if (opts.provider == .sqlserver) std.debug.print("[probe] SqlServer：开临时会话…\n", .{});
         var tmp = self.openDriverSession(opts) catch |e| {
             self.probe_code.store(probe_failed, .release);
             std.debug.print(
@@ -1343,6 +1331,7 @@ pub const Dal = struct {
             return;
         };
         defer tmp.deinit();
+        if (opts.provider == .sqlserver) std.debug.print("[probe] SqlServer：临时会话已建，查版本…\n", .{});
 
         const value = tmp.queryScalar(sql, &.{}) catch |e| {
             self.probe_code.store(probe_failed, .release);
@@ -1353,6 +1342,7 @@ pub const Dal = struct {
             );
             return;
         };
+        if (opts.provider == .sqlserver) std.debug.print("[probe] SqlServer：版本查询已返回\n", .{});
         const raw = if (value) |v| v.asText() else null;
         const text = raw orelse {
             self.probe_code.store(probe_failed, .release);

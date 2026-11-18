@@ -29,7 +29,7 @@ const model_xml =
     \\    </Table>
     \\  </Tables>
     \\</EntityModel>
-    ;
+;
 
 /// 唯一临时库文件名（纳秒时间戳 + 进程内原子计数器，调用方负责释放并删除）。
 fn tempDbPath(a: std.mem.Allocator, tag: []const u8) ![]u8 {

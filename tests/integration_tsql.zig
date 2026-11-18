@@ -151,6 +151,26 @@ fn writeEmptySingleColumn(o: *Out) !void {
     try writeDone(o, 0x10, 0);
 }
 
+/// 一行一列的 `nvarchar` 结果集（假服务端回版本号用；非 PLP 编码）。
+fn writeSingleNVarChar(o: *Out, text: []const u8) !void {
+    try o.u8v(0x81); // COLMETADATA
+    try o.u16v(1);
+    try o.u16v(0);
+    try o.u16v(0);
+    try o.u16v(0); // Flags
+    try o.u8v(0xE7); // NVARCHAR
+    try o.u16v(@intCast(text.len * 2)); // MaxLen（字节）
+    try o.bytes(&[_]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 }); // collation
+    try o.bVarChar("");
+    try o.u8v(0xD1); // ROW
+    try o.u16v(@intCast(text.len)); // 字符数
+    for (text) |c| {
+        try o.u8v(c);
+        try o.u8v(0);
+    }
+    try writeDone(o, 0x10, 1);
+}
+
 fn writeDone(o: *Out, status: u16, row_count: u64) !void {
     try o.u8v(0xFD);
     try o.u16v(status);
@@ -291,6 +311,11 @@ fn runServer(ctx: *Ctx) !void {
         {
             // 表 / 索引都不存在 → 空结果集
             try writeEmptySingleColumn(&o);
+        } else if (std.mem.indexOf(u8, sql_buf[0..sql_len], "SERVERPROPERTY") != null) {
+            // 版本探测（`SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))`）：
+            // 假服务端必须应答，否则客户端会一直等（2026-11-15 实际踩过：探版本新增后
+            // 这条用例挂死，因为 unrecognized SQL 走到下面的「只回 DONE」分支但没有结果集）。
+            try writeSingleNVarChar(&o, "17.0.4025.3");
         } else {
             // 建表 / 建索引等 DDL：只回 DONE
             try writeDone(&o, 0x00, 0);
@@ -452,6 +477,17 @@ test "SQL Server 真库：建表 → 插入（自增回写 + 显式写 IDENTITY�
         return;
     };
     defer s.deinit();
+
+    // TEMP-DEBUG：复现「第二条连接挂住握手」（第（八十一）节的下一步排查）
+    {
+        std.debug.print("[dbg] 准备开第二条连接…\n", .{});
+        var s2 = dal.openSession() catch |e| {
+            std.debug.print("[dbg] 第二条连接失败：{s}\n", .{@errorName(e)});
+            return;
+        };
+        std.debug.print("[dbg] 第二条连接成功\n", .{});
+        s2.deinit();
+    }
 
     // 先跑一条最简单的查询：驱动层（登录 / 帧 / 令牌解析）有问题会在这里就暴露
     {
