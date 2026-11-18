@@ -362,8 +362,11 @@ pub const Dal = struct {
 
     /// 从 `Model.xml` 文件打开。
     pub fn open(gpa: std.mem.Allocator, conn_str: []const u8, model_path: []const u8) !Dal {
-        var m = try EntityModel.load(gpa, model_path);
-        errdefer m.deinit();
+        const m = try EntityModel.load(gpa, model_path);
+        // **所有权交给 `initWithModel`**：它内部已有 errdefer 在失败时 deinit 模型。
+        // 这里若再加 `errdefer m.deinit()` 就是**双重释放** —— 2026-11-18 实测：
+        // 任何初始化失败（如 SQLite 动态库不可用）都会变成段错误，
+        // 真实错误被吞掉，只留一个莫名其妙的 segfault 调用栈。
         return initWithModel(gpa, conn_str, m);
     }
 
