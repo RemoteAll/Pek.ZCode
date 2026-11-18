@@ -1220,4 +1220,5 @@ test {
     _ = @import("integration_rowlock.zig");
     _ = @import("integration_dialect_versions.zig");
     _ = @import("integration_pg_driver.zig");
+    _ = @import("integration_sync_for.zig");
 }

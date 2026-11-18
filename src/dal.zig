@@ -1481,7 +1481,71 @@ pub const Dal = struct {
     /// 1. 表不存在 → 建表（含索引）
     /// 2. 表存在 → `PRAGMA table_info` 对比，缺列则 `ALTER TABLE ... ADD COLUMN`
     /// 3. 索引不存在 → `CREATE INDEX`
+    ///
+    /// 处理**模型里的全部表**：表级 `ConnName` 优先、模型级兜底，跨库表自动用对应连接执行。
+    /// 只想处理某一个连接的表请用 [`syncSchemaFor`] / [`syncSchemaForAny`]。
     pub fn syncSchema(self: *Dal, s_main: *Session) !SchemaReport {
+        return self.syncSchemaInner(s_main, null);
+    }
+
+    /// 连接过滤（`null` = 不按连接过滤，即 `syncSchema` 的行为）。
+    pub const ConnFilter = struct {
+        /// 目标连接名列表：表级 `ConnName` 命中**任一个**即算本连接的表（大小写不敏感）。
+        /// 空列表 = 不按连接过滤。
+        conn_names: []const []const u8,
+        /// 是否处理「表级 `ConnName` 为空」的表（它们归属模型级 `ConnName`）。
+        include_model_level: bool,
+    };
+
+    /// 同 [`syncSchema`]，但**只处理属于指定连接的表**（对齐 Rust `Pek.RCode::sync_schema_for`）。
+    ///
+    /// - `conn_name = null` → 不按连接过滤（等价 `syncSchema`）；
+    /// - `include_model_level`：是否处理「没有表级 `ConnName`」的表（它们归属模型级连接）。
+    pub fn syncSchemaFor(
+        self: *Dal,
+        s_main: *Session,
+        conn_name: ?[]const u8,
+        include_model_level: bool,
+    ) !SchemaReport {
+        const name = conn_name orelse return self.syncSchemaInner(s_main, null);
+        const names = [_][]const u8{name};
+        return self.syncSchemaInner(s_main, .{
+            .conn_names = &names,
+            .include_model_level = include_model_level,
+        });
+    }
+
+    /// 同 [`syncSchemaFor`]，但允许「同一物理库上的多个连接别名」（对齐 Rust
+    /// `Pek.RCode::sync_schema_for_any`）：表级 `ConnName` 命中任一个即算本连接的表。
+    /// `conn_names` 为空 = 不按连接过滤。
+    pub fn syncSchemaForAny(
+        self: *Dal,
+        s_main: *Session,
+        conn_names: []const []const u8,
+        include_model_level: bool,
+    ) !SchemaReport {
+        if (conn_names.len == 0) return self.syncSchemaInner(s_main, null);
+        return self.syncSchemaInner(s_main, .{
+            .conn_names = conn_names,
+            .include_model_level = include_model_level,
+        });
+    }
+
+    /// 表是否通过连接过滤（规则与 Rust `sync_schema_inner` 一致）。
+    fn tablePassesFilter(t: *const model.TableMeta, f: ConnFilter) bool {
+        const own = t.conn_name orelse return f.include_model_level;
+        const trimmed = std.mem.trim(u8, own, " \t\r\n");
+        if (trimmed.len == 0) return f.include_model_level;
+        if (f.conn_names.len == 0) return true; // 空列表 = 不按连接过滤
+
+        for (f.conn_names) |cn| {
+            const target = std.mem.trim(u8, cn, " \t\r\n");
+            if (target.len > 0 and std.ascii.eqlIgnoreCase(trimmed, target)) return true;
+        }
+        return false;
+    }
+
+    fn syncSchemaInner(self: *Dal, s_main: *Session, filter: ?ConnFilter) !SchemaReport {
         var report = SchemaReport{};
 
         // 跨库表的会话由本函数按 Model.xml 的连接规则自行打开并关闭（不借用调用方的会话）。
@@ -1497,6 +1561,15 @@ pub const Dal = struct {
         report.executed = global.canExecute();
 
         for (self.model.tables) |*t| {
+            // ── 连接过滤（仅 `syncSchemaFor*` 启用）：表级 ConnName 命中任一目标连接、
+            // 或无表级 ConnName 且 include_model_level 才继续；否则跳过。
+            if (filter) |f| {
+                if (!tablePassesFilter(t, f)) {
+                    report.tables_skipped += 1;
+                    continue;
+                }
+            }
+
             // ── 连接路由：**表级 `ConnName` 优先、模型级兜底**（唯一规则在 `EntityModel.tableConn`）——
             // 不在这里重新拼连接名，也不允许“没挂连接就建到主库”这种静默降级。
             const conn = self.model.tableConn(t);
