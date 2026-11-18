@@ -59,6 +59,8 @@ pub const dal = @import("dal.zig");
 pub const Dal = dal.Dal;
 /// 连接串解析（XCode 口径：`Data Source=...;Provider=...`，MySQL 用 `Server/Port/Uid/Pwd/Database`）
 pub const parseConnectionString = dal.parseConnectionString;
+/// 未配置连接串时的回退：按连接名生成默认 SQLite 连接串（与 C# `DAL.Init` 一致）
+pub const defaultSqliteConnStr = dal.defaultSqliteConnStr;
 pub const ConnectionOptions = dal.ConnectionOptions;
 /// 迁移档位（`Off` / `ReadOnly` / `On` / `Full`）
 pub const Migration = model.Migration;

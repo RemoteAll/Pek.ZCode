@@ -113,6 +113,46 @@ pub const ConnectionOptions = struct {
 ///
 /// 认得的键：`Provider` / `Data Source`（别名 `DataSource`/`Filename`）/
 /// `Migration` / `ShowSql` / `Readonly` / `Pooling`；其余键进 `extra`。
+/// 按连接名生成默认 SQLite 连接串（**未配置连接串时的回退**）。
+///
+/// 对齐 C# `DH.NCode/DataAccessLayer/DAL.cs:108-129` 的既有行为：
+///
+/// ```csharp
+/// if (!css.ContainsKey(connName)) {
+///     // 连接名只允许字母数字与 "-_."
+///     if (connName.Any(c => !Char.IsLetterOrDigit(c) && !_symbols.Contains(c)))
+///         throw new XCodeException($"非法连接名[{connName}]");
+///     var connstr = "Data Source=" + cfg.DataPath.CombinePath(connName + ".db");
+///     if (set.Migration <= Migration.On) connstr += ";Migration=On";
+///     AddConnStr(connName, connstr, null, "SQLite");
+/// }
+/// ```
+///
+/// 即：**任何连接名只要配置里没有，就自动落到 `{data_dir}/{connName}.db` 的 SQLite**；
+/// 只有「配了但值为空串」才报错（本函数在那种情况下由调用方判断，因为 Zig 侧没有配置中心）。
+///
+/// - 连接名只允许字母 / 数字 / `-` / `_` / `.`（与 C# `_symbols = "-_."` 一致），否则 `InvalidConnName`；
+/// - `data_dir` 对应 C# 的 `Setting.DataPath`（默认 `Data`）；
+/// - **不创建目录**（`Dal` 无 `io`）：调用方负责 `Dir.createDirPath`，否则 SQLite 打开会失败。
+pub fn defaultSqliteConnStr(
+    allocator: std.mem.Allocator,
+    conn_name: []const u8,
+    data_dir: []const u8,
+) error{ InvalidConnName, OutOfMemory }![]u8 {
+    const name = std.mem.trim(u8, conn_name, " \t\r\n");
+    if (name.len == 0) return error.InvalidConnName;
+    for (name) |c| {
+        const ok = std.ascii.isAlphabetic(c) or std.ascii.isDigit(c) or c == '-' or c == '_' or c == '.';
+        if (!ok) return error.InvalidConnName;
+    }
+
+    const dir = std.mem.trim(u8, data_dir, " \t\r\n");
+    if (dir.len == 0) {
+        return std.fmt.allocPrint(allocator, "Data Source={s}.db;Provider=SQLite;Migration=On", .{name});
+    }
+    return std.fmt.allocPrint(allocator, "Data Source={s}/{s}.db;Provider=SQLite;Migration=On", .{ dir, name });
+}
+
 pub fn parseConnectionString(gpa: std.mem.Allocator, conn_str: []const u8) !ConnectionOptions {
     var opts = ConnectionOptions{};
     // 任何中途失败都要把已复制的字段还回去（`deinit` 对空字段是安全的）
@@ -2341,6 +2381,35 @@ test "连接串缺 Provider 时默认 SQLite，未知 Provider 报错" {
 
     try std.testing.expectEqual(DatabaseKind.sqlite, opts.provider);
     try std.testing.expectError(error.Unsupported, parseConnectionString(a, "Data Source=x;Provider=NoSuchDb"));
+}
+
+test "默认连接串回退：按连接名生成 SQLite（对齐 C# DAL.Init），非法连接名报错" {
+    const a = std.testing.allocator;
+
+    // ① 默认目录 Data（与 C# `Setting.DataPath` 默认值一致）
+    const c1 = try defaultSqliteConnStr(a, "Permissions", "Data");
+    defer a.free(c1);
+    try std.testing.expectEqualStrings("Data Source=Data/Permissions.db;Provider=SQLite;Migration=On", c1);
+
+    // ② 空目录 → 落到当前目录
+    const c2 = try defaultSqliteConnStr(a, "DH", "");
+    defer a.free(c2);
+    try std.testing.expectEqualStrings("Data Source=DH.db;Provider=SQLite;Migration=On", c2);
+
+    // ③ 反斜杠目录原样保留（与 C# CombinePath 一致：不做跨平台归一，由 `resolve` 层负责）
+    const c3 = try defaultSqliteConnStr(a, "Log", "Data\\Sys");
+    defer a.free(c3);
+    try std.testing.expectEqualStrings("Data Source=Data\\Sys/Log.db;Provider=SQLite;Migration=On", c3);
+
+    // ④ 连接名允许字母数字与 - _ .
+    const c4 = try defaultSqliteConnStr(a, "my_app-2.0", "Data");
+    defer a.free(c4);
+    try std.testing.expect(std.mem.indexOf(u8, c4, "my_app-2.0.db") != null);
+
+    // ⑤ 非法连接名（与 C# 的 `_symbols = "-_."` 口径一致）
+    try std.testing.expectError(error.InvalidConnName, defaultSqliteConnStr(a, "a b", "Data"));
+    try std.testing.expectError(error.InvalidConnName, defaultSqliteConnStr(a, "x;y", "Data"));
+    try std.testing.expectError(error.InvalidConnName, defaultSqliteConnStr(a, "", "Data"));
 }
 
 test "连接串：时序库 / 国产库 Provider 与 InfluxDB 专属键" {
