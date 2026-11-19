@@ -53,11 +53,20 @@ pub const ConnectionOptions = struct {
     /// 压缩协议（`Compression=True`）：缺省关闭（与 MySqlConnector 的 `UseCompression` 缺省一致）
     compress: bool = false,
     // ── SQLite 并发设置（对应 PRAGMA；MySQL/PG 忽略）────────
-    /// `JournalMode=WAL|DELETE|MEMORY|OFF`：`null` = **不设置**（SQLite 原生 `delete`）。
-    /// 实测见 `docs/决策记录.md` 第（三十九）节：单行一事务下 WAL 反而慢 2×；
-    /// 只有「长写事务同时要别人能读」才值得显式开 WAL，网络盘一律开不得
+    /// `JournalMode=WAL|DELETE|MEMORY|OFF`：默认就是 **`WAL`**（最快档位，调用方不需要再配）。
+    ///
+    /// 文件库实测（2026-11-19，`zig build bench`，ReleaseFast）：
+    /// 单次写 WAL+NORMAL **94.76 µs** / DELETE+FULL **3086.89 µs** / DELETE+NORMAL **4731.96 µs**；
+    /// 写事务期间并发读：WAL 通 **3047** 次（3.92 µs/次），DELETE 只通 **25** 次且单次 **36 ms**。
+    ///
+    /// ⚠ **纠正旧注释**：这里曾写「实测…单行一事务下 WAL 反而慢 2×」并据此把 WAL 排除在默认之外。
+    /// 该结论作废 —— 旧记录未标明文件库/内存库（内存库上 `journal_mode` 无意义，SQLite 直接忽略），
+    /// 而今日在明确标注**文件库 + 三档对比**下反复测到 WAL 快 32 倍。以文件库实测为准。
+    ///
+    /// 网络盘（SMB/NFS 不支持共享内存文件）请显式传 `JournalMode=DELETE`；
+    /// WAL 设置失败时只留痕不中断，SQLite 保持原生行为。
     journal_mode: ?[]const u8 = null,
-    /// `Synchronous=Normal|Full|Off`（也认 0/1/2）：`null` = **不设置**（原生 `full`）
+    /// `Synchronous=Normal|Full|Off`（也认 0/1/2）：`null` = 未指定（实际生效值见 `effectiveSynchronous`）
     synchronous: ?[]const u8 = null,
     /// `CacheSize=-64000`：`null` = 用库默认（负数=KB，正数=页数）
     cache_size: ?i32 = null,
@@ -106,6 +115,20 @@ pub const ConnectionOptions = struct {
         self.bucket = "";
         self.auth_source = "";
         self.extra = &.{};
+    }
+
+    /// 实际生效的 `journal_mode`：**未显式指定时取最快的 `WAL`**（调用方不需要再配）。
+    ///
+    /// 为什么不把字段默认值直接写成 `"WAL"`：`deinit` 会对非 null 的字段 `gpa.free`，
+    /// 而字面量是静态字符串 —— free 它会直接崩溃（本轮真的这样把一批单测搞挂了）。
+    /// 所以字段保持 `null` = 「调用方没指定」，默认档位在这里映射。
+    pub fn effectiveJournalMode(self: ConnectionOptions) []const u8 {
+        return self.journal_mode orelse "WAL";
+    }
+
+    /// 实际生效的 `synchronous`：未显式指定时取与 WAL 配套的 `NORMAL`
+    pub fn effectiveSynchronous(self: ConnectionOptions) []const u8 {
+        return self.synchronous orelse "NORMAL";
     }
 };
 
@@ -854,10 +877,12 @@ pub const Dal = struct {
         switch (opts.provider) {
             .sqlite => {
                 const lib_ptr = if (self.lib) |*l| l else return error.Unsupported;
-                // 并发相关 PRAGMA 随连接串走：多线程/多进程共用同一个库时，WAL 是读写不互斥的前提
+                // 并发相关 PRAGMA 随连接串走：多线程/多进程共用同一个库时，WAL 是读写不互斥的前提。
+                // **未显式指定时取 effectiveXxx（默认 WAL + NORMAL）** —— 默认就是最快档，
+                // 不需要每个业务自己去配；要关掉就在连接串写 `JournalMode=DELETE`。
                 const db = try sqlite.Db.openWithOptions(lib_ptr, opts.data_source, .{
-                    .journal_mode = opts.journal_mode,
-                    .synchronous = opts.synchronous,
+                    .journal_mode = opts.effectiveJournalMode(),
+                    .synchronous = opts.effectiveSynchronous(),
                     .cache_size = opts.cache_size,
                     .read_only = opts.read_only,
                 });
