@@ -250,6 +250,13 @@ pub const Session = struct {
         stmt: sqlite.Stmt,
     };
 
+    /// 建会话。
+    ///
+    /// **不要把 `Session` 按值拷进结构体长期持有**：内部含 `ArenaAllocator` 与
+    /// 语句缓存，复制后原对象的 arena/缓存仍被内部引用，表现为 `prepare` 里
+    /// `sqlite3_prepare_v2` 段错误（实测 `address 0x122`）。
+    /// 要么按官方示例「局部 `var s = try dal.openSession(); defer s.deinit();`」，
+    /// 要么把 `*Session` 放到堆上（`allocator.create(Session)` 后再 `s.* = try dal.openSession()`）。
     pub fn init(gpa: std.mem.Allocator, kind: DatabaseKind, db: sqlite.Db) Session {
         return initWithDriver(gpa, kind, .{ .sqlite = db });
     }
