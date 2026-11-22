@@ -1742,8 +1742,8 @@ pub const Dal = struct {
             // - **列放宽**（长度/精度变大）→ `On` 档（Rust 同口径；Zig 暂时保守归入 Full）；
             // - **列缩窄 / 类型变更 / 删列** → 只有 `Full`。
             try self.dropExtraIndexes(s, t, execute_ddl, &report);
+            try self.alterChangedColumns(s, t, migration, execute_ddl, &report);
             if (!migration.onlyCreate()) {
-                try self.alterChangedColumns(s, t, execute_ddl, &report);
                 try self.dropExtraColumns(s, t, existing, execute_ddl, &report);
             }
         }
@@ -1833,12 +1833,24 @@ pub const Dal = struct {
         }
     }
 
-    /// `Migration=Full` 档：把库里类型/长度与模型不一致的列改过来。
+    /// 列结构对齐：类型 / 字符串长度 / 精度小数位。
     ///
     /// - MySQL / SQL Server / Oracle / PostgreSQL 系：`ALTER TABLE ... MODIFY/ALTER COLUMN`
     /// - SQLite：没有 `ALTER COLUMN`，只能**整表重建**（见 `rebuildSqliteTable`）
     /// - **可空性不自动改**（存量 NULL 会让约束失败），只打日志提醒
-    fn alterChangedColumns(self: *Dal, s: *Session, t: *const model.TableMeta, execute_ddl: bool, report: *SchemaReport) !void {
+    ///
+    /// 档位（对齐 Rust `Pek.RCode::apply_column_changes`）：
+    /// - **放宽**（长度/精度变大、或变成无限制的 Text）→ `On` 档即执行（不丢数据）；
+    /// - **缩窄 / 基础类型变更** → 仅 `Full`；
+    /// - SQLite 的整表重建风险高（重命名会带走视图/触发器指向），**只在 `Full` 做**，`On` 只打提示。
+    fn alterChangedColumns(
+        self: *Dal,
+        s: *Session,
+        t: *const model.TableMeta,
+        migration: model.Migration,
+        execute_ddl: bool,
+        report: *SchemaReport,
+    ) !void {
         const infos = existingColumnInfos(s, self.gpa, self.opts.provider, t.effectiveTableName()) catch |e| {
             std.debug.print(
                 "[sync_schema] 读取 {s} 的现有列类型失败（{s}），本轮跳过改列比对\n",
@@ -1871,8 +1883,26 @@ pub const Dal = struct {
             }
 
             if (self.opts.provider == .sqlite) {
+                // 整表重建（RENAME → CREATE → INSERT SELECT → DROP）：只在 Full 做。
+                // `On` 档只提示，避免「只想补列却把表重建成不带视图/触发器的新表」。
+                if (migration.onlyCreate()) {
+                    std.debug.print(
+                        "[sync_schema] {s}.{s} 类型不一致（模型 {s} / 库 {s}）：SQLite 需整表重建，属 Full 档，本次未执行\n",
+                        .{ t.name, col_name, model_type, db_col.type_text },
+                    );
+                    continue;
+                }
                 sqlite_needs_rebuild = true;
                 changed += 1;
+                continue;
+            }
+
+            // 非重建类方言：放宽在 `On` 档就执行，缩窄/类型变更留给 `Full`
+            if (migration.onlyCreate() and !isWideningColumn(model_type, db_col.type_text)) {
+                std.debug.print(
+                    "[sync_schema] {s}.{s} 需要缩窄/改类型（模型 {s} / 库 {s}）：属 Full 档，本次未执行\n",
+                    .{ t.name, col_name, model_type, db_col.type_text },
+                );
                 continue;
             }
 
@@ -1880,6 +1910,11 @@ pub const Dal = struct {
             defer self.gpa.free(alter_sql);
             if (execute_ddl) {
                 _ = s.execute(alter_sql, &.{}) catch |e| {
+                    // 幂等：多实例同时启动时先到者已完成同一动作 → 目标状态已达成，不算失败
+                    if (isIdempotentDdlError(s.lastError())) {
+                        std.debug.print("[sync_schema] 跳过（目标状态已达成）：{s}\n", .{alter_sql});
+                        continue;
+                    }
                     std.debug.print("[sync_schema] 改列失败：{s}.{s}\n  SQL: {s}\n  错误: {s}\n", .{ t.name, col_name, alter_sql, s.lastError() });
                     return e;
                 };
@@ -2383,6 +2418,66 @@ fn canonicalBaseType(base: []const u8) []const u8 {
 /// 规则：**基础名（归并同义词后）必须相同**；参数只在**两边都写了**的时候才比 ——
 /// MySQL 的 `bit(1)` / `int(11)` 这类显示宽度、`tinyint` 与 `tinyint(1)` 的口径差异
 /// 都不该被当成「类型变了」而反复 ALTER（反复 ALTER 是真实的生产事故源）。
+/// 模型列类型相对库里类型是否 **放宽**（只增不减、不丢数据）。
+///
+/// 判定（与 Rust `Pek.RCode` 的 widening 同口径）：
+/// - 基类型必须相同（基础类型变更不算放宽）；
+/// - 模型无参数（如 `text`）而库里有参数 → 放宽；库里已无参数（无限制）→ 无需改；
+/// - 参数逐项比较：模型每一项 ≥ 库对应项才算放宽
+///   （`varchar(50) → varchar(100)`、`decimal(18,4) → decimal(20,6)`）。
+fn isWideningColumn(model_type: []const u8, db_type: []const u8) bool {
+    var mbuf: [192]u8 = undefined;
+    var dbuf: [192]u8 = undefined;
+    if (model_type.len >= mbuf.len or db_type.len >= dbuf.len) return false;
+    const m = splitType(normalizeTypeInto(&mbuf, model_type));
+    const d = splitType(normalizeTypeInto(&dbuf, db_type));
+    if (!std.ascii.eqlIgnoreCase(canonicalBaseType(m.base), canonicalBaseType(d.base))) return false;
+    if (d.args.len == 0) return false; // 库里已无限制：无需改
+    if (m.args.len == 0) return true; // 模型变成无限制（Text）→ 放宽
+
+    var mi = std.mem.splitScalar(u8, m.args, ',');
+    var di = std.mem.splitScalar(u8, d.args, ',');
+    while (di.next()) |db_part| {
+        const dv = std.fmt.parseInt(u32, std.mem.trim(u8, db_part, " "), 10) catch return false;
+        const model_part = mi.next() orelse return false;
+        const mv = std.fmt.parseInt(u32, std.mem.trim(u8, model_part, " "), 10) catch return false;
+        if (mv < dv) return false;
+    }
+    return true;
+}
+
+/// 幂等 DDL 错误：多实例同时启动时，先到者已经完成了同一动作 —— 目标状态已达成，不能算失败。
+///
+/// 依据**数据库错误文本**（各库表述不同，全部列在这里，不靠猜）：
+/// - 已存在：`already exists` / `Duplicate column` / `Duplicate key name` / `duplicate index`
+/// - 已不存在：`no such index` / `no such column` / `Unknown index` / `Unknown column` / `does not exist`
+fn isIdempotentDdlError(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "already exists",
+        "duplicate column",
+        "duplicate key name",
+        "duplicate index",
+        "no such index",
+        "no such column",
+        "unknown index",
+        "unknown column",
+        "does not exist",
+    };
+    for (needles) |needle| {
+        if (indexOfIgnoreCase(msg, needle) != null) return true;
+    }
+    return false;
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 fn typesEquivalent(model_type: []const u8, db_type: []const u8) bool {
     // 超长类型文本（真实库里几乎不会出现）直接判等价：宁可少改一次，也不要因截断
     // 造成「每轮同步都判定不一致」→ 反复 ALTER（那是会破坏生产的循环）
@@ -2394,6 +2489,30 @@ fn typesEquivalent(model_type: []const u8, db_type: []const u8) bool {
     if (!std.ascii.eqlIgnoreCase(canonicalBaseType(m.base), canonicalBaseType(d.base))) return false;
     if (m.args.len == 0 or d.args.len == 0) return true;
     return std.mem.eql(u8, m.args, d.args);
+}
+
+test "isWideningColumn：变长/精度变大算放宽，缩窄与改类型不算" {
+    // 放宽
+    try std.testing.expect(isWideningColumn("varchar(100)", "varchar(50)"));
+    try std.testing.expect(isWideningColumn("text", "varchar(50)"));
+    try std.testing.expect(isWideningColumn("decimal(20,6)", "decimal(18,4)"));
+    // 不算放宽（缩窄 / 同宽 / 库已无限制 / 基类型变了）
+    try std.testing.expect(!isWideningColumn("varchar(50)", "varchar(100)"));
+    try std.testing.expect(!isWideningColumn("varchar(50)", "varchar(50)"));
+    try std.testing.expect(!isWideningColumn("varchar(50)", "text"));
+    try std.testing.expect(!isWideningColumn("int", "bigint"));
+    try std.testing.expect(!isWideningColumn("decimal(18,2)", "decimal(18,4)"));
+}
+
+test "isIdempotentDdlError：已存在/已不存在视为目标状态已达成" {
+    try std.testing.expect(isIdempotentDdlError("table User already exists"));
+    try std.testing.expect(isIdempotentDdlError("Duplicate column name 'Ex1'"));
+    try std.testing.expect(isIdempotentDdlError("Duplicate key name 'IX_User_Name'"));
+    try std.testing.expect(isIdempotentDdlError("no such index: IX_User_Name"));
+    try std.testing.expect(isIdempotentDdlError("no such column: OldCol"));
+    // 真正的错误不能被吞
+    try std.testing.expect(!isIdempotentDdlError("syntax error near FROM"));
+    try std.testing.expect(!isIdempotentDdlError("database is locked"));
 }
 
 test "连接串解析" {
