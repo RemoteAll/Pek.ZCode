@@ -2381,12 +2381,15 @@ fn normalizeTypeInto(buf: []u8, text: []const u8) []const u8 {
     return buf[0..out];
 }
 
-/// 拆成「基础名」与「括号参数」（参数含括号本身）。
+/// 拆成「基础名」与「括号参数」（参数**不含括号**，方便逐项 `parseInt`）。
 fn splitType(text: []const u8) struct { base: []const u8, args: []const u8 } {
-    if (std.mem.indexOfScalar(u8, text, '(')) |i| {
-        return .{ .base = std.mem.trim(u8, text[0..i], " "), .args = text[i..] };
+    const i = std.mem.indexOfScalar(u8, text, '(') orelse return .{ .base = text, .args = "" };
+    const open = i + 1;
+    var close = text.len;
+    if (std.mem.lastIndexOfScalar(u8, text, ')')) |j| {
+        if (j >= open) close = j;
     }
-    return .{ .base = text, .args = "" };
+    return .{ .base = std.mem.trim(u8, text[0..i], " "), .args = std.mem.trim(u8, text[open..close], " ") };
 }
 
 /// 不同库对同一类型的叫法归并（PostgreSQL 的 `integer` / `character varying` 尤其明显）。
@@ -2406,6 +2409,14 @@ fn canonicalBaseType(base: []const u8) []const u8 {
         .{ "bool", "boolean" },
         .{ "float8", "double precision" },
         .{ "float4", "real" },
+        // 变长字符串族：`varchar(n)` → `text` 属于**放宽**（去掉了长度上限），
+        // 必须归并到同一基类型，否则 `isWideningColumn` 会判成「改了基类型」而不执行。
+        .{ "text", "varchar" },
+        .{ "tinytext", "varchar" },
+        .{ "mediumtext", "varchar" },
+        .{ "longtext", "varchar" },
+        .{ "ntext", "varchar" },
+        .{ "clob", "varchar" },
     };
     for (pairs) |p| {
         if (std.ascii.eqlIgnoreCase(base, p[0])) return p[1];
@@ -2437,13 +2448,17 @@ fn isWideningColumn(model_type: []const u8, db_type: []const u8) bool {
 
     var mi = std.mem.splitScalar(u8, m.args, ',');
     var di = std.mem.splitScalar(u8, d.args, ',');
+    // 必须**至少有一项严格变大**才算放宽：全等（`varchar(50)` vs `varchar(50)`）不改，
+    // 否则每轮同步都会判成「需要 ALTER」→ 反复改列（生产事故源）。
+    var widened = false;
     while (di.next()) |db_part| {
         const dv = std.fmt.parseInt(u32, std.mem.trim(u8, db_part, " "), 10) catch return false;
         const model_part = mi.next() orelse return false;
         const mv = std.fmt.parseInt(u32, std.mem.trim(u8, model_part, " "), 10) catch return false;
         if (mv < dv) return false;
+        if (mv > dv) widened = true;
     }
-    return true;
+    return widened;
 }
 
 /// 幂等 DDL 错误：多实例同时启动时，先到者已经完成了同一动作 —— 目标状态已达成，不能算失败。

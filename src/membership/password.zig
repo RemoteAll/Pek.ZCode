@@ -211,6 +211,12 @@ pub fn verify(password: []const u8, stored: []const u8) bool {
     {
         if (hmacBase64Matches(alg, salt, password, want)) return true;
         if (std.ascii.eqlIgnoreCase(alg, "md5+sha512")) {
+            // C# 口径：`md5+sha512` 的 msg 是「MD5 原始 16 字节」。
+            // 因此**明文**要先取 MD5 再 HMAC（缺这一步就会出现「哈希能生成、校验永远不过」）。
+            var md5_raw: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(password, &md5_raw, .{});
+            if (hmacBase64Matches(alg, salt, &md5_raw, want)) return true;
+            // 前端已 MD5（32 位 hex）：解成 16 字节再 HMAC（同一份 msg）
             if (unhexMd5(password)) |raw| {
                 if (hmacBase64Matches(alg, salt, &raw, want)) return true;
             }

@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
         .root_module = unit_mod,
     });
     const run_unit = b.addRunArtifact(unit_tests);
+    // 只跑名称包含该子串的用例：`zig build test -Dfilter=isWideningColumn`
+    // （全量 317 项在 Windows 上要 1~2 分钟，改一处只想验证一条时用它）
+    if (b.option([]const u8, "filter", "只跑名称包含该子串的用例")) |filter| {
+        run_unit.addArg(b.fmt("--test-filter={s}", .{filter}));
+    }
 
     // 集成测试（真实 SQLite：动态加载 sqlite3.dll / winsqlite3.dll）
     const itest_mod = b.createModule(.{

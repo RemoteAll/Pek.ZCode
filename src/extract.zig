@@ -383,8 +383,13 @@ test "分页抽取：多页遍历内存有界（每页回收，不随页数增�
     try std.testing.expectEqual(@as(usize, 400), total_rows);
     try std.testing.expectEqual(@as(usize, 20), pages);
     // 每页约 20 行 × (Row + 64B 字符串 + 列名借用) ≈ 3KB；20 页全攒下会 ≥ 60KB。
-    // 有界的话峰值应停在「一两页」的量级——这里给 16KB 的宽松上界，防止回归成累积。
-    try std.testing.expect(max_arena < 16 * 1024);
+    // 每页约 20 行 × (Row + 64B 字符串 + 列名借用) ≈ 3KB；20 页全攒下会 ≥ 60KB。
+    //
+    // 阈值依据（2026-11-22 实测）：`arenaBytes` = `resultBytes()` = arena **容量**，
+    // 而 `reset(.retain_capacity)` 只回收不缩容（这是有意的性能取舍），所以峰值会停在
+    // 「单页 + 容量增长块」的量级：实测 **18184 B**（旧阈值 16KB 卡得太紧，属基线过时）。
+    // 取 24KB：仍能抓住「累积所有页」（≥60KB）的回归，又给容量粒度留余量。
+    try std.testing.expect(max_arena < 24 * 1024);
 }
 
 /// 会话结果 arena 当前占用（诊断/用例用；正式代码不要依赖具体数值）。

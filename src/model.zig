@@ -419,6 +419,165 @@ pub const EntityModel = struct {
         }
     }
 
+    /// 实体并入模型的统计（日志 / 测试用）。
+    pub const MergeEntityReport = struct {
+        /// 模型里没有、由实体补上的表
+        tables_added: usize = 0,
+        /// 模型里已有、被实体补列的表
+        tables_merged: usize = 0,
+        /// 实体补进来的列（XML 里没有）
+        columns_added: usize = 0,
+        /// 实体补进来的索引
+        indexes_added: usize = 0,
+    };
+
+    /// 把**编译期实体**（`{表}.zig` 的 `meta` / `indexes` / `max_cache_count`）并入模型。
+    ///
+    /// 口径：建表 = **`Model.xml` ∪ 实体**，两边谁都不许单方面把表/列「删掉」。
+    /// 因为 `Model.xml` 可能被人为清理掉表或列，而实体仍被业务代码引用 —— 此时表/列不能消失；
+    /// 反过来 XML 里还有实体表达不了的信息（`ConnName` / `Migration` / `DefaultValue` / `EnumType`
+    /// / `DataScale` / 描述），所以**同名表/列一律保留 XML 的定义**，实体只补「XML 里没有的」。
+    ///
+    /// 合并规则：
+    /// - 模型里**没有**的表 → 按实体追加上（`tables_added`）；
+    /// - 模型里**已有**的表 → 只追加 XML 缺的列（`columns_added`），同名列保留 XML；
+    /// - 索引取并集（按「列组合 + unique」去重）；
+    /// - `max_cache_count`：XML 用默认值（1000）时才采用实体给的更具体值。
+    ///
+    /// `nullable`：实体补进来的列里，`true` 记为显式（保留可空）；`false` 视为「没写」，
+    /// 交给 [`applyCsharpColumnDefaults`] 按 C# 口径判定（否则会把 C# 同源的可空列建成 NOT NULL）。
+    pub fn mergeEntityTypes(self: *EntityModel, comptime types: anytype) !MergeEntityReport {
+        const a = self.arena.allocator();
+        var report = MergeEntityReport{};
+        var tables: std.ArrayList(TableMeta) = .empty;
+        try tables.appendSlice(a, self.tables);
+
+        inline for (types) |T| {
+            const em = @field(T, "meta");
+
+            // 实体列（字符串全部复制进 arena；实体是 comptime 常量，不能直接借它的内存）
+            var ent_cols: std.ArrayList(ColumnMeta) = .empty;
+            inline for (em.fields) |f| {
+                try ent_cols.append(a, .{
+                    .name = try a.dupe(u8, f.name),
+                    .column_name = if (f.column_name) |cn| try a.dupe(u8, cn) else null,
+                    .data_type = f.data_type,
+                    .length = f.length,
+                    .precision = f.precision,
+                    .scale = f.scale,
+                    .identity = f.identity,
+                    .primary_key = f.primary_key,
+                    .nullable = f.nullable,
+                    // 只有「显式 true」才算显式；false 交给 C# 默认口径推断
+                    .nullable_explicit = f.nullable,
+                    .additional = f.additional,
+                    .description = try a.dupe(u8, f.description),
+                });
+            }
+
+            // 实体索引
+            var ent_indexes: std.ArrayList(IndexMeta) = .empty;
+            if (@hasDecl(T, "indexes")) {
+                inline for (@field(T, "indexes")) |info| {
+                    const idx_cols = try a.alloc([]const u8, info.columns.len);
+                    inline for (info.columns, 0..) |c, k| idx_cols[k] = try a.dupe(u8, c);
+                    try ent_indexes.append(a, .{
+                        .name = if (info.name.len > 0) try a.dupe(u8, info.name) else null,
+                        .columns = idx_cols,
+                        .unique = info.unique,
+                        .expression = if (info.expression) |e| try a.dupe(u8, e) else null,
+                    });
+                }
+            }
+
+            const cache: i32 = if (@hasDecl(T, "max_cache_count")) @field(T, "max_cache_count") else 1000;
+
+            // 定位同名表（物理表名 / 逻辑名任一相同即视为同一张表）
+            var hit: ?usize = null;
+            for (tables.items, 0..) |t, i| {
+                const tn = t.effectiveTableName();
+                if (std.ascii.eqlIgnoreCase(tn, em.table_name) or
+                    std.ascii.eqlIgnoreCase(tn, em.name) or
+                    std.ascii.eqlIgnoreCase(t.name, em.name))
+                {
+                    hit = i;
+                    break;
+                }
+            }
+
+            if (hit) |i| {
+                const t = &tables.items[i];
+                // 1) XML 的列**原样保留**（信息更全：DefaultValue / EnumType / DataScale …）
+                var final_cols: std.ArrayList(ColumnMeta) = .empty;
+                try final_cols.appendSlice(a, t.columns);
+                // 2) 只追加 XML 里没有的列（XML 被清理掉列时，靠这一步补回来）
+                for (ent_cols.items) |ec| {
+                    var exists = false;
+                    for (t.columns) |xc| {
+                        if (std.ascii.eqlIgnoreCase(xc.name, ec.name)) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        try final_cols.append(a, ec);
+                        report.columns_added += 1;
+                    }
+                }
+                t.columns = try final_cols.toOwnedSlice(a);
+
+                // 3) 索引并集（按「列组合 + unique」去重）
+                var final_idx: std.ArrayList(IndexMeta) = .empty;
+                try final_idx.appendSlice(a, t.indexes);
+                for (ent_indexes.items) |ei| {
+                    var dup = false;
+                    for (t.indexes) |xi| {
+                        if (xi.unique == ei.unique and sameColumns(xi.columns, ei.columns)) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        try final_idx.append(a, ei);
+                        report.indexes_added += 1;
+                    }
+                }
+                t.indexes = try final_idx.toOwnedSlice(a);
+                // 实体给了更具体的缓存上限才覆盖（XML 未写时是默认 1000）
+                if (t.max_cache_count == 1000) t.max_cache_count = cache;
+                report.tables_merged += 1;
+            } else {
+                try tables.append(a, .{
+                    .name = try a.dupe(u8, em.name),
+                    .table_name = try a.dupe(u8, em.table_name),
+                    .max_cache_count = cache,
+                    .columns = try ent_cols.toOwnedSlice(a),
+                    .indexes = try ent_indexes.toOwnedSlice(a),
+                });
+                report.tables_added += 1;
+            }
+        }
+
+        self.tables = try tables.toOwnedSlice(a);
+        return report;
+    }
+
+    /// 两组列名是否等价（忽略大小写与顺序）。
+    fn sameColumns(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a) |x| {
+            var found = false;
+            for (b) |y| {
+                if (std.ascii.eqlIgnoreCase(x, y)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
     /// 表是否归属指定连接（忽略大小写；两级都没配视为归属）。
     pub fn tableBelongsToConn(self: *const EntityModel, meta: *const TableMeta, conn: []const u8) bool {
         const target = std.mem.trim(u8, conn, " \t\r\n");
@@ -914,4 +1073,108 @@ test "视图识别：IsView 与 # 前缀" {
     defer m.deinit();
     try std.testing.expect(m.tables[0].is_view);
     try std.testing.expect(m.tables[1].is_view);
+}
+
+// ───────────────── 实体并入模型（建表 = Model.xml ∪ 实体） ─────────────────
+
+const FakeField = struct {
+    name: []const u8,
+    data_type: DataType,
+    primary_key: bool = false,
+    identity: bool = false,
+    column_name: ?[]const u8 = null,
+    nullable: bool = false,
+    additional: bool = false,
+    length: i32 = 0,
+    precision: i32 = 0,
+    scale: i32 = 0,
+    description: []const u8 = "",
+};
+
+const FakeMeta = struct {
+    name: []const u8,
+    table_name: []const u8,
+    fields: []const FakeField,
+};
+
+const FakeIndex = struct {
+    name: []const u8 = "",
+    columns: []const []const u8 = &.{},
+    unique: bool = false,
+    expression: ?[]const u8 = null,
+};
+
+/// XML 里已有 `Config`（少一列 `Remark`），实体把它补回来。
+const FakeConfigEntity = struct {
+    pub const meta = FakeMeta{ .name = "Config", .table_name = "Config", .fields = &.{
+        .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true },
+        .{ .name = "Name", .data_type = .string, .length = 100 },
+        .{ .name = "Remark", .data_type = .string, .length = 200, .nullable = true },
+    } };
+    pub const indexes = [_]FakeIndex{.{ .columns = &.{"Name"}, .unique = true }};
+    pub const max_cache_count: i32 = 1000;
+};
+
+/// XML 里**没有**这张表（被清理了），实体还在 → 必须建出来。
+const FakeSessionEntity = struct {
+    pub const meta = FakeMeta{ .name = "Session", .table_name = "Session", .fields = &.{
+        .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true },
+        .{ .name = "Token", .data_type = .string, .length = 200 },
+    } };
+    pub const max_cache_count: i32 = 0;
+};
+
+test "实体并入：XML 缺表按实体补、缺列按实体补、同名列保留 XML" {
+    const xml =
+        \\<EntityModel><Tables>
+        \\<Table Name="Config" TableName="Config">
+        \\  <Columns>
+        \\    <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" />
+        \\    <Column Name="Name" DataType="String" Nullable="True" DefaultValue="''" />
+        \\  </Columns>
+        \\</Table>
+        \\</Tables></EntityModel>
+    ;
+    var m = try EntityModel.parse(std.testing.allocator, xml);
+    defer m.deinit();
+
+    const report = try m.mergeEntityTypes(.{ FakeConfigEntity, FakeSessionEntity });
+    try std.testing.expectEqual(@as(usize, 1), report.tables_added); // Session
+    try std.testing.expectEqual(@as(usize, 1), report.columns_added); // Config.Remark
+    try std.testing.expectEqual(@as(usize, 1), report.indexes_added); // Config.ix(Name)
+
+    // XML 被清理掉的表由实体补回
+    const session = m.table("Session") orelse return error.MissingSession;
+    try std.testing.expectEqual(@as(usize, 2), session.columns.len);
+    try std.testing.expectEqual(@as(i32, 0), session.max_cache_count);
+
+    // 同名列保留 XML 定义（`DefaultValue` 不能丢）
+    const config = m.table("Config") orelse return error.MissingConfig;
+    const name_col = config.column("Name") orelse return error.MissingName;
+    try std.testing.expectEqualStrings("''", name_col.default_value.?);
+    // 缺列由实体补回
+    try std.testing.expect(config.column("Remark") != null);
+}
+
+test "实体并入：幂等（重复并两次不产生重复列/索引）" {
+    const xml =
+        \\<EntityModel><Tables>
+        \\<Table Name="Config" TableName="Config">
+        \\  <Columns><Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" /></Columns>
+        \\</Table>
+        \\</Tables></EntityModel>
+    ;
+    var m = try EntityModel.parse(std.testing.allocator, xml);
+    defer m.deinit();
+
+    const first = try m.mergeEntityTypes(.{FakeConfigEntity});
+    const second = try m.mergeEntityTypes(.{FakeConfigEntity});
+    try std.testing.expectEqual(@as(usize, 0), first.tables_added);
+    try std.testing.expectEqual(@as(usize, 0), second.tables_added);
+    try std.testing.expectEqual(@as(usize, 0), second.columns_added);
+    try std.testing.expectEqual(@as(usize, 0), second.indexes_added);
+
+    const config = m.table("Config") orelse return error.MissingConfig;
+    try std.testing.expectEqual(@as(usize, 3), config.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), config.indexes.len);
 }
