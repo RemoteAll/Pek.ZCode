@@ -200,8 +200,62 @@ pub fn verify(password: []const u8, stored: []const u8) bool {
         return false;
     }
 
-    // `sha1` / `sha512` 档只认明文（不接前端 MD5），本仓不使用；显式拒绝而不是猜。
+    // `sha1` / `sha512` / `md5+sha512` 档（C# `SaltPasswordProvider` 默认就是 `sha512`）：
+    //   `sha1`       = Base64(HMAC-SHA1(  key=盐, msg=UTF8(明文)      ))
+    //   `sha512`     = Base64(HMAC-SHA512(key=盐, msg=UTF8(明文)      ))
+    //   `md5+sha512` = Base64(HMAC-SHA512(key=盐, msg=MD5原始16字节   ))
+    // 这三档 C# 只认明文；`md5+sha512` 额外接受「前端 MD5（32 位 hex）」解成 16 字节再 HMAC。
+    if (std.ascii.eqlIgnoreCase(alg, "sha1") or
+        std.ascii.eqlIgnoreCase(alg, "sha512") or
+        std.ascii.eqlIgnoreCase(alg, "md5+sha512"))
+    {
+        if (hmacBase64Matches(alg, salt, password, want)) return true;
+        if (std.ascii.eqlIgnoreCase(alg, "md5+sha512")) {
+            if (unhexMd5(password)) |raw| {
+                if (hmacBase64Matches(alg, salt, &raw, want)) return true;
+            }
+        }
+        return false;
+    }
+
     return false;
+}
+
+/// 按算法名算 HMAC 并转 Base64，与库值做常量时间比较（`sha1` / `sha512` 档）。
+fn hmacBase64Matches(alg: []const u8, salt: []const u8, msg: []const u8, want: []const u8) bool {
+    var raw: [64]u8 = undefined;
+    const mac: []const u8 = if (std.ascii.eqlIgnoreCase(alg, "sha1")) blk: {
+        var out: [20]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&out, msg, salt);
+        @memcpy(raw[0..20], &out);
+        break :blk raw[0..20];
+    } else blk: {
+        var out: [64]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha512.create(&out, msg, salt);
+        @memcpy(raw[0..64], &out);
+        break :blk raw[0..64];
+    };
+    var b64: [88]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&b64, mac);
+    return eqlConstantTime(want, encoded);
+}
+
+/// 验证 + 按需升级的结果。
+pub const VerifyResult = struct {
+    /// 验证是否通过。
+    ok: bool,
+    /// 需要升级时的新散列（**调用方负责释放**）；`null` = 已是目标格式，或验证失败。
+    upgraded: ?[]u8 = null,
+};
+
+/// 验证 + 按需升级：通过但仍是旧档 / 旧格式（裸 MD5、`$sha512$` 等）时，生成新散列返回。
+///
+/// 这是各消费方登录流程要用的那一个（对齐 C# `LoginCore`：
+/// `if (!user.Password.Contains("$")) user.Password = prv.Hash(password);`）。
+pub fn verifyAndUpgradeAlloc(a: std.mem.Allocator, password: []const u8, stored: []const u8) !VerifyResult {
+    if (!verify(password, stored)) return .{ .ok = false };
+    if (!needsUpgrade(stored)) return .{ .ok = true };
+    return .{ .ok = true, .upgraded = try hashAlloc(a, password) };
 }
 
 /// 是否需要"登录成功后自动升级"：非 `$md5+sha1$` 格式（C# `LoginCore` 的旧格式判断 `!Password.Contains("$")`
@@ -209,6 +263,54 @@ pub fn verify(password: []const u8, stored: []const u8) bool {
 pub fn needsUpgrade(stored: []const u8) bool {
     if (!std.mem.startsWith(u8, stored, "$")) return true;
     return !std.mem.startsWith(u8, stored, "$" ++ algorithm ++ "$");
+}
+
+test "sha512 档（C# 默认）与 sha1 / md5+sha512 档都能校验" {
+    const a = std.testing.allocator;
+    const salt = "eRF1uJm3NhEHyxiC";
+
+    // $sha512$：Base64(HMAC-SHA512(key=盐, msg=明文))
+    {
+        var raw: [64]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha512.create(&raw, "New#life", salt);
+        var b64: [88]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&b64, &raw);
+        const stored = try std.fmt.allocPrint(a, "$sha512${s}${s}", .{ salt, enc });
+        defer a.free(stored);
+        try std.testing.expect(verify("New#life", stored));
+        try std.testing.expect(!verify("wrong", stored));
+    }
+
+    // $sha1$：Base64(HMAC-SHA1(key=盐, msg=明文))
+    {
+        var raw: [20]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&raw, "New#life", salt);
+        var b64: [28]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&b64, &raw);
+        const stored = try std.fmt.allocPrint(a, "$sha1${s}${s}", .{ salt, enc });
+        defer a.free(stored);
+        try std.testing.expect(verify("New#life", stored));
+        try std.testing.expect(!verify("wrong", stored));
+    }
+
+    // $md5+sha512$：Base64(HMAC-SHA512(key=盐, msg=MD5 原始 16 字节))
+    {
+        var md5_raw: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash("New#life", &md5_raw, .{});
+        var raw: [64]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha512.create(&raw, &md5_raw, salt);
+        var b64: [88]u8 = undefined;
+        const enc = std.base64.standard.Encoder.encode(&b64, &raw);
+        const stored = try std.fmt.allocPrint(a, "$md5+sha512${s}${s}", .{ salt, enc });
+        defer a.free(stored);
+        try std.testing.expect(verify("New#life", stored));
+        try std.testing.expect(!verify("wrong", stored));
+
+        // 前端传 32 位 MD5（hex）也要能过：解成 16 字节再 HMAC
+        var hex: [32]u8 = undefined;
+        md5HexLower(&hex, "New#life");
+        try std.testing.expect(verify(&hex, stored));
+    }
 }
 
 test "md5+sha1：格式、盐长度、摘要可往返" {
