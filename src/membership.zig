@@ -4,10 +4,21 @@
 //! 与 ORM 主链路的关系：本子系统**只提供业务语义**（实体 + 规则 + 权限翻译），
 //! 读写仍走 `zcode.entity` / `zcode.dbtable` / `zcode.Dal`，不另造一套数据访问。
 //!
-//! 表结构以 `membership/Member.xml` 为唯一真相源（C# 同源文件）；
+//! 表结构以 `src/membership/Member.xml` 为唯一真相源（C# 同源文件）；
 //! `src/membership/entities/*.zig` 由 `zig build codegen` 生成，**不要手改**。
 
 const std = @import("std");
+
+/// **C# 同源模型**（`src/membership/Member.xml`）：`User` / `Department` / `Role` / `Menu` /
+/// `Parameter` / `Area` / `Log` / `Tenant` / `TenantUser` 九张表。
+///
+/// 消费方（如 `Pek.ZDsMallUI`）把它与自己的 `Model.xml` **在模型对象层合并**后跑一次
+/// `Dal.syncSchema`，得到的就是与 C# **完全一致**的表结构 —— 于是 Zig 与 C# 读写
+/// **同一份库、同一批数据**，将来换语言不用迁数据、不用改字段。
+///
+/// `Member.xml` 与 `src/membership/entities/*.zig` 同源（`zig build codegen` 生成实体），
+/// 是这套 Membership 表的**唯一真相源**，不要在各项目里复制一份。
+pub const MemberXml = @embedFile("membership/Member.xml");
 
 /// 枚举（`PermissionFlags` / `DataScopes` / `RoleTypes` …），数值逐字对齐 C#。
 pub const enums = @import("membership/enums.zig");

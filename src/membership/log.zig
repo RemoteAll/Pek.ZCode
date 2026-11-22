@@ -14,7 +14,7 @@
 //! 2. C# 源码 `if (error.IsNullOrEmpty()) sb.Append(error);`（`:160`）只在**错误为空**时追加，
 //!    等于从不写错误信息——那是笔误。本实现按显式意图追加 `error`，并在 `--` 后注明。
 //!
-//! 表归属：`Log` 表在 `Log` 连接（`Member.xml` 表级 `ConnName="Log"`），
+//! 表归属：`Log` 表在 `Log` 连接（`src/membership/Member.xml` 表级 `ConnName="Log"`），
 //! 所以写日志必须用**连到 Log 库**的 `Dal`；不要拿 Membership 库的 Dal 去写。
 
 const std = @import("std");

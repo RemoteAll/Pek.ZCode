@@ -19,6 +19,10 @@ pub fn main(init: std.process.Init) !void {
 
     var model_path: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    // 反向工程时 `Model.xml` 的落盘路径（默认 `{out}/Model.xml`）。
+    var model_out: ?[]const u8 = null;
+    // 反向工程：**只导出 `Model.xml`**，不生成实体（看/比结构时用）。
+    var model_only = false;
     var table: ?[]const u8 = null;
     var reverse_conn: ?[]const u8 = null;
     var dry_run = false;
@@ -38,6 +42,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= argv.len) return usage();
             out_dir = argv[i];
+        } else if (std.mem.eql(u8, a, "--model-out")) {
+            i += 1;
+            if (i >= argv.len) return usage();
+            model_out = argv[i];
+        } else if (std.mem.eql(u8, a, "--model-only")) {
+            model_only = true;
         } else if (std.mem.eql(u8, a, "--table")) {
             i += 1;
             if (i >= argv.len) return usage();
@@ -67,10 +77,13 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // 反向工程：连库 → 生成 Model.xml（--out 这里是**文件路径**而不是目录）
-    // 反查不需要现有模型，用一个空模型建 Dal 即可（Dal 只在 sync/table 时用到表定义）
+    // 反向工程：连库 → `Model.xml` → **实体**（与 C#「GetTables + Builder」两步同口径，
+    // Rust `Pek.RCode --reverse` 只做到 `Model.xml`，这里再往前一步把实体也生成出来）。
+    // `--out` 是**实体目录**（与正向一致），`--model-out` 指定 `Model.xml` 路径，
+    // 默认落在 `{out}/Model.xml`（留着随时能看/改结构）。
     if (reverse_conn) |conn| {
-        const od = out_dir orelse return usage();
+        // `--model-only`：只要 xml（结构导出），不需要实体目录
+        const od = out_dir orelse if (model_only) "" else return usage();
         const empty_model =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><EntityModel xmlns=\"https://newlifex.com/Model202509.xsd\"><Tables></Tables></EntityModel>";
         var dal = try zcode.Dal.initWithModel(gpa, conn, try zcode.EntityModel.parse(gpa, empty_model));
@@ -82,10 +95,33 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(xml);
         if (dry_run) {
             std.debug.print("{s}", .{xml});
-        } else {
-            try zcode.File.WriteAll(od, xml);
-            std.debug.print("zcodegen --reverse：已生成 {s}（{d} 字节）\n", .{ od, xml.len });
+            return;
         }
+
+        const xml_path = model_out orelse if (od.len > 0)
+            try std.fmt.allocPrint(gpa, "{s}/Model.xml", .{od})
+        else
+            return usage();
+        defer if (model_out == null and od.len > 0) gpa.free(xml_path);
+        try zcode.File.WriteAll(xml_path, xml);
+        std.debug.print("zcodegen --reverse：已从库导出 {s}（{d} 字节）\n", .{ xml_path, xml.len });
+        if (model_only) return;
+
+        // 接着用刚导出的模型生成实体（同一套语义：列默认值按 C# XCode 补全）
+        var m = zcode.EntityModel.parse(gpa, xml) catch |e| {
+            std.debug.print("zcodegen --reverse：解析刚生成的 Model.xml 失败（{s}）\n", .{@errorName(e)});
+            return;
+        };
+        m.applyCsharpColumnDefaults();
+        const report = try zcode.codegen.generateAll(gpa, &m, .{
+            .out_dir = od,
+            .table = table,
+            .dry_run = false,
+            .import = import_path,
+            .biz = biz,
+            .force_biz = force_biz,
+        });
+        std.debug.print("zcodegen --reverse：已生成 {d} 个实体 / {d} 个文件 → {s}\n", .{ report.tables, report.files, od });
         return;
     }
 
@@ -101,6 +137,10 @@ pub fn main(init: std.process.Init) !void {
 
     var m = try zcode.EntityModel.load(gpa, mp);
     defer m.deinit();
+
+    // **按 C# XCode 的列语义补全**（C# 同源模型不写 `Nullable`/`DefaultValue`）：
+    // 与 `syncSchema` 建表同一口径，否则生成的实体把可空列当空串/0。
+    m.applyCsharpColumnDefaults();
 
     const report = try zcode.codegen.generateAll(gpa, &m, .{
         .out_dir = od,
@@ -202,13 +242,22 @@ fn verifyModel(gpa: std.mem.Allocator, path: []const u8) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\zcodegen —— Model.xml → Zig 实体
+        \\zcodegen —— Model.xml ⇄ Zig 实体（正向生成 / 反向工程）
         \\
-        \\  --model <path>   必填，Model.xml 路径
-        \\  --verify        只做互读对账（解析 → 回写 → 再解析），不生成
-        \\  --out <dir>      必填，输出目录
-        \\  --table <name>   只生成指定表（实体名或物理表名）
-        \\  --dry-run        只打印到标准错误，不写文件
+        \\正向（模型 → 实体）：
+        \\  --model <path>    必填，Model.xml 路径
+        \\  --out <dir>       必填，实体输出目录（名字.zig + 名字.biz.zig + mod.zig）
+        \\  --table <name>    只生成指定表（实体名或物理表名）
+        \\  --import <path>   生成文件里的 zcode 导入路径（默认 zcode）
+        \\  --no-biz          不生成业务扩展文件
+        \\  --force-biz       覆盖已有业务扩展文件（默认保留）
+        \\  --dry-run         只打印，不写文件
+        \\  --verify          只做互读对账（解析 → 回写 → 再解析），不生成
+        \\
+        \\反向工程（库 → Model.xml → 实体，与 C#「GetTables + Builder」同口径）：
+        \\  --reverse <conn>  连接串，如 "Data Source=Data/Admin.db;Provider=SQLite"
+        \\  --out <dir>       必填，实体输出目录
+        \\  --model-out <path> 导出的 Model.xml 路径（默认 out 目录下 Model.xml）
         \\
     , .{});
 }

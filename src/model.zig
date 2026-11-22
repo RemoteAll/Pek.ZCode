@@ -152,6 +152,12 @@ pub const ColumnMeta = struct {
     primary_key: bool = false,
     master: bool = false,
     nullable: bool = false,
+    /// 模型里**是否显式写了 `Nullable` 属性**。
+    ///
+    /// C# 同源模型（如 `membership/Member.xml`）大量列不写 `Nullable`，而 C# XCode 对
+    /// 不写的列按「引用类型 NULL / 值类型 NOT NULL + 默认值」生成 DDL。没有本标记时
+    /// `nullable=false` 无法区分「显式 False」与「没写」，建表就会把可空列建成 NOT NULL。
+    nullable_explicit: bool = false,
     /// 累加字段（C# `BindColumnAttribute.Additional`）：更新时按 `col = col + 值` 累加，
     /// 不做整体覆盖；统计类字段靠它避免「读-改-写」丢更新。
     additional: bool = false,
@@ -379,6 +385,40 @@ pub const EntityModel = struct {
         return self.modelConn();
     }
 
+    /// **按 C# XCode 的列语义补全模型**（就地修改）。
+    ///
+    /// 为什么需要：C# 同源模型（`membership/Member.xml`）大量列**不写 `Nullable` / `DefaultValue`**，
+    /// 而 C# 的建表规则是「**引用类型默认 NULL；值类型默认 NOT NULL + 默认值 0**」。
+    /// Zig 侧若直接按「没写 = NOT NULL」建表，`User.Password` / `User.DisplayName` 这类列会被建成
+    /// `NOT NULL`，随后 C# 往同一张表写 NULL 就报错 —— 表结构复用就断了。
+    ///
+    /// 规则（**只补没显式写的**，写了 `Nullable` / `DefaultValue` 的列原样保留）：
+    /// - 值类型（`boolean` / `byte` / `int16` / `int32` / `int64` / `single` / `double` / `decimal`）
+    ///   → NOT NULL + `DefaultValue = "0"`（对齐 C# 生成的 `... NOT NULL DEFAULT 0`）；
+    /// - 其它（`string` / `datetime` / `guid` / `binary` / `json`）→ 可空（对齐 C# 生成的 `... NULL`）。
+    ///
+    /// 幂等：重复调用结果不变。建表/迁移前调用一次即可。
+    pub fn applyCsharpColumnDefaults(self: *EntityModel) void {
+        for (self.tables) |*tbl| {
+            const cols = @constCast(tbl.columns);
+            for (cols) |*col| {
+                if (col.primary_key or col.identity) continue;
+                if (!col.nullable_explicit) {
+                    col.nullable = switch (col.data_type) {
+                        .boolean, .byte, .int16, .int32, .int64, .single, .double, .decimal => false,
+                        else => true,
+                    };
+                }
+                if (col.default_value == null) {
+                    switch (col.data_type) {
+                        .boolean, .byte, .int16, .int32, .int64, .single, .double, .decimal => col.default_value = "0",
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
     /// 表是否归属指定连接（忽略大小写；两级都没配视为归属）。
     pub fn tableBelongsToConn(self: *const EntityModel, meta: *const TableMeta, conn: []const u8) bool {
         const target = std.mem.trim(u8, conn, " \t\r\n");
@@ -577,6 +617,7 @@ fn parseColumn(a: std.mem.Allocator, e: *const zzig.xml.Dom.Element, table_name:
         .primary_key = attrBool(e, "PrimaryKey"),
         .master = attrBool(e, "Master"),
         .nullable = attrBool(e, "Nullable"),
+        .nullable_explicit = attrString(e, "Nullable") != null,
         .additional = attrBool(e, "Additional"),
         .default_value = attrString(e, "DefaultValue"),
         .description = attrString(e, "Description") orelse "",

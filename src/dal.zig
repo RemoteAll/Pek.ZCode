@@ -1664,9 +1664,15 @@ pub const Dal = struct {
                 continue;
             }
             const execute_ddl = migration.canExecute();
-            const exists = try tableExists(s, self.opts.provider, t.effectiveTableName());
+            const exists = tableExists(s, self.opts.provider, t.effectiveTableName()) catch |e| {
+                std.debug.print("[sync_schema] 查询表是否存在失败：{s}（{s}）错误：{s}\n", .{ t.name, @errorName(e), s.lastError() });
+                return e;
+            };
             if (!exists) {
-                const stmts = try self.opts.provider.createTableAlloc(self.gpa, t);
+                const stmts = self.opts.provider.createTableAlloc(self.gpa, t) catch |e| {
+                    std.debug.print("[sync_schema] 生成建表语句失败：{s}（{s}）\n", .{ t.name, @errorName(e) });
+                    return e;
+                };
                 defer {
                     for (stmts) |stmt| self.gpa.free(stmt);
                     self.gpa.free(stmts);
@@ -1727,12 +1733,17 @@ pub const Dal = struct {
                 report.indexes_created += 1;
             }
 
-            // Full：删除模型里已不存在的列与索引（**只有 Full 档允许删除**）
-            // 顺序：**先删索引再删列**——否则引用该列的索引会让 DROP COLUMN 报
-            //「error in index ... after drop column: no such column」
+            // 顺序：**先删索引再删列** —— 引用该列的索引会让 DROP COLUMN 报
+            //「error in index ... after drop column: no such column」。
+            //
+            // 档位口径（对齐 Rust `Pek.RCode::sync_table_indexes` 的原话：
+            // 「索引增删不改数据，**宽度档位（`On`）即执行**，只读档收集到 `pending_sql`」）：
+            // - **补索引 / 普通→唯一升级 / 删多余索引** → `On` 档就执行（`ReadOnly` 只收集）；
+            // - **列放宽**（长度/精度变大）→ `On` 档（Rust 同口径；Zig 暂时保守归入 Full）；
+            // - **列缩窄 / 类型变更 / 删列** → 只有 `Full`。
+            try self.dropExtraIndexes(s, t, execute_ddl, &report);
             if (!migration.onlyCreate()) {
                 try self.alterChangedColumns(s, t, execute_ddl, &report);
-                try self.dropExtraIndexes(s, t, execute_ddl, &report);
                 try self.dropExtraColumns(s, t, existing, execute_ddl, &report);
             }
         }

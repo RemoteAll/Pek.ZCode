@@ -52,6 +52,10 @@ pub const Report = struct {
 pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options) !Report {
     if (!opts.dry_run) try zzig.compat.fs.cwd().makePath(opts.out_dir);
 
+    // 列属性不做二次加工：调用方（`zcodegen` 入口）已按 C# XCode 语义调用
+    // `EntityModel.applyCsharpColumnDefaults`（string/datetime 可空、值类型 NOT NULL + 默认 0），
+    // 保证「生成实体」与「`syncSchema` 建表」两处口径一致。
+
     var report = Report{};
     var modules: std.ArrayList([]const u8) = .empty;
     defer {
