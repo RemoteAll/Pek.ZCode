@@ -42,6 +42,10 @@ pub const Options = struct {
 pub const Report = struct {
     tables: usize = 0,
     files: usize = 0,
+    /// 本次实际写入的实体文件数（内容没变的不算，避免白刷 mtime）
+    files_written: usize = 0,
+    /// 内容未变、跳过的实体文件数
+    files_kept: usize = 0,
     /// 本次写入的业务扩展文件数
     biz_written: usize = 0,
     /// 已存在而保留的业务扩展文件数
@@ -80,7 +84,11 @@ pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options)
             defer gpa.free(file_name);
             const path = try std.fs.path.join(gpa, &.{ opts.out_dir, file_name });
             defer gpa.free(path);
-            try zzig.File.WriteAll(path, src);
+            if (try writeIfChanged(gpa, path, src)) {
+                report.files_written += 1;
+            } else {
+                report.files_kept += 1;
+            }
             report.files += 1;
 
             // 业务扩展文件：只在不存在时创建（对齐 C# 的 `Xxx.Biz.cs` 不被覆盖）
@@ -109,7 +117,7 @@ pub fn generateAll(gpa: std.mem.Allocator, m: *const EntityModel, opts: Options)
         defer gpa.free(index);
         const path = try std.fs.path.join(gpa, &.{ opts.out_dir, "mod.zig" });
         defer gpa.free(path);
-        try zzig.File.WriteAll(path, index);
+        _ = try writeIfChanged(gpa, path, index);
         report.files += 1;
     }
     return report;
@@ -377,6 +385,17 @@ pub fn moduleIndexAllocOpt(gpa: std.mem.Allocator, names: []const []const u8, wi
             try b.add(n);
         }
         try b.add("};\n");
+        if (with_biz) {
+            // 业务扩展模块的元组：`inline for (all_biz) |B| std.testing.refAllDecls(B);`
+            // 一行就能把**所有** `.biz.zig` 的用例收进测试（否则每加一张表都要在测试根里手写一行）。
+            try b.add("\n/// 全部业务扩展模块（`inline for (all_biz) |B|` 收集测试 / 批量处理）\n");
+            try b.add("pub const all_biz = .{");
+            for (names, 0..) |n, i| {
+                if (i > 0) try b.add(", ");
+                try b.fmt("{s}Biz", .{n});
+            }
+            try b.add("};\n");
+        }
     }
     return b.toOwnedSlice();
 }
@@ -426,6 +445,22 @@ pub fn bizTemplateAlloc(gpa: std.mem.Allocator, t: *const TableMeta, opts: Optio
 /// 文件是否存在（`statFile` 抛错即视为不存在）。
 fn fileExists(path: []const u8) bool {
     _ = zzig.compat.fs.cwd().statFile(path) catch return false;
+    return true;
+}
+
+/// 写入文件，**内容完全相同则不动**（返回 `false`）。
+///
+/// 为什么要比较：`zig build` 会把 codegen 当构建步骤跑，若每次无条件覆盖写，
+/// 所有实体文件的 mtime 都会变 → 编译器认为源码变了 → 每次全量重编。
+fn writeIfChanged(gpa: std.mem.Allocator, path: []const u8, bytes: []const u8) !bool {
+    // 0.17 已移除 `std.fs.cwd().readFileAlloc`，统一走 `zzig.File.ReadAllAlloc`
+    // （内部按 `getEndPos` 长度读，跨版本可用）。
+    const old = zzig.File.ReadAllAlloc(gpa, path, 8 * 1024 * 1024) catch null;
+    defer if (old) |b| gpa.free(b);
+    if (old) |b| {
+        if (std.mem.eql(u8, b, bytes)) return false;
+    }
+    try zzig.File.WriteAll(path, bytes);
     return true;
 }
 
