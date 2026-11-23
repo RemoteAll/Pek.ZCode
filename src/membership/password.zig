@@ -69,7 +69,27 @@ pub fn makeSalt(allocated: *[salt_len]u8) void {
 }
 
 /// 用指定盐算出 `md5+sha1` 的 Base64 摘要（`out` 为 28 字符）。
+///
+/// **C# 口径**：`Base64(HMAC-SHA1(key = MD5(明文) 16 字节, msg = 盐))`。
+///
+/// ★ 注意 Zig 标准库的签名是 `HmacSha1.create(out, msg, key)`（**msg 在前**），
+/// 早先这里写成 `create(&mac, &md5_bytes, salt)`，等价于 `key=盐 / msg=MD5`——
+/// 与本档要求的 `key=MD5 / msg=盐` **正好相反**，于是「Zig 写的散列 C# 验不过」。
+/// 2026-11-23 由 `PROBE` 用例实测发现并改正；老库里的旧值由 `verify` 的历史分支兜底，
+/// 登录成功时自动升级成新口径（见 `verifyAndUpgradeAlloc`）。
 pub fn digestWithSalt(out: *[28]u8, password: []const u8, salt: []const u8) void {
+    var md5_bytes: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(password, &md5_bytes, .{});
+
+    var mac: [20]u8 = undefined;
+    std.crypto.auth.hmac.HmacSha1.create(&mac, salt, &md5_bytes);
+
+    _ = std.base64.standard.Encoder.encode(out, &mac);
+}
+
+/// **历史口径**（key = 盐、msg = MD5 明文）——仅用于校验 2026-11-23 之前写进库的老值。
+/// 命中后由 `verifyAndUpgradeAlloc` 升级为新口径。
+pub fn digestWithSaltLegacy(out: *[28]u8, password: []const u8, salt: []const u8) void {
     var md5_bytes: [16]u8 = undefined;
     std.crypto.hash.Md5.hash(password, &md5_bytes, .{});
 
@@ -91,6 +111,42 @@ pub fn hashWithSaltAlloc(a: std.mem.Allocator, password: []const u8, salt: []con
     var digest: [28]u8 = undefined;
     digestWithSalt(&digest, password, salt);
     return std.fmt.allocPrint(a, "${s}${s}${s}", .{ algorithm, salt, digest });
+}
+
+/// `md5+sha1` 档的三条匹配路径（**C# 口径**：key = MD5 16 字节，msg = 盐）：
+/// 明文 / 明文当 HMAC msg / 传输值（32 位 hex 解成 16 字节）。
+fn macMatches(plain: []const u8, salt: []const u8, want: []const u8) bool {
+    // 分支 1（标准）：plain 是明文 → HMAC(key = MD5(plain), msg = salt)
+    var digest: [28]u8 = undefined;
+    digestWithSalt(&digest, plain, salt);
+    if (eqlConstantTime(want, &digest)) return true;
+
+    // 分支 2（传输 MD5）：plain 是 32 位 hex → 解成 16 字节当 key，msg 仍是盐
+    if (unhexMd5(plain)) |bytes| {
+        var mac: [20]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&mac, salt, &bytes);
+        var b64: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&b64, &mac);
+        if (eqlConstantTime(want, &b64)) return true;
+    }
+    return false;
+}
+
+/// 同一个档的**历史口径**（key = 盐、msg = MD5）：2026-11-23 之前 Zig 侧写进库的老值。
+/// 命中即视为「通过但需升级」，登录成功后改写成新口径（见 `verifyAndUpgradeAlloc`）。
+fn macMatchesLegacy(plain: []const u8, salt: []const u8, want: []const u8) bool {
+    var digest: [28]u8 = undefined;
+    digestWithSaltLegacy(&digest, plain, salt);
+    if (eqlConstantTime(want, &digest)) return true;
+
+    if (unhexMd5(plain)) |bytes| {
+        var mac: [20]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&mac, &bytes, salt);
+        var b64: [28]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&b64, &mac);
+        if (eqlConstantTime(want, &b64)) return true;
+    }
+    return false;
 }
 
 /// 常量时间字节比较（避免按字符提前返回泄露长度/前缀信息）。
@@ -174,30 +230,7 @@ pub fn verify(password: []const u8, stored: []const u8) bool {
     }
 
     if (std.ascii.eqlIgnoreCase(alg, algorithm)) {
-        var digest: [28]u8 = undefined;
-
-        // 分支 1（标准）：password 是明文
-        digestWithSalt(&digest, password, salt);
-        if (eqlConstantTime(want, &digest)) return true;
-
-        // 分支 2（兼容 sha1 档）：password 直接 HMAC
-        {
-            var mac: [20]u8 = undefined;
-            std.crypto.auth.hmac.HmacSha1.create(&mac, password, salt);
-            var b64: [28]u8 = undefined;
-            _ = std.base64.standard.Encoder.encode(&b64, &mac);
-            if (eqlConstantTime(want, &b64)) return true;
-        }
-
-        // 分支 3（传输 MD5）：password 是 32 位 hex，先解成 16 字节再 HMAC
-        if (unhexMd5(password)) |bytes| {
-            var mac: [20]u8 = undefined;
-            std.crypto.auth.hmac.HmacSha1.create(&mac, &bytes, salt);
-            var b64: [28]u8 = undefined;
-            _ = std.base64.standard.Encoder.encode(&b64, &mac);
-            if (eqlConstantTime(want, &b64)) return true;
-        }
-        return false;
+        return macMatches(password, salt, want) or macMatchesLegacy(password, salt, want);
     }
 
     // `sha1` / `sha512` / `md5+sha512` 档（C# `SaltPasswordProvider` 默认就是 `sha512`）：
@@ -260,8 +293,21 @@ pub const VerifyResult = struct {
 /// `if (!user.Password.Contains("$")) user.Password = prv.Hash(password);`）。
 pub fn verifyAndUpgradeAlloc(a: std.mem.Allocator, password: []const u8, stored: []const u8) !VerifyResult {
     if (!verify(password, stored)) return .{ .ok = false };
-    if (!needsUpgrade(stored)) return .{ .ok = true };
+    // 格式旧（裸 MD5 / `$sha512$` …）或**口径旧**（本仓 2026-11-23 之前写反的 HMAC 顺序）都要升级
+    if (!needsUpgrade(stored) and !isLegacyOrderOnly(password, stored)) return .{ .ok = true };
     return .{ .ok = true, .upgraded = try hashAlloc(a, password) };
+}
+
+/// 该库值是否**只能**用历史口径通过（= 需要改写成 C# 口径）。
+fn isLegacyOrderOnly(plain: []const u8, stored: []const u8) bool {
+    var it = std.mem.splitScalar(u8, stored, '$');
+    _ = it.next();
+    const alg = it.next() orelse return false;
+    const salt = it.next() orelse return false;
+    const want = it.next() orelse return false;
+    if (!std.ascii.eqlIgnoreCase(alg, algorithm)) return false;
+    if (macMatches(plain, salt, want)) return false; // 已经是新口径
+    return macMatchesLegacy(plain, salt, want);
 }
 
 /// 是否需要"登录成功后自动升级"：非 `$md5+sha1$` 格式（C# `LoginCore` 的旧格式判断 `!Password.Contains("$")`
@@ -389,4 +435,37 @@ test "md5 档与未支持档" {
 
     // sha512 档只认明文、本仓不实现 → 显式 false（不猜）
     try std.testing.expect(!verify("123456", "$sha512$abcdefgh$AAAA"));
+}
+
+test "md5+sha1：C# 口径（key=MD5, msg=盐）与历史口径都能验证，旧值会被判为待升级" {
+    const a = std.testing.allocator;
+    const salt = "abcdefghijklmnop";
+
+    // C# 口径的期望值（由独立实现算出：HMAC-SHA1(key=MD5("admin123") 16B, msg=salt) 的 Base64）
+    var digest: [28]u8 = undefined;
+    digestWithSalt(&digest, "admin123", salt);
+    const fresh = try std.fmt.allocPrint(a, "$md5+sha1${s}${s}", .{ salt, digest });
+    defer a.free(fresh);
+    try std.testing.expect(verify("admin123", fresh));
+    try std.testing.expect(!isLegacyOrderOnly("admin123", fresh));
+
+    // 历史口径（本仓 2026-11-23 之前写反的顺序）：仍要能登录，但必须被判为待升级
+    var legacy_digest: [28]u8 = undefined;
+    digestWithSaltLegacy(&legacy_digest, "admin123", salt);
+    const old = try std.fmt.allocPrint(a, "$md5+sha1${s}${s}", .{ salt, legacy_digest });
+    defer a.free(old);
+    try std.testing.expect(verify("admin123", old));
+    try std.testing.expect(isLegacyOrderOnly("admin123", old));
+
+    const r = try verifyAndUpgradeAlloc(a, "admin123", old);
+    defer if (r.upgraded) |u| a.free(u);
+    try std.testing.expect(r.ok);
+    try std.testing.expect(r.upgraded != null);
+    // 升级后的值必须是新口径，且不再被判为待升级
+    try std.testing.expect(verify("admin123", r.upgraded.?));
+    try std.testing.expect(!isLegacyOrderOnly("admin123", r.upgraded.?));
+
+    // 错误口令一律不过
+    try std.testing.expect(!verify("wrong", fresh));
+    try std.testing.expect(!verify("wrong", old));
 }
