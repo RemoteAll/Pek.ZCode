@@ -169,6 +169,17 @@ pub fn buildRemarkAlloc(
     return b.toOwnedSlice();
 }
 
+/// 日志表的**时间型主键**生成器（`Member.xml`：`Log.ID` 是 `DataScale="time"`，不是自增列）。
+///
+/// 毫秒时间戳左移 12 位 + 12 位序号：单调递增，同一毫秒内可插 4096 条不冲突。
+/// 任何写 `Log` 的地方都必须用它（或自己保证唯一），否则第二条就是 `UNIQUE constraint failed: Log.ID`。
+var id_seq = std.atomic.Value(u32).init(0);
+
+pub fn nextLogId(now_ms: i64) i64 {
+    const seq: i64 = @intCast(id_seq.fetchAdd(1, .monotonic) % 4096);
+    return now_ms * 4096 + seq;
+}
+
 /// 日志提供者（C# `LogProvider`）。
 ///
 /// `enable == false` 时 `write` 直接返回（C# `if (!Enable) return;`）。
@@ -201,6 +212,9 @@ pub const LogProvider = struct {
         log.Success = success;
         log.Remark = remark;
         log.CreateTime = zzig.DateTime.nowLocal();
+        // `Log.ID` 在 `Member.xml` 里是 `DataScale="time"`（时间型主键，不是自增列）：
+        // 不自己生成就会以 0 写入，第二次插入直接 UNIQUE 冲突。
+        log.ID = nextLogId(zzig.DateTime.nowUnix() * 1000);
 
         if (parseLinkId(remark)) |link| log.LinkID = link;
 

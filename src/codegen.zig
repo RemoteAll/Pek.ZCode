@@ -166,6 +166,11 @@ pub fn generateTableAllocOpt(gpa: std.mem.Allocator, t: *const TableMeta, opts: 
     try b.add("    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{\n");
     try b.fmt("        .name = \"{s}\",\n", .{t.name});
     try b.fmt("        .table_name = \"{s}\",\n", .{t.effectiveTableName()});
+    if (t.conn_name) |cn| {
+        if (std.mem.trim(u8, cn, " \t\r\n").len > 0) {
+            try b.fmt("        .conn_name = \"{s}\",\n", .{std.mem.trim(u8, cn, " \t\r\n")});
+        }
+    }
     try b.add("        .fields = &.{\n");
     for (t.columns) |*c| {
         try b.fmt("            .{{ .name = \"{s}\", .data_type = .{s}", .{ c.name, @tagName(c.data_type) });

@@ -543,6 +543,12 @@ pub const EntityModel = struct {
                     }
                 }
                 t.indexes = try final_idx.toOwnedSlice(a);
+                // 表级连接名：XML 没写而实体写了才补（不要拿实体空值覆盖 XML 里的值）
+                if (t.conn_name == null) {
+                    if (em.conn_name) |cn| {
+                        if (std.mem.trim(u8, cn, " \t\r\n").len > 0) t.conn_name = try a.dupe(u8, cn);
+                    }
+                }
                 // 实体给了更具体的缓存上限才覆盖（XML 未写时是默认 1000）
                 if (t.max_cache_count == 1000) t.max_cache_count = cache;
                 report.tables_merged += 1;
@@ -550,6 +556,7 @@ pub const EntityModel = struct {
                 try tables.append(a, .{
                     .name = try a.dupe(u8, em.name),
                     .table_name = try a.dupe(u8, em.table_name),
+                    .conn_name = if (em.conn_name) |cn| try a.dupe(u8, cn) else null,
                     .max_cache_count = cache,
                     .columns = try ent_cols.toOwnedSlice(a),
                     .indexes = try ent_indexes.toOwnedSlice(a),
@@ -1094,6 +1101,8 @@ const FakeField = struct {
 const FakeMeta = struct {
     name: []const u8,
     table_name: []const u8,
+    /// 与 `entity.EntityMeta.conn_name` 对齐（测试桩也要有，否则 `mergeEntityTypes` 编译不过）
+    conn_name: ?[]const u8 = null,
     fields: []const FakeField,
 };
 

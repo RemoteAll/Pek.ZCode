@@ -90,6 +90,10 @@ pub const EntityMeta = struct {
     name: []const u8,
     /// 物理表名（`Model.xml` 的 `Table@TableName`，缺省同 `name`）
     table_name: []const u8,
+    /// 表级连接名（`Model.xml` 的 `Table@ConnName`）。
+    ///
+    /// **必须保留**：`Log` 表就是靠它落到独立的 `Log` 库；丢了就会被当模型级连接（Membership）。
+    conn_name: ?[]const u8 = null,
     fields: []const FieldMeta,
 };
 

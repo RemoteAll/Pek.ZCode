@@ -395,13 +395,13 @@ pub const CronScheduler = struct {
         };
         defer session.deinit();
 
-        var entry = entities.Log{};
-        entry.Category = category;
-        entry.Action = name;
-        entry.Success = ok;
-        entry.Remark = remark;
-        entry.UserName = "system";
-        entry.CreateTime = zzig.DateTime.nowLocal();
+        // 复用 `LogProvider`：它负责时间型主键（`Log.ID`）、LinkID 解析与默认用户/IP，
+        // 不要在这里手拼实体（手拼会漏 ID，第二条就 UNIQUE 冲突）。
+        const provider = zcode.membership.LogProvider{ .enable = true, .host = "" };
+        var entry = provider.createLog(category, name, ok, remark, 0, "system", "") catch |err| {
+            zzig.Logger.warn("[zcode.cron] 定时作业「{s}」日志构造失败：{s}", .{ name, @errorName(err) });
+            return;
+        };
         _ = zcode.entity.insert(self.dal, &entry, &session) catch |err| {
             zzig.Logger.warn("[zcode.cron] 定时作业「{s}」日志写入失败：{s}", .{ name, @errorName(err) });
             return;

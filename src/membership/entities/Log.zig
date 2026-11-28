@@ -47,6 +47,7 @@ pub const Log = struct {
     pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Log",
         .table_name = "Log",
+        .conn_name = "Log",
         .fields = &.{
             .{ .name = "ID", .data_type = .int64, .primary_key = true, .description = "编号" },
             .{ .name = "Category", .data_type = .string, .nullable = true, .description = "类别" },
