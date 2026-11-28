@@ -68,42 +68,42 @@ pub const Menu = struct {
     /// 备注
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Menu",
         .table_name = "Menu",
         .fields = &.{
             .{ .name = "ID", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
             .{ .name = "Name", .data_type = .string, .description = "名称" },
-            .{ .name = "DisplayName", .data_type = .string, .description = "显示名" },
+            .{ .name = "DisplayName", .data_type = .string, .nullable = true, .description = "显示名" },
             .{ .name = "Type", .data_type = .int32, .description = "类型。1目录/2菜单/3功能" },
-            .{ .name = "FullName", .data_type = .string, .length = 200, .description = "全名" },
+            .{ .name = "FullName", .data_type = .string, .nullable = true, .length = 200, .description = "全名" },
             .{ .name = "ParentID", .data_type = .int32, .description = "父编号" },
-            .{ .name = "Url", .data_type = .string, .length = 200, .description = "链接" },
+            .{ .name = "Url", .data_type = .string, .nullable = true, .length = 200, .description = "链接" },
             .{ .name = "Sort", .data_type = .int32, .description = "排序" },
-            .{ .name = "Icon", .data_type = .string, .description = "图标" },
+            .{ .name = "Icon", .data_type = .string, .nullable = true, .description = "图标" },
             .{ .name = "Visible", .data_type = .boolean, .description = "可见" },
             .{ .name = "Necessary", .data_type = .boolean, .description = "必要。必要的菜单，必须至少有角色拥有这些权限，如果没有则自动授权给系统角色" },
             .{ .name = "NewWindow", .data_type = .boolean, .description = "新窗口。新窗口打开链接" },
             .{ .name = "DataScope", .data_type = .int32, .description = "数据范围。该菜单的数据权限，-1使用角色默认/0全部/1本部门及下级/2本部门/3仅本人/4自定义" },
-            .{ .name = "DataDepartmentIds", .data_type = .string, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
-            .{ .name = "Permission", .data_type = .string, .length = 2000, .description = "权限子项。逗号分隔，每个权限子项编号与名称用井号分隔" },
+            .{ .name = "DataDepartmentIds", .data_type = .string, .nullable = true, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
+            .{ .name = "Permission", .data_type = .string, .nullable = true, .length = 2000, .description = "权限子项。逗号分隔，每个权限子项编号与名称用井号分隔" },
             .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
             .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
             .{ .name = "Ex3", .data_type = .double, .description = "扩展3" },
-            .{ .name = "Ex4", .data_type = .string, .description = "扩展4" },
-            .{ .name = "Ex5", .data_type = .string, .description = "扩展5" },
-            .{ .name = "Ex6", .data_type = .string, .description = "扩展6" },
-            .{ .name = "CreateUser", .data_type = .string, .description = "创建者" },
+            .{ .name = "Ex4", .data_type = .string, .nullable = true, .description = "扩展4" },
+            .{ .name = "Ex5", .data_type = .string, .nullable = true, .description = "扩展5" },
+            .{ .name = "Ex6", .data_type = .string, .nullable = true, .description = "扩展6" },
+            .{ .name = "CreateUser", .data_type = .string, .nullable = true, .description = "创建者" },
             .{ .name = "CreateUserID", .data_type = .int32, .description = "创建用户" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "UpdateUser", .data_type = .string, .description = "更新者" },
+            .{ .name = "UpdateUser", .data_type = .string, .nullable = true, .description = "更新者" },
             .{ .name = "UpdateUserID", .data_type = .int32, .description = "更新用户" },
-            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
+            .{ .name = "UpdateIP", .data_type = .string, .nullable = true, .description = "更新地址" },
             .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "备注" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "备注" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

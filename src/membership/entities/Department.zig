@@ -62,16 +62,16 @@ pub const Department = struct {
     /// 备注
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Department",
         .table_name = "Department",
         .fields = &.{
             .{ .name = "ID", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
             .{ .name = "TenantId", .data_type = .int32, .description = "租户" },
             .{ .name = "Type", .data_type = .int32, .description = "类型。1公司/2部门/3小组/4虚拟" },
-            .{ .name = "Code", .data_type = .string, .description = "代码" },
+            .{ .name = "Code", .data_type = .string, .nullable = true, .description = "代码" },
             .{ .name = "Name", .data_type = .string, .description = "名称" },
-            .{ .name = "FullName", .data_type = .string, .length = 200, .description = "全名" },
+            .{ .name = "FullName", .data_type = .string, .nullable = true, .length = 200, .description = "全名" },
             .{ .name = "ParentID", .data_type = .int32, .description = "父级" },
             .{ .name = "Level", .data_type = .int32, .description = "层级。树状结构的层级" },
             .{ .name = "Sort", .data_type = .int32, .description = "排序。同级内排序" },
@@ -81,20 +81,20 @@ pub const Department = struct {
             .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
             .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
             .{ .name = "Ex3", .data_type = .double, .description = "扩展3" },
-            .{ .name = "Ex4", .data_type = .string, .description = "扩展4" },
-            .{ .name = "Ex5", .data_type = .string, .description = "扩展5" },
-            .{ .name = "Ex6", .data_type = .string, .description = "扩展6" },
-            .{ .name = "CreateUser", .data_type = .string, .description = "创建者" },
+            .{ .name = "Ex4", .data_type = .string, .nullable = true, .description = "扩展4" },
+            .{ .name = "Ex5", .data_type = .string, .nullable = true, .description = "扩展5" },
+            .{ .name = "Ex6", .data_type = .string, .nullable = true, .description = "扩展6" },
+            .{ .name = "CreateUser", .data_type = .string, .nullable = true, .description = "创建者" },
             .{ .name = "CreateUserID", .data_type = .int32, .description = "创建用户" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "UpdateUser", .data_type = .string, .description = "更新者" },
+            .{ .name = "UpdateUser", .data_type = .string, .nullable = true, .description = "更新者" },
             .{ .name = "UpdateUserID", .data_type = .int32, .description = "更新用户" },
-            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
+            .{ .name = "UpdateIP", .data_type = .string, .nullable = true, .description = "更新地址" },
             .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "备注" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "备注" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

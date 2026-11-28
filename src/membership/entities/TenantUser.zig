@@ -36,7 +36,7 @@ pub const TenantUser = struct {
     /// 描述
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "TenantUser",
         .table_name = "TenantUser",
         .fields = &.{
@@ -46,16 +46,16 @@ pub const TenantUser = struct {
             .{ .name = "Enable", .data_type = .boolean, .description = "启用" },
             .{ .name = "DepartmentId", .data_type = .int32, .description = "部门。用户在该租户所属的部门" },
             .{ .name = "RoleId", .data_type = .int32, .description = "角色。用户在该租户所对应的主要角色，替换用户自身的角色组" },
-            .{ .name = "RoleIds", .data_type = .string, .length = 200, .description = "角色组。次要角色集合" },
+            .{ .name = "RoleIds", .data_type = .string, .nullable = true, .length = 200, .description = "角色组。次要角色集合" },
             .{ .name = "CreateUserId", .data_type = .int32, .description = "创建者" },
-            .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateTime", .data_type = .datetime, .nullable = true, .description = "创建时间" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "UpdateUserId", .data_type = .int32, .description = "更新者" },
-            .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "描述" },
+            .{ .name = "UpdateTime", .data_type = .datetime, .nullable = true, .description = "更新时间" },
+            .{ .name = "UpdateIP", .data_type = .string, .nullable = true, .description = "更新地址" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "描述" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

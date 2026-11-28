@@ -52,34 +52,34 @@ pub const Tenant = struct {
     /// 描述
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Tenant",
         .table_name = "Tenant",
         .fields = &.{
             .{ .name = "Id", .data_type = .int32, .primary_key = true, .identity = true, .description = "编号" },
-            .{ .name = "Code", .data_type = .string, .description = "编码。唯一编码" },
+            .{ .name = "Code", .data_type = .string, .nullable = true, .description = "编码。唯一编码" },
             .{ .name = "Name", .data_type = .string, .description = "名称。显示名称" },
             .{ .name = "Type", .data_type = .int32, .description = "类型。1免费/2个人/3企业/4旗舰" },
             .{ .name = "Enable", .data_type = .boolean, .description = "启用" },
             .{ .name = "Level", .data_type = .int32, .description = "等级。租户级别或套餐版本，数字越大功能越多" },
             .{ .name = "ManagerId", .data_type = .int32, .description = "管理者" },
-            .{ .name = "RoleIds", .data_type = .string, .length = 200, .description = "角色组。租户可选的角色集合，不同级别的租户所拥有的角色不一样，高级功能也会不同" },
-            .{ .name = "Logo", .data_type = .string, .description = "图标。附件路径" },
-            .{ .name = "Domain", .data_type = .string, .length = 200, .description = "域名。绑定的独立域名" },
+            .{ .name = "RoleIds", .data_type = .string, .nullable = true, .length = 200, .description = "角色组。租户可选的角色集合，不同级别的租户所拥有的角色不一样，高级功能也会不同" },
+            .{ .name = "Logo", .data_type = .string, .nullable = true, .description = "图标。附件路径" },
+            .{ .name = "Domain", .data_type = .string, .nullable = true, .length = 200, .description = "域名。绑定的独立域名" },
             .{ .name = "MaxUsers", .data_type = .int32, .description = "用户数上限。该租户最大允许用户数，0表示不限制" },
             .{ .name = "MaxStorage", .data_type = .int64, .description = "存储上限。该租户最大允许存储字节数，0表示不限制" },
-            .{ .name = "DatabaseName", .data_type = .string, .description = "数据库。分库用的数据库名" },
-            .{ .name = "TableName", .data_type = .string, .description = "数据表。分表用的数据表前缀" },
-            .{ .name = "Expired", .data_type = .datetime, .description = "过期时间。达到该时间后，自动禁用租户，空表示永不过期" },
+            .{ .name = "DatabaseName", .data_type = .string, .nullable = true, .description = "数据库。分库用的数据库名" },
+            .{ .name = "TableName", .data_type = .string, .nullable = true, .description = "数据表。分表用的数据表前缀" },
+            .{ .name = "Expired", .data_type = .datetime, .nullable = true, .description = "过期时间。达到该时间后，自动禁用租户，空表示永不过期" },
             .{ .name = "CreateUserId", .data_type = .int32, .description = "创建者" },
-            .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateTime", .data_type = .datetime, .nullable = true, .description = "创建时间" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "UpdateUserId", .data_type = .int32, .description = "更新者" },
-            .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "描述" },
+            .{ .name = "UpdateTime", .data_type = .datetime, .nullable = true, .description = "更新时间" },
+            .{ .name = "UpdateIP", .data_type = .string, .nullable = true, .description = "更新地址" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "描述" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

@@ -44,30 +44,30 @@ pub const Area = struct {
     /// 备注
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Area",
         .table_name = "Area",
         .fields = &.{
             .{ .name = "ID", .data_type = .int32, .primary_key = true, .description = "编码。行政区划编码" },
             .{ .name = "Name", .data_type = .string, .description = "名称" },
-            .{ .name = "FullName", .data_type = .string, .description = "全名" },
+            .{ .name = "FullName", .data_type = .string, .nullable = true, .description = "全名" },
             .{ .name = "ParentID", .data_type = .int32, .description = "父级" },
             .{ .name = "Level", .data_type = .int32, .description = "层级" },
-            .{ .name = "Kind", .data_type = .string, .description = "类型。省市县，自治州等" },
-            .{ .name = "English", .data_type = .string, .description = "英文名" },
-            .{ .name = "PinYin", .data_type = .string, .description = "拼音" },
-            .{ .name = "JianPin", .data_type = .string, .description = "简拼" },
-            .{ .name = "TelCode", .data_type = .string, .description = "区号。电话区号" },
-            .{ .name = "ZipCode", .data_type = .string, .description = "邮编。邮政编码" },
+            .{ .name = "Kind", .data_type = .string, .nullable = true, .description = "类型。省市县，自治州等" },
+            .{ .name = "English", .data_type = .string, .nullable = true, .description = "英文名" },
+            .{ .name = "PinYin", .data_type = .string, .nullable = true, .description = "拼音" },
+            .{ .name = "JianPin", .data_type = .string, .nullable = true, .description = "简拼" },
+            .{ .name = "TelCode", .data_type = .string, .nullable = true, .description = "区号。电话区号" },
+            .{ .name = "ZipCode", .data_type = .string, .nullable = true, .description = "邮编。邮政编码" },
             .{ .name = "Longitude", .data_type = .double, .description = "经度" },
             .{ .name = "Latitude", .data_type = .double, .description = "纬度" },
-            .{ .name = "GeoHash", .data_type = .string, .description = "地址编码。字符串前缀相同越多，地理距离越近，8位精度19米，6位610米" },
+            .{ .name = "GeoHash", .data_type = .string, .nullable = true, .description = "地址编码。字符串前缀相同越多，地理距离越近，8位精度19米，6位610米" },
             .{ .name = "Enable", .data_type = .boolean, .description = "启用" },
-            .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "备注" },
+            .{ .name = "CreateTime", .data_type = .datetime, .nullable = true, .description = "创建时间" },
+            .{ .name = "UpdateTime", .data_type = .datetime, .nullable = true, .description = "更新时间" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "备注" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

@@ -60,7 +60,7 @@ pub const Role = struct {
     /// 备注
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Role",
         .table_name = "Role",
         .fields = &.{
@@ -71,27 +71,27 @@ pub const Role = struct {
             .{ .name = "IsSystem", .data_type = .boolean, .description = "系统。用于业务系统开发使用，不受数据权限约束，禁止修改名称或删除" },
             .{ .name = "TenantId", .data_type = .int32, .description = "租户。角色所属组合，0表示全局角色" },
             .{ .name = "DataScope", .data_type = .int32, .description = "数据范围。控制用户可访问的数据范围，0全部/1本部门及下级/2本部门/3仅本人/4自定义" },
-            .{ .name = "DataDepartmentIds", .data_type = .string, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
+            .{ .name = "DataDepartmentIds", .data_type = .string, .nullable = true, .length = 500, .description = "数据部门。数据范围为自定义时，选择的部门编号列表" },
             .{ .name = "ViewSensitive", .data_type = .boolean, .description = "敏感字段。是否可以查看其他人的敏感字段数据" },
-            .{ .name = "Permission", .data_type = .string, .description = "权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7" },
+            .{ .name = "Permission", .data_type = .string, .nullable = true, .description = "权限。对不同资源的权限，逗号分隔，每个资源编号与权限值用井号分隔，如 1#3,2#7" },
             .{ .name = "Sort", .data_type = .int32, .description = "排序" },
             .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
             .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
             .{ .name = "Ex3", .data_type = .double, .description = "扩展3" },
-            .{ .name = "Ex4", .data_type = .string, .description = "扩展4" },
-            .{ .name = "Ex5", .data_type = .string, .description = "扩展5" },
-            .{ .name = "Ex6", .data_type = .string, .description = "扩展6" },
-            .{ .name = "CreateUser", .data_type = .string, .description = "创建者" },
+            .{ .name = "Ex4", .data_type = .string, .nullable = true, .description = "扩展4" },
+            .{ .name = "Ex5", .data_type = .string, .nullable = true, .description = "扩展5" },
+            .{ .name = "Ex6", .data_type = .string, .nullable = true, .description = "扩展6" },
+            .{ .name = "CreateUser", .data_type = .string, .nullable = true, .description = "创建者" },
             .{ .name = "CreateUserID", .data_type = .int32, .description = "创建用户" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "CreateTime", .data_type = .datetime, .description = "创建时间" },
-            .{ .name = "UpdateUser", .data_type = .string, .description = "更新者" },
+            .{ .name = "UpdateUser", .data_type = .string, .nullable = true, .description = "更新者" },
             .{ .name = "UpdateUserID", .data_type = .int32, .description = "更新用户" },
-            .{ .name = "UpdateIP", .data_type = .string, .description = "更新地址" },
+            .{ .name = "UpdateIP", .data_type = .string, .nullable = true, .description = "更新地址" },
             .{ .name = "UpdateTime", .data_type = .datetime, .description = "更新时间" },
-            .{ .name = "Remark", .data_type = .string, .length = 500, .description = "备注" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 500, .description = "备注" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {

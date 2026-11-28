@@ -7,6 +7,7 @@ pub const Department = @import("Department.zig").Department;
 pub const Role = @import("Role.zig").Role;
 pub const Menu = @import("Menu.zig").Menu;
 pub const Parameter = @import("Parameter.zig").Parameter;
+pub const CronJob = @import("CronJob.zig").CronJob;
 pub const Area = @import("Area.zig").Area;
 pub const Log = @import("Log.zig").Log;
 pub const Tenant = @import("Tenant.zig").Tenant;
@@ -18,10 +19,14 @@ pub const DepartmentBiz = @import("Department.biz.zig");
 pub const RoleBiz = @import("Role.biz.zig");
 pub const MenuBiz = @import("Menu.biz.zig");
 pub const ParameterBiz = @import("Parameter.biz.zig");
+pub const CronJobBiz = @import("CronJob.biz.zig");
 pub const AreaBiz = @import("Area.biz.zig");
 pub const LogBiz = @import("Log.biz.zig");
 pub const TenantBiz = @import("Tenant.biz.zig");
 pub const TenantUserBiz = @import("TenantUser.biz.zig");
 
 /// 全部实体（用 `inline for (all) |T|` 编译期逐个处理）
-pub const all = .{User, Department, Role, Menu, Parameter, Area, Log, Tenant, TenantUser};
+pub const all = .{User, Department, Role, Menu, Parameter, CronJob, Area, Log, Tenant, TenantUser};
+
+/// 全部业务扩展模块（`inline for (all_biz) |B|` 收集测试 / 批量处理）
+pub const all_biz = .{UserBiz, DepartmentBiz, RoleBiz, MenuBiz, ParameterBiz, CronJobBiz, AreaBiz, LogBiz, TenantBiz, TenantUserBiz};

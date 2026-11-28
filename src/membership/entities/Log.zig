@@ -44,30 +44,30 @@ pub const Log = struct {
     /// 详细信息
     @"Remark": []const u8 = "",
 
-    pub const meta = zcode.entity.EntityMeta{
+    pub const meta = zcode.entity.checkMeta(zcode.entity.EntityMeta{
         .name = "Log",
         .table_name = "Log",
         .fields = &.{
             .{ .name = "ID", .data_type = .int64, .primary_key = true, .description = "编号" },
-            .{ .name = "Category", .data_type = .string, .description = "类别" },
+            .{ .name = "Category", .data_type = .string, .nullable = true, .description = "类别" },
             .{ .name = "Action", .data_type = .string, .description = "操作" },
             .{ .name = "LinkID", .data_type = .int64, .description = "链接" },
             .{ .name = "Success", .data_type = .boolean, .description = "成功" },
-            .{ .name = "UserName", .data_type = .string, .description = "用户名" },
+            .{ .name = "UserName", .data_type = .string, .nullable = true, .description = "用户名" },
             .{ .name = "Ex1", .data_type = .int32, .description = "扩展1" },
             .{ .name = "Ex2", .data_type = .int32, .description = "扩展2" },
             .{ .name = "Ex3", .data_type = .double, .description = "扩展3" },
-            .{ .name = "Ex4", .data_type = .string, .description = "扩展4" },
-            .{ .name = "Ex5", .data_type = .string, .description = "扩展5" },
-            .{ .name = "Ex6", .data_type = .string, .description = "扩展6" },
-            .{ .name = "TraceId", .data_type = .string, .description = "性能追踪。用于APM性能追踪定位，还原该事件的调用链" },
-            .{ .name = "CreateUser", .data_type = .string, .description = "创建者" },
+            .{ .name = "Ex4", .data_type = .string, .nullable = true, .description = "扩展4" },
+            .{ .name = "Ex5", .data_type = .string, .nullable = true, .description = "扩展5" },
+            .{ .name = "Ex6", .data_type = .string, .nullable = true, .description = "扩展6" },
+            .{ .name = "TraceId", .data_type = .string, .nullable = true, .description = "性能追踪。用于APM性能追踪定位，还原该事件的调用链" },
+            .{ .name = "CreateUser", .data_type = .string, .nullable = true, .description = "创建者" },
             .{ .name = "CreateUserID", .data_type = .int32, .description = "创建用户" },
-            .{ .name = "CreateIP", .data_type = .string, .description = "创建地址" },
+            .{ .name = "CreateIP", .data_type = .string, .nullable = true, .description = "创建地址" },
             .{ .name = "CreateTime", .data_type = .datetime, .description = "时间" },
-            .{ .name = "Remark", .data_type = .string, .length = 2000, .description = "详细信息" },
+            .{ .name = "Remark", .data_type = .string, .nullable = true, .length = 2000, .description = "详细信息" },
         },
-    };
+    });
 
     /// 列名常量（写 SQL / `Where` / `Field` 时引用这里）
     pub const Field = struct {
