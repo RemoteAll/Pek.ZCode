@@ -1153,6 +1153,18 @@ pub const Dal = struct {
         return self.connections.items.len;
     }
 
+    /// 该命名连接是否已挂载（主连接名恒为「已挂载」；同名比较忽略大小写）。
+    ///
+    /// 给上层做「缺就补」用：表级 `ConnName`（如 `Log`）在模型里声明了、但没人 `attachConnection`
+    /// 时，`syncSchema` 会以 `error.UnknownConnection` 失败。上层可以先问一句再决定补不补。
+    pub fn hasConnection(self: *const Dal, name: []const u8) bool {
+        if (name.len == 0 or std.ascii.eqlIgnoreCase(name, self.connName())) return true;
+        for (self.connections.items) |c| {
+            if (std.ascii.eqlIgnoreCase(c.name, name)) return true;
+        }
+        return false;
+    }
+
     fn connectionIndex(self: *const Dal, name: []const u8) ?usize {
         if (name.len == 0 or std.ascii.eqlIgnoreCase(name, self.connName())) return null;
         for (self.connections.items, 0..) |c, i| {
