@@ -124,6 +124,8 @@ pub const window = @import("window.zig");
 pub const pagesplit = @import("pagesplit.zig");
 /// 汉字拼音（`Get` / `GetFirst` / `GetAll`，对应 C# `DH.NCore/Common/PinYin.cs`）
 pub const pinyin = @import("pinyin.zig");
+/// SEO 别名（slug）：中文转拼音、英文转连字符短语（服务端生成 URL 用）
+pub const slug = @import("slug.zig");
 /// 字段缓存（键列 → 值列整表字典，写后自动失效，对应 C# `Cache/FieldCache`）
 pub const fieldcache = @import("fieldcache.zig");
 /// XCode 全局设置（对应 C# `Setting.cs` / `XCodeSetting`）
@@ -199,6 +201,7 @@ test {
     _ = @import("window.zig");
     _ = @import("pagesplit.zig");
     _ = @import("pinyin.zig");
+    _ = @import("slug.zig");
     _ = @import("csv.zig");
     _ = @import("simulation.zig");
     _ = @import("search.zig");
