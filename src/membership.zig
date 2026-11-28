@@ -38,6 +38,7 @@ pub const provider = @import("membership/provider.zig");
 pub const tenant = @import("membership/tenant.zig");
 /// 菜单索引与查找（C# `IMenuFactory.cs`：按 ID/名称/全名/URL 查 + 子菜单排序与权限过滤）。
 pub const menu = @import("membership/menu.zig");
+pub const cron_scheduler = @import("membership/cron_scheduler.zig");
 /// 九张表的实体（由 `Member.xml` 生成）。
 pub const entities = @import("membership/entities/mod.zig");
 
