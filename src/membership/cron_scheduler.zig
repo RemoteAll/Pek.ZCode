@@ -164,9 +164,11 @@ pub const CronScheduler = struct {
 
         const offset = self.cronOffset();
 
-        // 配置签名：内容没变就不重建（管理端频繁保存也不会有额外开销）
+        // 配置签名：内容没变就不重建（管理端频繁保存也不会有额外开销）。
+        // **时区偏移也要进签名**：它被写进每个 `Timer`，光刷 NextTime 不会让已装载的定时器改时间。
         var sig: std.Io.Writer.Allocating = .init(a);
         defer sig.deinit();
+        try sig.writer.print("offset={d}\n", .{offset});
         for (raws) |raw| {
             const id = rowInt(raw, "ID");
             try sig.writer.print("{d}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\n", .{
@@ -270,21 +272,30 @@ pub const CronScheduler = struct {
         self.replaceRows(.empty);
     }
 
-    /// 找到 id 对应的行状态（按 `ID`，因为管理端操作都以 ID 为准）。
-    fn findRowById(self: *CronScheduler, id: i32) ?*RowState {
+    /// 找到 id 对应的行状态**并加一个引用**（调用方负责 `releaseRow`）。
+    ///
+    /// 为什么必须在锁内加引用：`reload` 换表时会 `releaseRow` 旧行，
+    /// 先拿到裸指针再解锁去用，就是 use-after-free。
+    fn acquireRowById(self: *CronScheduler, id: i32) ?*RowState {
         self.lock();
         defer self.unlock();
         for (self.rows.items) |state| {
-            if (state.id == id) return state;
+            if (state.id == id) {
+                _ = state.refs.fetchAdd(1, .monotonic);
+                return state;
+            }
         }
         return null;
     }
 
-    fn findRowByName(self: *CronScheduler, name: []const u8) ?*RowState {
+    fn acquireRowByName(self: *CronScheduler, name: []const u8) ?*RowState {
         self.lock();
         defer self.unlock();
         for (self.rows.items) |state| {
-            if (std.mem.eql(u8, state.name, name)) return state;
+            if (std.mem.eql(u8, state.name, name)) {
+                _ = state.refs.fetchAdd(1, .monotonic);
+                return state;
+            }
         }
         return null;
     }
@@ -292,12 +303,35 @@ pub const CronScheduler = struct {
     /// 立刻触发一次（对齐 C# `JobService.Wake(job.Id, -1)`）。
     /// 返回 true = 找到并已安排；false = 不存在或未启用（与 C# 一致，不报错）。
     pub fn scheduleNow(self: *CronScheduler, id: i32) bool {
-        const state = self.findRowById(id) orelse return false;
+        const state = self.acquireRowById(id) orelse return false;
+        defer releaseRow(state);
         return self.reg.trigger(state.name);
     }
 
     /// 把内存里算出的「下次时间」写回库（管理端要展示 `NextTime`）。
+    ///
+    /// 先在锁内把行状态快照出来（各自 +1 引用），解锁后再做数据库 IO——
+    /// 不要在持锁期间访问库，否则 reload/回写会互相等。
     fn syncNextTimes(self: *CronScheduler, offset: i64) void {
+        var snapshot: std.ArrayListUnmanaged(*RowState) = .empty;
+        defer {
+            for (snapshot.items) |state| releaseRow(state);
+            snapshot.deinit(self.gpa);
+        }
+        {
+            self.lock();
+            defer self.unlock();
+            for (self.rows.items) |state| {
+                _ = state.refs.fetchAdd(1, .monotonic);
+                snapshot.append(self.gpa, state) catch |err| {
+                    _ = state.refs.fetchSub(1, .acq_rel);
+                    zzig.Logger.warn("[zcode.cron] NextTime 快照登记失败（{s}）：剩余行跳过", .{@errorName(err)});
+                    break;
+                };
+            }
+        }
+        if (snapshot.items.len == 0) return;
+
         var session = self.dal.openSessionForTable("CronJob") catch |err| {
             zzig.Logger.warn("[zcode.cron] 下次时间回写失败（开会话 {s}）：管理端 NextTime 可能为空", .{@errorName(err)});
             return;
@@ -309,9 +343,7 @@ pub const CronScheduler = struct {
         };
 
         const now_unix = zzig.DateTime.nowUnix();
-        self.lock();
-        defer self.unlock();
-        for (self.rows.items) |state| {
+        for (snapshot.items) |state| {
             const next_ms = nextUnixMs(state.crons, now_unix, offset);
             _ = table.updateOne(&session, &[_]zcode.sqlbuild.Field{
                 .{ .name = "NextTime", .value = .{ .datetime = fromUnixMs(next_ms, offset) } },
@@ -380,7 +412,7 @@ pub const CronScheduler = struct {
 /// zzig 的执行后回调：按 key（= `CronJob.Name`）找到行状态并回写。
 fn onJobRan(ctx: ?*anyopaque, outcome: jobs_mod.Outcome) void {
     const owner: *CronScheduler = @ptrCast(@alignCast(ctx orelse return));
-    const state = owner.findRowByName(outcome.key) orelse {
+    const state = owner.acquireRowByName(outcome.key) orelse {
         // 刚被 reload 摘掉的作业：不再回写（行可能已删除），但要留痕
         zzig.Logger.warn(
             "[zcode.cron] 作业「{s}」执行完成但不在当前快照里（已删除/已停用）：跳过时间回写",
@@ -388,7 +420,6 @@ fn onJobRan(ctx: ?*anyopaque, outcome: jobs_mod.Outcome) void {
         );
         return;
     };
-    _ = state.refs.fetchAdd(1, .monotonic);
     defer releaseRow(state);
 
     const offset = owner.cronOffset();
